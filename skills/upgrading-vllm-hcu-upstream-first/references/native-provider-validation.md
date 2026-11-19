@@ -68,3 +68,12 @@ Keep physical packing separate from launch tuning. A wider program that wins
 on the largest weight can regress smaller shards; compare conversion plus GEMM
 across the admitted shapes before choosing a size policy, then validate the
 final installed kernel and changed-input Graph independently of the prototype.
+
+Before carrying a constructor patch that forces a native operator, inspect the
+target's dispatch and precision guards. For clamp SwiGLU, current v0.33 Core
+already selects its ROCm kernel for default alpha/beta and retains its Torch
+path for nondefault parameters. Preserve that policy and official custom-op
+enablement rather than forcing every configuration through the kernel. Reuse
+upstream eager tests and add changing-input Graph coverage on the real class;
+see `docs/validation/vllm033-official-clamp-swiglu.md`. Component ownership does
+not qualify a checkpoint, HumanEval, performance or whole-model shutdown.

@@ -103,6 +103,31 @@ fixed-address changed-input replay. Test coverage does not itself establish
 passing execution, another architecture, a complete model or HumanEval.
 Keep this candidate opt-in until the applicable gates are completed.
 
+## Standalone Step5 MTP configuration
+
+`das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
+Adapter activates it before vLLM constructs model configuration. It registers
+only the separate `step5_mtp` model type through Transformers' public
+`AutoConfig.register()` API. Ordinary `step5` and `step5_vl` configs, their
+validation and the in-checkpoint MTP conversion stay owned by vLLM.
+
+The Plugin class inherits official `Step5Config`, defaults standalone drafts
+to one prediction layer and the `Step5MTP` architecture, and preserves explicit
+checkpoint values. Both ordinary `hf` and `auto` config formats work with
+`trust_remote_code=False`; no custom config-format flag or Core registry patch
+is needed. Discovery imports no framework or native provider. A pre-existing
+`step5_mtp` owner is refused without overwriting it. Failed publication or
+subsequent ownership drift is fatal for that process; health checks do not
+repair or silently republish the mapping. Spawned processes register their own
+mapping, and a fork must explicitly activate its inherited exact mapping.
+
+To require configuration support at startup, use the Adapter's existing
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=step5-standalone-mtp-config` requirement.
+This is a **configuration capability**. It does not establish Step5 checkpoint
+loading, tokenizer, sparse attention, Graph, drafted/accepted tokens, model
+accuracy or performance. See the [configuration validation boundary](
+../docs/validation/vllm033-step5-config.md).
+
 ## DSV4.1 Channel-FP8 configuration routing
 
 The independent `das_hcu_dsv41` Adapter extension advertises only
