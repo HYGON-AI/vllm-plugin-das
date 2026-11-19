@@ -53,3 +53,14 @@ The [Qwen3-8B final-payload comparison](../../../docs/validation/vllm033-flash-e
 records an E4M3 raw loss despite equal normalized totals and passing Graph/prefix
 probes. Its unchanged full-cohort BF16 repeat preserves the failing-task boundary;
 neither that repeat nor normal process exits waive accuracy or native-owner leaks.
+
+For a pretrained startup launch failure after successful weight loading and partial
+Graph capture, retain that original failed cohort. A small probe with matching
+head/GQA geometry may still pass: compare the actual failing tensor shapes,
+strides, storage offsets, layout and static sequence bounds before changing the
+Plugin route. A failure-only external metadata observer can preserve the original
+call and exception without replacing the installed package or native library;
+its run remains diagnostic, including if observation changes whether it fails.
+Do not infer healthy serving, HumanEval or normal shutdown from completed model
+loading or capture progress. Record controller cleanup signals separately from
+framework-internal signals and the final surviving-process check.
