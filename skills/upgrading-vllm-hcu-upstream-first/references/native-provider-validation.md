@@ -211,6 +211,24 @@ failed strict-format probe. Keep expected-value checks in the derived audit
 when the original generation client is frozen, without changing its requests
 or regenerating answers.
 
+For a real windowed checkpoint, map every actual worker attention layer back
+to its original configured layer type before and after generation. Test input
+lengths on both sides of the window boundary, changed batches and prefix reuse;
+retain literal expected answers and actual integer token lists independently
+from whitespace comparisons and aggregate scores. A pipeline text encoder may
+need its bundled tokenizer and the target's official text-only modality limit;
+retain the original architecture and checkpoint configuration.
+
+Audit worker GPU traces as well as capture counters: bind HIP graph launches
+to the actual worker PID and correlate them with GPU kernel events. Reused
+capture counts, backend selection and HTTP success alone do not establish
+replay execution. Profiling changes timing, so these traces are execution
+evidence rather than serving performance acceptance. A BF16 window-model pair
+does not qualify FP8 or softcap; a BF16/FP8 comparison changes KV precision and
+must be labeled accordingly. Keep raw fenced-code failures separate from
+isolated format-normalized scores even when both backends produce identical
+messages, tokens and pass flags.
+
 
 ## Inverse-RoPE rounding boundaries
 

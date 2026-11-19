@@ -69,7 +69,9 @@ attention cap50 are retained. Original HE0–31 paired validation is running
 with official TRITON_ATTN and Plugin FLASH_ATTN at BF16 and E4M3 KV, default
 Graph/prefix and the original15s shutdown grace. This is pending model/accuracy
 evidence, not a passed gate. The local checkpoint weights reside in tmpfs;
-only the bounded metadata/seal is durably archived. gfx836 remains unqualified.
+only the bounded metadata/seal is durably archived. These running/pending
+statements describe that historical cohort, not the current process state or
+qualification of later runtime payloads. gfx836 remains unqualified.
 
 ## E4M3 composition follow-up (2026-11-18)
 
@@ -840,3 +842,50 @@ do not establish kernel-only or serving performance. No FA library changes
 or tolerance relaxation; keep Draft pending accuracy investigation, real
 softcap/window checkpoint, clean lifecycle, serving performance and the
 proposed Adapter97 dependency's independent qualification/required approval.
+
+## Real Gemma3 window BF16 pair (2026-11-19)
+
+The original Gemma3 conditional-generation text encoder and bundled tokenizer
+from the local LTX pipeline complete an official `TRITON_ATTN` / Plugin
+`FLASH_ATTN` pair. Both use the same gfx938 device UUID, checkpoint bytes,
+Core0.33 `c440c08`, proposed Adapter97 `6eeea954`, BF16 weights and `auto` KV,
+TP1, max length4096, block64, max sequences8/batched tokens1024, official
+`limit_mm_per_prompt={"image":0}`, and default Graph/prefix. Plugin runtime
+is `39eb839`; later documentation commits do not change its wheel inputs.
+The original model configuration, including all48 attention layers, is retained.
+
+An independent audit reads the saved raw responses, scores, worker metadata
+and compressed rank0 traces. It checks original source seals and reconciles
+the14 checkpoint assets' before/after double-read hashes; it does not rehash
+weights or execute generated code again.
+
+| Check | Official Triton | Plugin Flash |
+| --- | --- | --- |
+| Actual per-layer windows | 40 sliding `(1023,0)`,8 full | Same |
+| Literal expected answers, input lengths1023/1024/1025/2049 | 16/16 | 16/16 |
+| Concurrent waves1/4/8, repeated real token IDs | Equal | Equal |
+| Prefix hit-token delta | 17856 | 17856 |
+| Actual `hipGraphLaunch` / correlated GPU kernels | 6 /84 | 6 /72 |
+| GPU `unified_attention` kernels in trace | 150 | 126 |
+| HumanEval0–31 raw / normalized | 1/32 /32/32 | 1/32 /32/32 |
+| Exit within original15s, exit0, no forced cleanup/survivors | Yes | Yes |
+| Complete lifecycle | FAIL: nanobind | FAIL: nanobind |
+
+Before/after capture counters remain unchanged while the traces show real
+HIP graph launches and correlated GPU work; capture counts alone are not used
+as replay evidence. All16 window responses have identical literal texts and
+real integer token lists across backends. All32 HumanEval messages, token
+lists, finish reasons and raw/normalized pass flags match, with no newly
+failed task. The independent `gemma3-pipeline-text` protocol retains temperature0,
+seed0,2048 output tokens and concurrency4, without reasoning controls. Most
+raw programs include Markdown fences: retain raw1/32 separately from the
+isolated format-normalized32/32, without redefining the original accuracy gate.
+
+Each model controller returns1 because nanobind leakage remains, despite
+exit0 within15s and no survivors. This is real BF16 window-model evidence;
+Gemma3 has no attention softcap, and these runs do not qualify E4M3/E5M2,
+clean lifecycle, serving performance or all Plugin features. Separate FP8
+cohorts are pending and compare changed KV precision to this reference rather
+than claiming a same-precision old-Plugin A/B. FlashAttention is unchanged.
+Keep Draft. Evidence: `evidence/gemma3-window-pair-r245/` and immutable
+independent audit `evidence/gemma3-window-audit-r248/paired-contract/audit.json`.
