@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare private runtime wheels and inspect a built release CI candidate."""
 import argparse
+import ast
 import base64
 import csv
 from email.parser import BytesParser
@@ -22,7 +23,8 @@ GPU_LIBRARIES = ('_C.abi3.so', '_C_stable_libtorch.abi3.so',
                  '_moe_C_stable_libtorch.abi3.so', '_rocm_C.abi3.so')
 ADAPTER_SEAMS = ('kernels/pcp_fork.py', 'fp4_indexer.py', 'v41_fp8_indexer.py',
                  'ct_w4a8_registration.py', 'dsv41_activation.py',
-                 'dsv41_channel_fp8.py', 'dsv41_dspark_registration.py')
+                 'dsv41_channel_fp8.py', 'dsv41_dspark_registration.py',
+                 'kernels/pcp_dspark.py', 'hcu_config.py')
 PAIR_INPUTS = ('ADAPTER_SOURCE', 'ADAPTER_WHEEL_SHA256', 'KERNEL_WHEEL_SHA256')
 
 
@@ -144,6 +146,26 @@ def adapter_manifest(manifest, inputs):
     return pair
 
 
+def adapter_catalog(source):
+    """Check registration metadata without executing package or config code."""
+    try:
+        tree = ast.parse(source.decode('utf-8'))
+        values = [node.value for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == 'BACKEND_CATALOG'
+                          for target in node.targets)]
+        if len(values) != 1:
+            raise ValueError('one static catalog required')
+        catalog = ast.literal_eval(values[0])
+    except (ValueError, SyntaxError, TypeError, UnicodeError) as error:
+        raise CandidateError('Adapter requires a static BACKEND_CATALOG: ' + str(error))
+    entry = catalog.get('vllm_pcp_q_rope') if isinstance(catalog, dict) else None
+    backends = entry.get('backends') if isinstance(entry, dict) else None
+    provider = backends.get('hcu') if isinstance(backends, dict) else None
+    if (not isinstance(provider, dict)
+            or provider.get('status') not in ('candidate', 'validated', 'production')):
+        raise CandidateError('Adapter BACKEND_CATALOG lacks selectable vllm_pcp_q_rope/hcu')
+
+
 def component_payload(path, digest, distribution):
     payload = wheel_payload(path, digest)
     info, metadata = wheel_identity(path)
@@ -165,6 +187,8 @@ def component_payload(path, digest, distribution):
     if distribution == 'hcu-adapter':
         if not all('hcu_adapter/' + name in payload for name in ADAPTER_SEAMS):
             raise CandidateError('paired Adapter lacks required interfaces')
+        with zipfile.ZipFile(path) as archive:
+            adapter_catalog(archive.read('hcu_adapter/hcu_config.py'))
     elif len([name for name in payload if name.startswith('sgl_kernel/native_ops.')
               and name.endswith('.so')]) != 1:
         raise CandidateError('paired kernel requires exactly one native_ops library')
@@ -297,6 +321,7 @@ def inspect_image(expected=None):
     for name in ADAPTER_SEAMS:
         if not Path(adapter.locate_file('hcu_adapter/' + name)).is_file():
             raise CandidateError('image Adapter lacks ' + name)
+    adapter_catalog(Path(adapter.locate_file('hcu_adapter/hcu_config.py')).read_bytes())
     native = {}
     for name in GPU_LIBRARIES:
         native['vllm/' + name] = architectures(Path(core.locate_file('vllm/' + name)))

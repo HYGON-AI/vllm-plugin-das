@@ -179,6 +179,13 @@ group before dispatch. Reuse an existing matching run. Keep the shared consumer
 and complete source/device/Graph/aggregate gates unchanged; publication or
 successful image selection does not establish runtime qualification.
 
+For missing Adapter modules or catalog entries, bind the failed job's resolved
+image digest to its actual installed payload before changing either repository.
+Check companion modules and selectable backend declarations in both the paired
+wheel and installed image without running startup hooks. A merged dependency
+or a self-consistent RECORD does not prove that the selected image delivers it;
+structural admission still needs the original registry/native/device tests.
+
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.
 2. Run affected CPU contracts, then installed native numerics and Graph
