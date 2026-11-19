@@ -48,6 +48,9 @@ Adapter versions retain their original auto policy. General-plugin activation
 defers an unresolved V4.1 auto configuration until the platform resolves it.
 The existing FP4 deployment admission and provider checks still apply.
 
+The LightOp FP4 decode path masks logits beyond each device sequence length
+before candidate selection and top-k, including during CUDA Graph replay.
+
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
