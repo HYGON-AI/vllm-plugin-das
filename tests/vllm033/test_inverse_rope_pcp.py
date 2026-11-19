@@ -194,7 +194,11 @@ def test_real_core_forward_applies_inverse_only_to_unrotated_rows(
     monkeypatch.setitem(sys.modules, "vllm.platforms", NS(
         current_platform=NS(is_rocm=lambda: True)))
     monkeypatch.setattr(hcu_env, "arch_name", lambda: "gfx938")
-    monkeypatch.setattr(inverse, "load_operator", lambda: native)
+    def prepare(original):
+        assert original is stock_inverse
+        return native
+
+    monkeypatch.setattr(inverse, "prepare_operator", prepare)
     monkeypatch.setattr(inverse, "eligible", lambda *args: True)
     monkeypatch.setattr(inverse_rope_pcp.registry, "_RECORDS", {})
     monkeypatch.setattr(inverse_rope_pcp.registry, "_BOUND", {})
@@ -224,3 +228,52 @@ def test_real_core_forward_applies_inverse_only_to_unrotated_rows(
     assert torch.equal(output[0, :, -64:], torch.full((2, 64), 6, dtype=output.dtype))
     assert torch.equal(output[1:, 0, -64:], torch.full((2, 64), 3, dtype=output.dtype))
     assert torch.equal(output[1:, 1, -64:], torch.full((2, 64), 2, dtype=output.dtype))
+
+
+def _cpu_rounding(output, positions, cache, *, fuse_cosine):
+    """Independent FP64 reference; tests probe policy, not device execution."""
+    a, b = output[..., -64::2].float(), output[..., -63::2].float()
+    c, s = cache[positions.long(), :32, None].transpose(1, 2), cache[positions.long(), 32:, None].transpose(1, 2)
+    sine_even = (b.double() * s.double()).float()
+    sine_odd = (a.double() * s.double()).float()
+    cosine_even, cosine_odd = a.double() * c.double(), b.double() * c.double()
+    if not fuse_cosine:
+        cosine_even, cosine_odd = cosine_even.float().double(), cosine_odd.float().double()
+    output[..., -64::2] = (cosine_even + sine_even.double()).float().to(torch.bfloat16)
+    output[..., -63::2] = (cosine_odd - sine_odd.double()).float().to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_preparation_selects_the_observed_core_arithmetic(fused):
+    def original(out, pos, cache, rope_dim):
+        assert rope_dim == 64
+        _cpu_rounding(out, pos, cache, fuse_cosine=fused)
+
+    def native(tail, pos, cache, *, fuse_cosine):
+        _cpu_rounding(tail, pos, cache, fuse_cosine=fuse_cosine)
+
+    assert inverse._probe_mode(original, native, torch.device("cpu")) is fused
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("kind", ["unsupported", "ambiguous", "dtype-drift"])
+def test_preparation_rejects_unmatched_or_inconsistent_arithmetic(kind):
+    def original(out, pos, cache, rope_dim):
+        if kind == "unsupported":
+            out.fill_(42)
+        else:
+            _cpu_rounding(out, pos, cache, fuse_cosine=(pos.dtype == torch.int32))
+
+    def native(tail, pos, cache, *, fuse_cosine):
+        selected = pos.dtype == torch.int32 if kind == "ambiguous" else fuse_cosine
+        _cpu_rounding(tail, pos, cache, fuse_cosine=selected)
+
+    with pytest.raises(RuntimeError, match="unsupported or ambiguous"):
+        inverse._probe_mode(original, native, torch.device("cpu"))
+
+
+def test_inverse_preparation_is_rejected_inside_capture(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(inverse, "load_operator", lambda: pytest.fail("build during capture"))
+    with pytest.raises(RuntimeError, match="before Graph capture"):
+        inverse.prepare_operator(lambda *args: None)

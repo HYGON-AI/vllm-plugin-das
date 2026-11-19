@@ -60,14 +60,15 @@ def prepare_forward_mqa(base):
     _require_source(original)
     from hcu_adapter.hcu_env import arch_name
     from vllm.platforms import current_platform
-    from .inverse_rope_hcu import load_operator, route
+    from .inverse_rope_hcu import prepare_operator, route
 
     if not current_platform.is_rocm() or arch_name() != "gfx938":
         raise RuntimeError("V41 PCP inverse RoPE requires real gfx938 HIP")
 
     namespace = dict(original.__globals__)
+    original_inverse = namespace["rocm_inverse_rope_rows_"]
     namespace["rocm_inverse_rope_rows_"] = route(
-        namespace["rocm_inverse_rope_rows_"], load_operator())
+        original_inverse, prepare_operator(original_inverse))
     run = FunctionType(original.__code__, namespace, original.__name__,
                        original.__defaults__, original.__closure__)
     run.__kwdefaults__ = original.__kwdefaults__
