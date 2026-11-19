@@ -217,6 +217,31 @@ def test_real_attention_constructor_selects_68byte_cache_before_binding(chain):
     assert not torch.cuda.is_initialized()
 
 
+@pytest.mark.parametrize('dtype', ['auto', 'mxfp4'])
+def test_platform_default_reaches_the_real_fp4_cache_constructor(chain, monkeypatch, dtype):
+    from hcu_adapter.bridges import vllm as bridge
+    from hcu_adapter.extensions import ExtensionReport, ExtensionStatus
+    from vllm.config import AttentionConfig
+
+    chain.cfg.attention_config = AttentionConfig(indexer_kv_dtype=dtype)
+    owners = tuple(ExtensionReport(capability, capability, ExtensionStatus.ACTIVE,
+                                   frozenset({capability}), 'CPU provider')
+                   for capability in bridge._FP4_INDEXER_CAPABILITIES)
+    monkeypatch.setattr(bridge, 'extension_reports', lambda: owners)
+    monkeypatch.setattr(bridge, 'require_extension_healthy', lambda _: None)
+    bridge._configure_indexer_kv_dtype(chain.cfg)
+    assert chain.cfg.attention_config.indexer_kv_dtype == 'mxfp4'
+    attention = make_attention(chain)
+    cache = attention.indexer.k_cache
+    spec = cache.get_kv_cache_spec(chain.cfg)
+    assert spec.head_size == 68
+    assert spec.page_size_bytes >= 4352
+    assert cache.get_attn_backend().get_builder_cls() is impl.Fp4MetadataBuilder
+    assert isinstance(attention.indexer.indexer_op, scorer.HcuV41SparseAttnIndexer)
+    assert attention.indexer.indexer_op._hcu_fp4
+    assert not torch.cuda.is_initialized()
+
+
 def test_mixed_ratio_model_is_admitted_before_allocation(chain):
     chain.cfg.model_config.hf_text_config.compress_ratios = [0, 1, 2]
     plan = impl.validate_config(chain.cfg)

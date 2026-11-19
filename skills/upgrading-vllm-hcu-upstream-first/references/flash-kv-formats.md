@@ -47,3 +47,9 @@ fallback also re-enters the vendor path that casts Q to cache dtype. Route
 explicit decode-LSE through the verified bounded byte-gather/ordinary-varlen
 composition and independently check output/LSE in eager and changed-input
 Graph tests; retain paged decode when no normalizer is requested.
+
+Keep the final-source model qualification separate from component acceptance.
+The [Qwen3-8B final-payload comparison](../../../docs/validation/vllm033-flash-e4m3-model-boundary.md)
+records an E4M3 raw loss despite equal normalized totals and passing Graph/prefix
+probes. Its unchanged full-cohort BF16 repeat preserves the failing-task boundary;
+neither that repeat nor normal process exits waive accuracy or native-owner leaks.

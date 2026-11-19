@@ -70,8 +70,12 @@ def select_attention(cfg):
     `HCU_DISABLE_OPS=vllm_pcp` actually mean something at construction time.
     """
     from hcu_adapter.kernels import pcp_fork
+    from ..inverse_rope_policy import selected_mode
 
-    if pcp_fork.selected_mode() == 'stock' or not validate_config(cfg):
+    admitted = pcp_fork.selected_mode() != 'stock' and validate_config(cfg)
+    if not admitted:
+        if selected_mode() == 'hcu':
+            raise ValueError('Selected inverse RoPE requires native PCP attention')
         return native._select_dsv4_attn_cls(cfg)
     base = attention_class()
     if cfg.speculative_config is not None:

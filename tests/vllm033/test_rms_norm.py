@@ -187,6 +187,14 @@ for name, module in (
 ):
     sys.modules[name] = module
 
+from hcu_vllm_das import extension
+provider_imports = []
+original_importer = extension._import_module
+def observe_import(name):
+    if name == "lightop.norm":
+        provider_imports.append(name)
+    return original_importer(name)
+extension._import_module = observe_import
 module = importlib.import_module("hcu_vllm_das.rms_norm")
 layer = module.HcuRMSNorm()
 try:
@@ -243,6 +251,7 @@ fused_fake = fused_registration["fake_impl"](
     layer.variance_epsilon,
 )
 layer_events = list(events)
+provider_admissions_before_direct_probe = list(provider_imports)
 impl_probe_value = Tensor(
     (3, {width!r}),
     dtype={input_dtype!r},
@@ -260,6 +269,7 @@ fused_impl = fused_registration["op_func"](
     layer.variance_epsilon,
 )
 print(json.dumps({{
+    "provider_admissions": provider_admissions_before_direct_probe,
     "registration_names": [item["op_name"] for item in registrations],
     "ordinary_mutates": ordinary_registration["mutates_args"],
     "fused_mutates": fused_registration["mutates_args"],
@@ -436,3 +446,18 @@ def test_compiled_rms_delegates_complete_operation_to_core(residual):
     assert report["result"] == "native-result"
     assert not any(event[0] in {"ordinary-lightop", "fused-lightop"}
                    for event in report["events"])
+
+
+@pytest.mark.parametrize("options,expected", (
+    ({"master": "0", "child": "0"}, []),
+    ({"master": "1", "child": "0"}, []),
+    ({"master": "0", "child": "1"}, []),
+    ({"compiling": True}, []),
+    ({"batch_invariant": True}, []),
+    ({"hidden_size": 32}, []),
+    ({}, ["lightop.norm"]),
+    ({"residual": True}, ["lightop.norm"]),
+))
+def test_vendor_is_admitted_only_for_actual_eager_lightop_execution(options, expected):
+    result = run_fake_runtime(**options)
+    assert result["provider_admissions"] == expected

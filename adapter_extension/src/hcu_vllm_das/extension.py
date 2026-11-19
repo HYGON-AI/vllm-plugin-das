@@ -14,7 +14,7 @@ from hcu_adapter.extensions import (
     ExtensionSpec,
 )
 
-from .environment import register_compile_factors
+from .environment import register_compile_factors, rms_norm_enabled
 from .version import TARGET_VLLM_RELEASE
 
 
@@ -22,6 +22,7 @@ _CAPABILITIES = frozenset({"lightop-rms-norm"})
 _IMPLEMENTED_EXTENSION_API_VERSION = 1
 _activation_lock = threading.Lock()
 _activated = False
+_provider_health = None
 
 
 class DasExtensionError(RuntimeError):
@@ -86,37 +87,58 @@ def _require_rms_call_arity(function, name, arguments):
         signature.bind(*arguments)
 
 
+def _validate_lightop_norm(lightop_norm: object) -> None:
+    for name, arguments in (
+        ("rms_norm", (object(), object(), 1e-6, object())),
+        ("fused_add_rms_norm", (object(), object(), object(), 1e-6)),
+    ):
+        _require_callable(lightop_norm, name, f"lightop.norm.{name}")
+        function = getattr(lightop_norm, name)
+        implementations = (function,) if inspect.isroutine(function) else (function, function.__call__)
+        if any(check(implementation) for implementation in implementations for check in (
+            inspect.iscoroutinefunction, inspect.isasyncgenfunction, inspect.isgeneratorfunction,
+        )):
+            raise DasExtensionError(f"lightop.norm.{name} must be synchronous")
+        try:
+            _require_rms_call_arity(function, name, arguments)
+        except (TypeError, ValueError) as error:
+            raise DasExtensionError(
+                f"required four-positional-argument RMS ABI unavailable: lightop.norm.{name}"
+            ) from error
+
+
+def get_lightop_norm():
+    """Resolve and validate the vendor only when its capability is requested."""
+    from .rms_provider import get_provider, check_provider_health
+
+    global _provider_health
+    _provider_health = check_provider_health
+    return get_provider(_import_module, _validate_lightop_norm)
+
+
+def check_health() -> None:
+    if not _activated:
+        raise DasExtensionError("DAS RMS extension has not activated")
+    if _provider_health is not None:
+        _provider_health()
+
+
 def activate_extension(context: ExtensionContext) -> None:
     """Validate and register the migrated optimization capability once."""
 
     global _activated
     _require_vllm_033_release_line(context.vllm_version)
     with _activation_lock:
+        provider_required = (
+            rms_norm_enabled()
+            or "das_hcu" in context.requested_extensions
+            or "lightop-rms-norm" in context.requested_capabilities
+        )
+        if provider_required:
+            get_lightop_norm()
         if _activated:
+            check_health()
             return
-        try:
-            lightop_norm = _import_module("lightop.norm")
-        except Exception as error:
-            raise DasExtensionError(
-                f"cannot import required LightOp norm module: {error}"
-            ) from error
-        for name, arguments in (
-            ("rms_norm", (object(), object(), 1e-6, object())),
-            ("fused_add_rms_norm", (object(), object(), object(), 1e-6)),
-        ):
-            _require_callable(lightop_norm, name, f"lightop.norm.{name}")
-            function = getattr(lightop_norm, name)
-            implementations = (function,) if inspect.isroutine(function) else (function, function.__call__)
-            if any(check(implementation) for implementation in implementations for check in (
-                inspect.iscoroutinefunction, inspect.isasyncgenfunction, inspect.isgeneratorfunction,
-            )):
-                raise DasExtensionError(f"lightop.norm.{name} must be synchronous")
-            try:
-                _require_rms_call_arity(function, name, arguments)
-            except (TypeError, ValueError) as error:
-                raise DasExtensionError(
-                    f"required four-positional-argument RMS ABI unavailable: lightop.norm.{name}"
-                ) from error
 
         try:
             vllm_layernorm = _import_module(
@@ -160,6 +182,7 @@ def extension_spec() -> ExtensionSpec:
         priority=100,
         capabilities=_CAPABILITIES,
         activate=activate_extension,
+        check_health=check_health,
     )
 
 
