@@ -19,6 +19,14 @@ For v0.33, `adapter_extension` is the production project; repository-root
 - Plugin owns optional providers through Adapter extensions. Check defaults,
   explicit enablement, required-owner failures and the existing kill switch.
 
+For a standalone draft config missing from the official registry, first test
+public Transformers `AutoConfig.register()` from an Adapter extension before
+adding Core registry entries or replacing parsers. Inherit the official config
+under a distinct model type, preserve foreign registrations and verify real
+`get_config`/save-load paths. See [standalone draft configuration](
+references/standalone-draft-config.md); config support does not qualify MTP
+execution.
+
 Compare the actual baseline and target implementations before retaining,
 rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names

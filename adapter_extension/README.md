@@ -69,6 +69,31 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Standalone Step5 MTP configuration
+
+`das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
+Adapter activates it before vLLM constructs model configuration. It registers
+only the separate `step5_mtp` model type through Transformers' public
+`AutoConfig.register()` API. Ordinary `step5` and `step5_vl` configs, their
+validation and the in-checkpoint MTP conversion stay owned by vLLM.
+
+The Plugin class inherits official `Step5Config`, defaults standalone drafts
+to one prediction layer and the `Step5MTP` architecture, and preserves explicit
+checkpoint values. Both ordinary `hf` and `auto` config formats work with
+`trust_remote_code=False`; no custom config-format flag or Core registry patch
+is needed. Discovery imports no framework or native provider. A pre-existing
+`step5_mtp` owner is refused without overwriting it. Failed publication or
+subsequent ownership drift is fatal for that process; health checks do not
+repair or silently republish the mapping. Spawned processes register their own
+mapping, and a fork must explicitly activate its inherited exact mapping.
+
+To require configuration support at startup, use the Adapter's existing
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=step5-standalone-mtp-config` requirement.
+This is a **configuration capability**. It does not establish Step5 checkpoint
+loading, tokenizer, sparse attention, Graph, drafted/accepted tokens, model
+accuracy or performance. See the [configuration validation boundary](
+../docs/validation/vllm033-step5-config.md).
+
 ## DSV4.1 Channel-FP8 configuration routing
 
 The independent `das_hcu_dsv41` Adapter extension advertises only
@@ -396,9 +421,16 @@ only for uninspectable native builtins, a compatible concrete declaration from
 generated binding documentation, including overloads and optional additions.
 Declarations are parsed without evaluating annotations or defaults. Missing or
 incompatible documentation, uninspectable Python callables, and asynchronous or
-generator providers are rejected. This extends the existing activation preflight;
-its provider checks still run even when the RMS execution flags are OFF.
-It neither invokes a provider nor proves kernel, Graph or model correctness.
+generator providers are rejected. Explicit RMS opt-in, a required `das-hcu` extension, or a required
+`lightop-rms-norm` capability performs these checks before registration.
+With RMS disabled and no explicit requirement, registration retains the official
+fallback and compile factor without importing LightOp. If later enabled, the
+first eligible eager custom-op call resolves and validates the provider once
+per process; ABI/import failures are latched rather than silently falling back.
+The read-only extension health checker reports prior provider failures without
+loading or repairing a provider. Direct custom-op calls also require admission.
+See [optional-provider loading](../docs/validation/vllm033-rms-lazy-provider.md).
+Admission neither invokes a provider nor proves kernel, Graph or model correctness.
 
 Compiled calls delegate to Core's complete RMSNorm IR, including its compiler
 precision policy and fusion across consecutive residual additions. The optional

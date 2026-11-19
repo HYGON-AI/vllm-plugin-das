@@ -30,3 +30,27 @@ and GIL tests establish host transport behavior only. HIP IPC, device registrati
 RDMA, P/D model output, Graph, accuracy, lifecycle and performance retain their
 own applicable gates. Record owned-process exits and listener cleanup separately
 from numerical assertions; retain an initial bind refusal and any later recovery.
+
+
+For a default-OFF native optimization, trace real activation and the ordinary
+model path as well as the enable switch: registering an OOT class or fake/custom
+op need not import its vendor DSO. Preserve official fallback, compile-cache
+factors and explicit required-capability admission while deferring an unused
+provider. Required extensions use published entry-point names, which can differ
+from declared spec names; exercise the real host activation with that metadata.
+Reuse Adapter's process-local lifecycle for serialized first-use ABI checks
+and fork refusal; a health checker reports failures without initializing
+or repairing the provider. Verify enabled ordinary/fused execution and changing
+input Graph replay after an installed-wheel binding check. Count shutdown leaks
+and the original cleanup deadline separately: fewer imports do not establish a
+clean exit or a speedup. The Plugin RMS example is documented in
+`docs/validation/vllm033-rms-lazy-provider.md`.
+
+Before carrying a constructor patch that forces a native operator, inspect the
+target's dispatch and precision guards. For clamp SwiGLU, current v0.33 Core
+already selects its ROCm kernel for default alpha/beta and retains its Torch
+path for nondefault parameters. Preserve that policy and official custom-op
+enablement rather than forcing every configuration through the kernel. Reuse
+upstream eager tests and add changing-input Graph coverage on the real class;
+see `docs/validation/vllm033-official-clamp-swiglu.md`. Component ownership does
+not qualify a checkpoint, HumanEval, performance or whole-model shutdown.
