@@ -52,3 +52,12 @@ input Graph replay after an installed-wheel binding check. Count shutdown leaks
 and the original cleanup deadline separately: fewer imports do not establish a
 clean exit or a speedup. The Plugin RMS example is documented in
 `docs/validation/vllm033-rms-lazy-provider.md`.
+
+Before carrying a constructor patch that forces a native operator, inspect the
+target's dispatch and precision guards. For clamp SwiGLU, current v0.33 Core
+already selects its ROCm kernel for default alpha/beta and retains its Torch
+path for nondefault parameters. Preserve that policy and official custom-op
+enablement rather than forcing every configuration through the kernel. Reuse
+upstream eager tests and add changing-input Graph coverage on the real class;
+see `docs/validation/vllm033-official-clamp-swiglu.md`. Component ownership does
+not qualify a checkpoint, HumanEval, performance or whole-model shutdown.
