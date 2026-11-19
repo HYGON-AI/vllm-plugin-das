@@ -8,7 +8,6 @@ manager only within their private instance namespaces.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
 import hashlib
 import inspect
 from types import FunctionType, MethodType
@@ -17,6 +16,8 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, get_pcp_g
 from vllm.distributed.device_communicators.all2all import AgRsAll2AllManager
 from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import MoEPrepareAndFinalizeNaiveDPEPModular
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+
+from .dspark_capacity import TokenCapacity, token_capacity
 
 _BACKEND = 'allgather_reducescatter'
 _OWNER = 'hcu_dsv41_dspark_agrs_v1'
@@ -45,29 +46,6 @@ def _capacity_from_metadata(cfg):
     if any(type(value) is not int for value in values):
         return None
     return TokenCapacity(*values)
-
-
-@dataclass(frozen=True)
-class TokenCapacity:
-    query_per_request: int
-    query_rows: int
-    verify_rows: int
-    budget: int
-
-
-def token_capacity(cfg):
-    spec, scheduler = cfg.speculative_config, cfg.scheduler_config
-    n, reqs, budget = spec.num_speculative_tokens, scheduler.max_num_seqs, scheduler.max_num_batched_tokens
-    if any(type(x) is not int or x <= 0 for x in (n, reqs, budget)):
-        raise ValueError('DSpark requires positive integer n/requests/token budget')
-    anchor = getattr(spec.draft_model_config.hf_config, 'sample_from_anchor', True)
-    if type(anchor) is not bool:
-        raise ValueError('DSpark sample_from_anchor must be bool')
-    query = n if anchor else n + 1
-    result = TokenCapacity(query, reqs * query, reqs * (n + 1), budget)
-    if max(result.query_rows, result.verify_rows) > budget:
-        raise ValueError(f'DSpark capacity exceeds original budget: query={result.query_rows}, verify={result.verify_rows}, budget={budget}')
-    return result
 
 
 def is_owned_draft(cfg):
