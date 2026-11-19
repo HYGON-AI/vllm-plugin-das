@@ -742,3 +742,30 @@ native writer, softcap0/50 and windows1/17/64/4096. It adds FP16-query FP8
 coverage and in-place scale changes between Graph replays while retaining the
 original fixed-scale BF16 cases. Current model precision, normal shutdown and
 performance remain unqualified; historical failures above are not waived.
+
+
+### Native FP16 E4M3 writer input precision
+
+R233's expanded320-case device matrix passes the original96 cases but exposes
+32 failures in the added FP16-query/E4M3,0.7/0.3-scale cases, both layouts,
+with fixed or changing scales and softcap0/50. All original references and
+0.016 bounds remain unchanged. This is not a passing native candidate.
+
+The selected Core native writer's half specialization stores `x / scale` back
+into a half temporary before converting it to FP8; its FP32 specialization
+converts directly. R234's external controlled native byte comparison confirms
+the mechanism: first-wave half inputs differ from the FP32 quantization
+reference at662 K and1058 V elements out of276480 each, while exactly matching
+a half-rounded reference. Promoting inputs before the same native writer
+matches every FP32-reference byte. Three unchanged window1/17/64 tests,
+including softcap50 and changing-input/scale Graph replay, pass in that
+diagnostic. This does not change an installed package or qualify production.
+
+The new candidate promotes only FP16 inputs on the E4M3 writer route to FP32,
+then calls the unchanged native HCU quantize/scatter. It retains the source
+Q/K/V buffers and caller's cache/scales/slot mapping; two temporary FP32 input
+buffers scale with the active input token count, not KV-cache capacity. Other
+input/cache dtype routes retain their existing inputs. No native library or
+FlashAttention source/build changes. Final wheel/native/model and performance
+qualification must include this candidate; the earlier reader-only results
+cannot qualify the added writer branch.

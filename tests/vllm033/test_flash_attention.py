@@ -763,8 +763,9 @@ def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("kv_cache_dtype", ("auto", "bfloat16", "float16", "fp8_e4m3"))
+@pytest.mark.parametrize("input_dtype", (torch.float32, torch.bfloat16, torch.float16))
 def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
-    monkeypatch, layout, kv_cache_dtype
+    monkeypatch, layout, kv_cache_dtype, input_dtype
 ):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
     calls = []
@@ -775,7 +776,7 @@ def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
     impl.head_size = 4
     strides = (120, 40, 8, 1) if layout == "LBHNC" else (120, 8, 24, 1)
     packed = torch.empty_strided((1, 3, 5, 8), strides)
-    key = torch.randn(2, 3, 4)
+    key = torch.randn(2, 3, 4, dtype=input_dtype)
     value = torch.randn_like(key)
     slots = torch.tensor([0, 1], dtype=torch.long)
     layer = SimpleNamespace(_k_scale=torch.tensor(1.0), _v_scale=torch.tensor(1.0))
@@ -784,7 +785,12 @@ def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
 
     assert len(calls) == 1
     k, v = impl._get_kv_cache_write_views(packed)
-    assert calls[0][:2] == (key, value)
+    if kv_cache_dtype == "fp8_e4m3" and input_dtype == torch.float16:
+        for actual, original in zip(calls[0][:2], (key, value)):
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, original.float(), atol=0, rtol=0)
+    else:
+        assert calls[0][0] is key and calls[0][1] is value
     assert calls[0][2].data_ptr() == k.data_ptr()
     assert calls[0][3].data_ptr() == v.data_ptr()
     assert calls[0][2].stride() == k.stride()

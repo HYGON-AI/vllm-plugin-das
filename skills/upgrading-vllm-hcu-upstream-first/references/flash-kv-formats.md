@@ -73,7 +73,14 @@ cache allocation, host value read or Q/output rescale. Preserve typed FP8 views
 and verify fixed-address, changing-scale Graph replays. Nonuniform request/head
 scales are a different contract; do not collapse them to a scalar or a shared
 physical-block scale cache. Retain an independent FP32 reference and unchanged
-tolerances, including scales that are not powers of two. Exercise public forward dispatch,
+tolerances, including scales that are not powers of two. Check native writer rounding separately from
+reader scaling: a half-input specialization may round `x/scale` to half before
+FP8 conversion while a BF16/FP32 specialization does not. Compare raw written
+bytes to independent FP32 quantization before attributing an attention error.
+If an admitted native FP32-input specialization is used to preserve precision,
+retain native quantize/scatter, account for active-token conversion scratch and
+validate changed-input/scale Graph replay and performance for that route.
+Exercise public forward dispatch,
 prefill-gather on/off, non-unit scales and changed-input Graph replay in both
 layouts. Core owns the softcap algorithm; a provider fallback does not prove
 the vendor implements it or qualify model accuracy.

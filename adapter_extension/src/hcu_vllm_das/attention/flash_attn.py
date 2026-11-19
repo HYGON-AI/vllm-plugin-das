@@ -362,6 +362,11 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         if self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE:
             from vllm._custom_ops import reshape_and_cache_flash
 
+            if self.kv_cache_dtype == _E4M3_KV_CACHE_DTYPE and key.dtype == torch.float16:
+                # The native half specialization rounds x/scale back to half
+                # before converting to FP8. Use its FP32 input specialization
+                # to avoid that extra rounding, retaining native quantize/scatter.
+                key, value = key.float(), value.float()
             reshape_and_cache_flash(
                 key,
                 value,
