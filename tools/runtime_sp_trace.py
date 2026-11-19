@@ -181,7 +181,8 @@ def compare_trace_sets(reference, candidate, *, atol=.016, rtol=.016):
                         within_tolerance = False
                     finite = bool(torch.isfinite(actual).all() and torch.isfinite(expected).all())
                     difference = (actual.float() - expected.float()).abs().max()
-                    rows.append(dict(sample=label, event=name, leaf=leaf, rank=rank,
+                    rows.append(dict(sample=label, event_index=index, event=name,
+                        leaf=leaf, rank=rank,
                         exact=torch.equal(actual, expected), within_tolerance=within_tolerance and finite,
                         max_abs_error=float(difference) if torch.isfinite(difference) else None,
                         finite=finite))

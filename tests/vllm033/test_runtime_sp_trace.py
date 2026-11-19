@@ -47,6 +47,37 @@ def test_inactive_hooks_do_not_inspect_gpu_capture(monkeypatch):
     trace.close()
 
 
+def test_shared_rotary_module_keeps_distinct_invocation_indices():
+    class CachedRotary(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+            shared = nn.Identity()
+            for layer in self.model.layers:
+                layer.self_attn = nn.Module()
+                layer.self_attn.rotary_emb = shared
+
+        def forward(self, x, offset):
+            self.model.layers[0].self_attn.rotary_emb(x)
+            return self.model.layers[1].self_attn.rotary_emb(x + offset)
+
+    data = []
+    for arm, offset in (("reference", 0), ("candidate", 1)):
+        model = CachedRotary()
+        trace = RuntimeSPTrace(model, arm=arm, rank=0, size=1, num_tokens=3)
+        with trace.capture("eager", active_tokens=3):
+            model(torch.zeros(3, 4), offset)
+        trace.close()
+        data.append([trace.data])
+    result = compare_trace_sets(*data)
+    first, second = result["comparisons"]
+    assert first["event"] == second["event"]
+    assert first["exact"] and first["event_index"] == 0
+    assert not second["exact"] and second["event_index"] == 1
+    assert result["first_difference"] == result["first_outside_tolerance"] == second
+
+
 def test_recording_refuses_inside_graph_and_preserves_incomplete_sample(monkeypatch):
     model = Toy()
     trace = RuntimeSPTrace(model, arm="reference", rank=0, size=1, num_tokens=1)

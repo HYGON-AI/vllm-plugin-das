@@ -206,6 +206,11 @@ weight loading, provider arithmetic and rounding/reduction order. Ordinary TP's
 partial GEMMs plus reduction and an SP replicated full GEMM can differ in BF16;
 that observation alone neither waives a model gate nor justifies a policy change.
 
+Use `sample` and `event_index` to identify each invocation, retaining `event`
+as the canonical module name. Core can cache one RoPE module across layers;
+`named_modules()` then supplies one name for several calls. Do not merge those
+rows by name or assign a later call to the layer encoded in that shared name.
+
 `tests/vllm033/test_runtime_sp_trace.py` covers CPU capture and offline controls.
 Its success does not qualify a device trace, SP collective, trained checkpoint,
 HumanEval, normal shutdown or gfx836 support. Record the exact runtime/source
