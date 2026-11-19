@@ -708,25 +708,37 @@ last_good=false; no performance or full-upgrade acceptance follows.
 Immutable current Gemma review SHA256: `69da52ed059050a4ea136932b3c25084d56ecdb610da44a391ef40ce9f6c31f0`.
 The structured record retains per-arm provenance, controller transitions,
 original requests, expected-key checks and every raw/normalized task result.
-## Official per-tensor FP8 descales candidate
+## Official layer-scale attention candidate
 
-The selected v0.33 Core already exposes `KVQuantMode.FP8_PER_TENSOR` in
-`unified_attention`. For BF16/FP16 queries it multiplies loaded FP8 KV tiles
-by their FP32 layer scales before casting to the query dtype. The Plugin now
-passes scalar or zero-stride broadcast layer scales to that official mode,
-preserving typed E4M3/E5M2 views and the caller's Q/output buffers. It avoids
-the vendor mixed-dtype workaround's extra Q/output scaling on this route.
-No FlashAttention source or binary is changed or rebuilt.
+The earlier R230 candidate passed scalar layer descales through Core's
+`KVQuantMode.FP8_PER_TENSOR`. Its unchanged native ragged-window reference
+exposed **24 failures / 96 cases** for scales0.7/0.3 in BF16-query E4M3/E5M2,
+both layouts. Core dequantizes FP8 KV in FP32 but then rounds K/V to Q's dtype
+before QK/PV. An external diagnostic matches the BF16-rounded-cache reference
+while failing the original FP32 reference. Do not relax the original0.016
+absolute/relative bounds or treat the earlier portable132 pass as native pass.
 
-Nonuniform `[batch, KV heads]` scales retain the existing scale adapter;
-Core's per-tensor path loads only the first element and cannot represent them.
-Selection uses tensor metadata, without CPU value reads or synchronization.
-The focused portable attention suite passes 132 cases, including public
-forward routing and retained nonuniform-scale forwarding. These are source
-contracts, not installed native or model qualification.
+The candidate instead represents a scalar layer scale as a zero-stride
+`[blocks, page, KV heads]` view and calls the selected Core's official
+`KVQuantMode.FP8_PER_TOKEN_HEAD` with those scale-cache views. This mode applies
+K scales to FP32 scores before softcap and V scales to probabilities before PV;
+FP8 values are exactly representable in the query dtype. Layer scales are the
+constant special case of this API. No cache-sized scale allocation, KV copy,
+CPU scalar read or Q/output rescale is needed. Typed E4M3/E5M2 storage, native
+writers, metadata, Q and output buffers retain their existing owners.
+FlashAttention source and binary are neither changed nor rebuilt.
 
-The native ragged-window matrix retains its original reference and tolerances,
-native writer, both layouts, zero/positive softcap and changed-input Graph
-checks. It adds non-power-of-two scales 0.7/0.3 alongside 0.5/0.25 for both FP8
-formats. Device results, current-combination model accuracy, original normal
-shutdown and performance remain pending; historical failures below are not waived.
+The route is admitted only for an actual scalar or a fully zero-stride
+`[batch, KV heads]` layer broadcast. Nonuniform batch/head descales retain the
+existing scale adapter: a physical token/head scale cache cannot encode
+request-dependent scales for shared blocks. Selection uses tensor metadata.
+
+In R232's external diagnostic only, the original E4M3 and E5M2 window17 failing
+tests pass with this official scale-cache mode, including changed-input Graph.
+That wrapper is not the installed candidate and does not qualify native/model
+acceptance. The production candidate requires its own wheel and full matrix.
+The matrix preserves the original references,0.016 bounds, both layouts,
+native writer, softcap0/50 and windows1/17/64/4096. It adds FP16-query FP8
+coverage and in-place scale changes between Graph replays while retaining the
+original fixed-scale BF16 cases. Current model precision, normal shutdown and
+performance remain unqualified; historical failures above are not waived.

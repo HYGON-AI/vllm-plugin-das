@@ -350,7 +350,7 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
     def apply_descales(core, arguments):
         pytest.fail("scalar layer scales reached the vendor Q/output workaround")
 
-    tensor_mode = object()
+    token_head_mode = object()
 
     def unified_attention(**arguments):
         calls.append("core")
@@ -358,12 +358,21 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
             assert arguments[name].dtype == storage_dtype
             assert arguments[name].data_ptr() == view.data_ptr()
         assert arguments["q"].data_ptr() == query.data_ptr()
-        assert arguments["kv_quant_mode"] is tensor_mode
+        assert arguments["kv_quant_mode"] is token_head_mode
         assert arguments["q_descale"] is None
-        torch.testing.assert_close(arguments["k_descale"], torch.full((1, 4), 0.5))
-        torch.testing.assert_close(arguments["v_descale"], torch.full((1, 4), 0.25))
-        assert arguments["k_descale"].data_ptr() == layer._k_scale.data_ptr()
-        assert arguments["v_descale"].data_ptr() == layer._v_scale.data_ptr()
+        assert arguments["k_descale"] is arguments["v_descale"] is None
+        for name, value in (("k", 0.5), ("v", 0.25)):
+            scales = arguments[name + "_scale_cache"]
+            assert scales.shape == arguments[name].shape[:3]
+            assert scales.stride() == (0, 0, 0)
+            assert scales.data_ptr() == getattr(layer, "_" + name + "_scale").data_ptr()
+            torch.testing.assert_close(scales, torch.full(scales.shape, value))
+            # The official call observes the original device scalar storage,
+            # including later in-place updates, rather than a copied snapshot.
+            scalar = getattr(layer, "_" + name + "_scale")
+            scalar.fill_(value * 1.5)
+            torch.testing.assert_close(scales, torch.full(scales.shape, value * 1.5))
+            scalar.fill_(value)
         assert arguments["softcap"] == softcap
         assert arguments["window_size"] == (
             (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
@@ -375,7 +384,7 @@ def test_fp8_softcap_forward_preserves_format_and_layer_descales(
     core = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
     core.unified_attention = unified_attention
     kv_interface = ModuleType("vllm.v1.kv_cache_interface")
-    kv_interface.KVQuantMode = SimpleNamespace(FP8_PER_TENSOR=tensor_mode)
+    kv_interface.KVQuantMode = SimpleNamespace(FP8_PER_TOKEN_HEAD=token_head_mode)
     monkeypatch.setitem(sys.modules, scales.__name__, scales)
     monkeypatch.setitem(sys.modules, core.__name__, core)
     monkeypatch.setitem(sys.modules, kv_interface.__name__, kv_interface)

@@ -14,21 +14,23 @@ pytestmark = [pytest.mark.hcu, pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
-@pytest.mark.parametrize("kv_dtype,k_scale,v_scale", (
-    ("bfloat16", 1.0, 1.0), ("float16", 1.0, 1.0),
-    ("fp8_e4m3", 0.5, 0.25), ("fp8_e4m3", 0.7, 0.3),
-    ("fp8_e5m2", 0.5, 0.25), ("fp8_e5m2", 0.7, 0.3),
+@pytest.mark.parametrize("kv_dtype,dtype,k_scale,v_scale", (
+    ("bfloat16", torch.bfloat16, 1.0, 1.0), ("float16", torch.float16, 1.0, 1.0),
+    ("fp8_e4m3", torch.bfloat16, 0.5, 0.25), ("fp8_e4m3", torch.bfloat16, 0.7, 0.3),
+    ("fp8_e5m2", torch.bfloat16, 0.5, 0.25), ("fp8_e5m2", torch.bfloat16, 0.7, 0.3),
+    ("fp8_e4m3", torch.float16, 0.5, 0.25), ("fp8_e4m3", torch.float16, 0.7, 0.3),
+    ("fp8_e5m2", torch.float16, 0.5, 0.25), ("fp8_e5m2", torch.float16, 0.7, 0.3),
 ))
+@pytest.mark.parametrize("changing_scales", (False, True))
 @pytest.mark.parametrize("softcap", (0.0, 50.0))
 @pytest.mark.parametrize("window", (1, 17, 64, 4096))
 @torch.inference_mode()
 def test_sliding_native_writer_forward_ragged_changed_graph(
-    layout, kv_dtype, k_scale, v_scale, softcap, window,
+    layout, kv_dtype, dtype, k_scale, v_scale, changing_scales, softcap, window,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
 
     torch.manual_seed(417)
-    dtype = torch.float16 if kv_dtype == "float16" else torch.bfloat16
     fp8 = kv_dtype.startswith("fp8_")
     storage_dtype = torch.uint8 if fp8 else dtype
     quant_dtype = torch.float8_e4m3fn if kv_dtype == "fp8_e4m3" else torch.float8_e5m2
@@ -59,6 +61,9 @@ def test_sliding_native_writer_forward_ragged_changed_graph(
     impl.scale = dim ** -0.5
 
     def produce(wave):
+        if fp8 and changing_scales:
+            kscale.fill_(k_scale * (1.0, 0.75, 1.25)[wave])
+            vscale.fill_(v_scale * (1.0, 1.25, 0.75)[wave])
         qlens = ((1, 3, 0, 2), (2, 0, 3, 1), (3, 1, 2, 0))[wave]
         lens = ((75, 129, 0, 66), (65, 0, 130, 128), (129, 65, 127, 0))[wave]
         offsets = [0]

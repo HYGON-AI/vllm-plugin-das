@@ -68,6 +68,8 @@ def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
     key, value = kwargs["k"], kwargs["v"]
+    if kwargs["layout"] == "bhsd":
+        key, value = key.transpose(1, 2), value.transpose(1, 2)
     quantization = {}
     if any(kwargs.get(name) is not None for name in ("k_descale", "v_descale")):
         if not _has_core_tensor_descales(kwargs):
@@ -78,9 +80,16 @@ def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
             raise ValueError("Core scaled softcap requires BF16/FP16 queries and typed FP8 KV")
         from vllm.v1.kv_cache_interface import KVQuantMode
 
-        quantization["kv_quant_mode"] = KVQuantMode.FP8_PER_TENSOR
-    if kwargs["layout"] == "bhsd":
-        key, value = key.transpose(1, 2), value.transpose(1, 2)
+        # Core's per-tensor mode rounds dequantized KV to Q's dtype before
+        # QK. Its token/head mode instead scales scores in FP32 and weights
+        # before PV. A layer scalar is a constant token/head scale cache:
+        # zero strides preserve its device storage without allocating a cache
+        # or reading values on the host, including during Graph replay.
+        quantization.update(
+            kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD,
+            k_scale_cache=kwargs["k_descale"].as_strided(key.shape[:3], (0, 0, 0)),
+            v_scale_cache=kwargs["v_descale"].as_strided(value.shape[:3], (0, 0, 0)),
+        )
     output = kwargs.get("out")
     if output is None:
         output = torch.empty_like(kwargs["q"])
@@ -94,7 +103,7 @@ def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
         causal=kwargs.get("causal", False),
         window_size=kwargs.get("window_size") or (-1, -1),
         block_table=kwargs["block_table"], softcap=kwargs.get("softcap", 0.0),
-        q_descale=None, k_descale=kwargs.get("k_descale"), v_descale=kwargs.get("v_descale"),
+        q_descale=None, k_descale=None, v_descale=None,
         alibi_slopes=kwargs.get("alibi_slopes"),
         **quantization,
     )
@@ -397,9 +406,8 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 kwargs["k"] = cache_view(kwargs["k"])
                 kwargs["v"] = cache_view(kwargs["v"])
                 if _has_core_tensor_descales(kwargs):
-                    # Core applies layer scales to FP32 KV tiles before casting
-                    # to Q's dtype. Do not round Q/output through the vendor's
-                    # mixed-dtype workaround when this official mode applies.
+                    # Broadcast the layer scales through Core's token/head
+                    # scale API; avoid rounding dequantized K or scaling Q.
                     return _triton_softcap_attention(**kwargs)
                 # Preserve nonuniform batch/head scale semantics. Core's
                 # per-tensor mode loads only the first scalar.
