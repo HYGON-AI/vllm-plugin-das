@@ -889,3 +889,56 @@ cohorts are pending and compare changed KV precision to this reference rather
 than claiming a same-precision old-Plugin A/B. FlashAttention is unchanged.
 Keep Draft. Evidence: `evidence/gemma3-window-pair-r245/` and immutable
 independent audit `evidence/gemma3-window-audit-r248/paired-contract/audit.json`.
+
+## Real Gemma3 window FP8 cohorts completed (2026-11-19)
+
+The E4M3 and E5M2 cohorts pending in the preceding section are now terminal.
+Both retain the original Gemma3 checkpoint/tokenizer, BF16 weights, gfx938
+device UUID, Core `c440c08`, proposed Adapter97 `6eeea954`, Plugin runtime
+`39eb839`, default Graph/prefix, serving options and original15s exit grace.
+Only the KV precision changes relative to the FLASH BF16 reference. This is
+a quantization comparison, not a same-precision old-Plugin/candidate A/B.
+
+| Check | FLASH BF16 KV | FLASH E4M3 KV | FLASH E5M2 KV |
+| --- | --- | --- | --- |
+| Literal expected window answers | 16/16 | 16/16 | 16/16 |
+| Window real token lists equal to BF16 | Reference | 16/16 | 16/16 |
+| Prefix hit-token delta | 17856 | 17856 | 17856 |
+| Actual HIP graph launches / correlated GPU kernels | 6 /72 | 6 /84 | 6 /84 |
+| GPU unified-attention kernels | 126 | 126 | 126 |
+| HumanEval0–31 raw / isolated normalized | 1/32 /32/32 | 4/32 /32/32 | 0/32 /32/32 |
+| Newly failed raw task relative to BF16 | Reference | HumanEval/4 | HumanEval/4 |
+| Newly failed normalized tasks | Reference | None | None |
+| Changed HumanEval messages / real token lists | Reference | 8/32 | 8/32 |
+| Exit0 within15s, no forced cleanup/survivors | Yes | Yes | Yes |
+| Complete lifecycle | FAIL: nanobind | FAIL: nanobind, EngineDeadError | FAIL: nanobind |
+
+The independent audit verifies source seals, the original18 distribution
+attestations, saved checkpoint double-read hashes, normalized launch options,
+controlled environment and before/after worker metadata. All48 layers retain
+the original40 sliding windows1024 and8 full layers. Boundary inputs remain
+1023/1024/1025/2049 tokens with concurrent waves1/4/8; repeated window tokens
+are stable, and capture counters remain unchanged during real graph execution.
+Profiling is execution evidence, not serving performance acceptance.
+
+E4M3 raw pass flags match BF16 for27/32 tasks; newly passed tasks8/20/28/29
+raise the total while task4 is lost. E5M2 raw flags match for31/32 tasks.
+All32 normalized pass flags match in both comparisons. E4M3 changes messages
+and token lists on tasks4/8/10/15/19/20/28/29; E5M2 changes1/4/7/8/10/15/28/29.
+In E4M3 task4, added Markdown fences cause the raw syntax failure, but the
+normalized program also adds an empty-input branch: its AST differs from
+BF16. Do not call this only a formatting change or output equivalence.
+An improved aggregate raw score cannot waive a newly failed individual task.
+
+Each FP8 model controller returns1 because lifecycle diagnostics remain.
+Gemma3 has no attention softcap. Preserve the original raw accuracy gate,
+per-task losses and output differences; these results do not qualify FP8
+accuracy, real softcap checkpoints, clean lifecycle, serving performance or
+all Plugin features. No FlashAttention source, binaries or build changes.
+Keep Draft pending those gates and the proposed Adapter dependency's approval.
+
+Evidence: `evidence/gemma3-window-fp8-r248/` and immutable independent audit
+`evidence/gemma3-window-audit-r249/fp8-complete/audit.json`, SHA256
+`61ae8f734751cca35e4ae9a3bc5ceb242b5ecba98243d016dda621c4d6d80d78`.
+The audit reuses saved isolated scores without executing generated code or
+rehashing the weights again; its executed script is retained beside the result.

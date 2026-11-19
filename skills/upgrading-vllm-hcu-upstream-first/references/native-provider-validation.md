@@ -229,6 +229,12 @@ must be labeled accordingly. Keep raw fenced-code failures separate from
 isolated format-normalized scores even when both backends produce identical
 messages, tokens and pass flags.
 
+Compare per-task pass sets even when the aggregate raw score improves: newly
+passed tasks can conceal a lost reference task. If fenced output fails raw
+scoring, compare the normalized programs too. A changed AST or added branch
+prevents attributing the whole difference to formatting; equal normalized
+pass flags do not prove equivalent programs or waive the original raw gate.
+
 
 ## Inverse-RoPE rounding boundaries
 
