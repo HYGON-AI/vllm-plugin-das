@@ -161,7 +161,7 @@ merely to pass discovery. Qualify each admitted operator and consumer separately
 
 ## Validate the changed execution path
 
-For interrupted checkpoint downloads and live-worker inspection, read
+For interrupted checkpoint downloads, live-worker inspection or shutdown stalls, read
 [checkpoint recovery and runtime probes](references/checkpoint-runtime-probes.md).
 Keep the original checkpoint identity and avoid copying live tensor owners.
 
