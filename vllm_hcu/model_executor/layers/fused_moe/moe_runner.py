@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_dp_group,
     get_ep_group,
     get_pcp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -1213,9 +1214,15 @@ class MoERunner(MoERunnerInterface):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]
+    ):
         if getattr(self._quant_method, "hcu_owns_dispatch", False):
             # MegaMoE addresses the complete TP/DP/PCP expert group itself.
+            if extra_tensors is not None:
+                return hidden_states, router_logits, extra_tensors
             return hidden_states, router_logits
         # For naive dispatch/combine Dp/Ep, dispatch the hidden states and
         # router logits to all experts.
@@ -1229,13 +1236,19 @@ class MoERunner(MoERunnerInterface):
                 "with naive DP/EP or PCP dispatch"
             )
         if self.do_naive_dispatch_combine:
+            kwargs = {} if extra_tensors is None else {"extra_tensors": extra_tensors}
             result = get_ep_group().dispatch_router_logits(
                 hidden_states,
                 router_logits,
                 self.moe_config.is_sequence_parallel,
+                **kwargs,
             )
-            assert len(result) == 2
-            hidden_states, router_logits = result
+            if extra_tensors is None:
+                assert len(result) == 2
+                hidden_states, router_logits = result
+            else:
+                assert len(result) == 3
+                hidden_states, router_logits, extra_tensors = result
 
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
@@ -1254,32 +1267,84 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
                 dim=0,
             )
+            if extra_tensors is not None:
+                extra_tensors = [
+                    get_pcp_group().all_gather(tensor, dim=0)
+                    for tensor in extra_tensors
+                ]
 
+        if extra_tensors is not None:
+            return hidden_states, router_logits, extra_tensors
         return hidden_states, router_logits
 
     @contextmanager
-    def _pcp_routing_inputs(self, input_ids, num_local_tokens):
-        """Match routing auxiliaries to the fallback PCP dispatch ordering."""
-        if not (
+    def _dispatched_routing_inputs(self, hidden_states, router_logits, input_ids):
+        """Dispatch routing auxiliaries in the same row order as the logits.
+
+        The padding bitmap belongs to the local forward context, not to the
+        gathered MoE batch. Carry it through the same DP/EP and fallback PCP
+        collectives, then restore it before the next layer or on failure.
+        Core's SP bitmap is TP-global. Already-local producers may declare
+        ``context.additional_kwargs["hcu_moe_padding_is_local"] = True``;
+        this is required when a single-row mask has an ambiguous shape.
+        """
+        needs_dispatch = self.do_naive_dispatch_combine or (
             self.moe_config.pcp_size > 1
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
             and not getattr(self._quant_method, "hcu_owns_dispatch", False)
-        ):
-            yield input_ids
-            return
-
+        )
         context = get_forward_context() if is_forward_context_available() else None
         local_padding = context.is_padding if context is not None else None
-        if input_ids is not None:
-            input_ids = get_pcp_group().all_gather(
-                input_ids[:num_local_tokens], dim=0
+        extra_tensors = []
+        num_local_tokens = hidden_states.shape[0]
+        if needs_dispatch:
+            if input_ids is not None:
+                extra_tensors.append(input_ids[:num_local_tokens])
+            if local_padding is not None:
+                padding = local_padding
+                if self.moe_config.is_sequence_parallel:
+                    # SP shards activations using the original TP group. MoE
+                    # TP may instead be flattened over DP or collapsed by EP.
+                    tp_size = get_tensor_model_parallel_world_size()
+                    if tp_size > 1:
+                        # Core provides a TP-global bitmap. Exact-sized,
+                        # multirow local masks are unambiguous; a one-row mask
+                        # is not, so default to Core's global contract. Local
+                        # producers can declare their domain for any shape.
+                        is_local = getattr(context, "additional_kwargs", {}).get(
+                            "hcu_moe_padding_is_local",
+                            padding.shape[0] == num_local_tokens
+                            and num_local_tokens > 1,
+                        )
+                        if not is_local:
+                            start = get_tensor_model_parallel_rank() * num_local_tokens
+                            padding = padding[start : start + num_local_tokens]
+                padding = padding[:num_local_tokens]
+                if padding.shape[0] < num_local_tokens:
+                    # sequence_parallel_chunk can append activation rows when
+                    # the global token count is not divisible by TP. Those
+                    # synthetic rows must be skipped, not treated as valid.
+                    padding = F.pad(
+                        padding, (0, num_local_tokens - padding.shape[0]), value=True
+                    )
+                # PyNccl cannot carry bool, and IPC all-gather requires each
+                # tensor's row width to be 4-byte aligned. One int32 per row
+                # preserves both providers in the existing batched collective.
+                extra_tensors.append(padding.to(torch.int32))
+        if extra_tensors:
+            hidden_states, router_logits, extra_tensors = self._maybe_dispatch(
+                hidden_states, router_logits, extra_tensors=extra_tensors
             )
-        if local_padding is not None:
-            context.is_padding = get_pcp_group().all_gather(
-                local_padding[:num_local_tokens], dim=0
+            if input_ids is not None:
+                input_ids = extra_tensors[0]
+        else:
+            hidden_states, router_logits = self._maybe_dispatch(
+                hidden_states, router_logits
             )
         try:
-            yield input_ids
+            if needs_dispatch and local_padding is not None:
+                context.is_padding = extra_tensors[-1].to(torch.bool)
+            yield hidden_states, router_logits, input_ids
         finally:
             if context is not None:
                 context.is_padding = local_padding
@@ -1442,7 +1507,6 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            num_local_tokens = hidden_states.shape[0]
             dispatch_output_dtype = None
             if use_int8_allgatherv:
                 if router_logits is None:
@@ -1479,15 +1543,14 @@ class MoERunner(MoERunnerInterface):
                     dtype=dispatch_output_dtype,
                 )
                 router_logits = None
-            else:
-                hidden_states, router_logits = self._maybe_dispatch(
-                    hidden_states,
-                    router_logits,
+            routing_context = (
+                nullcontext((hidden_states, router_logits, input_ids))
+                if use_int8_allgatherv
+                else self._dispatched_routing_inputs(
+                    hidden_states, router_logits, input_ids
                 )
-
-            with self._pcp_routing_inputs(
-                input_ids, num_local_tokens
-            ) as routing_input_ids:
+            )
+            with routing_context as (hidden_states, router_logits, routing_input_ids):
                 shared_output, hidden_states = self._apply_quant_method(
                     hidden_states=hidden_states,
                     router_logits=router_logits,

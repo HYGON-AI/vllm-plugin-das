@@ -9242,7 +9242,7 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     scheme = module.CompressedTensorsW8A8Int8()
     assert scheme.supports_quanted_inputs() is False
     layer = SimpleNamespace(weight=torch.nn.Parameter(torch.ones(2, 3)))
-    assert scheme.apply_weights(layer, "x", None)[0] == "upstream"
+    assert scheme.apply_weights(layer, torch.ones(2, 3), None)[0] == "upstream"
     scheme.process_weights_after_loading(layer)
     assert layer.weight.shape == (3, 2)
 
@@ -9274,6 +9274,100 @@ def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.Monke
     assert feature_layer.weight.is_contiguous()
     assert feature_scheme.apply_weights(feature_layer, "x", None) == "hcu"
     assert calls[0]["weight"] is feature_layer.weight
+
+
+def _int8_tensor_fallback_scheme(monkeypatch: pytest.MonkeyPatch):
+    class CompressedTensorsW8A8Int8:
+        def process_weights_after_loading(self, layer):
+            pass
+
+        def apply_weights(self, layer, x, bias):
+            # Model the Core Triton kernel's two-dimensional row contract.
+            # This is a CPU wrapper test, not a native quantization test.
+            rows, width = x.shape
+            assert width == layer.weight.shape[1]
+            result = x @ layer.weight.t()
+            assert result.shape == (rows, layer.weight.shape[0])
+            return result if bias is None else result + bias
+
+    module = _module(
+        patch_compressed_tensors_w8a8_int8.TARGET_MODULE,
+        CompressedTensorsW8A8Int8=CompressedTensorsW8A8Int8,
+    )
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_custom_quantization_enabled",
+        lambda: False,
+    )
+    patch_compressed_tensors_w8a8_int8.apply_to_module(module)
+    return module.CompressedTensorsW8A8Int8()
+
+
+@pytest.mark.parametrize("shape", [(8,), (6, 8), (2, 3, 8), (2, 1, 3, 8)])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_int8_fallback_preserves_leading_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    noncontiguous: bool,
+    with_bias: bool,
+):
+    scheme = _int8_tensor_fallback_scheme(monkeypatch)
+    torch.manual_seed(19)
+    if noncontiguous:
+        x = torch.randn(*shape[:-1], 2 * shape[-1])[..., ::2]
+        assert not x.is_contiguous()
+    else:
+        x = torch.randn(shape)
+    layer = SimpleNamespace(weight=torch.randn(5, 8))
+    bias = torch.randn(5) if with_bias else None
+    result = scheme.apply_weights(layer, x, bias)
+    expected = torch.nn.functional.linear(x, layer.weight, bias)
+    assert result.shape == shape[:-1] + (5,)
+    torch.testing.assert_close(result, expected)
+
+
+def test_int8_fallback_2d_delegates_without_replacing_input(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_int8_scheme_module()
+    monkeypatch.setattr(
+        patch_compressed_tensors_w8a8_int8,
+        "_custom_quantization_enabled",
+        lambda: False,
+    )
+    patch_compressed_tensors_w8a8_int8.apply_to_module(module)
+    x = torch.randn(2, 6)[:, ::2]
+    layer, bias = object(), torch.ones(5)
+    result = module.CompressedTensorsW8A8Int8().apply_weights(layer, x, bias)
+    assert result[0] == "upstream"
+    assert result[1] is layer
+    assert result[2] is x
+    assert result[3] is bias
+
+
+@pytest.mark.parametrize("rank", [1, 2, 3, 4])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_int8_fallback_fullgraph(
+    monkeypatch: pytest.MonkeyPatch, rank: int, with_bias: bool
+):
+    scheme = _int8_tensor_fallback_scheme(monkeypatch)
+    layer = SimpleNamespace(weight=torch.randn(5, 8))
+    bias = torch.randn(5) if with_bias else None
+
+    def apply(x):
+        return scheme.apply_weights(layer, x, bias)
+
+    compiled = torch.compile(apply, backend="aot_eager", fullgraph=True, dynamic=True)
+    try:
+        for rows in (2, 5):
+            shape = (rows,) * (rank - 1) + (8,)
+            x = torch.randn(shape)
+            torch.testing.assert_close(
+                compiled(x), torch.nn.functional.linear(x, layer.weight, bias)
+            )
+    finally:
+        torch._dynamo.reset()
 
 
 def test_int8_weight_layout_rolls_back_if_upstream_processing_fails(
@@ -9664,3 +9758,75 @@ def test_transform_sf_identity_fallback_and_backend_delegation():
     module._transform_sf_into_required_layout_impl = object()
     assert module.transform_sf_into_required_layout(sf, 128, 128) == "backend"
     assert calls[-2:] == ["lazy", ("backend", (sf, 128, 128), {})]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_boltops_w4a8_padding_routes_are_capture_safe(monkeypatch, device):
+    """Keep -1 padding rows out of the sorter's unchecked expert mesh."""
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a visible HCU for graph replay")
+    calls = []
+
+    def fused_experts_impl(hidden, _w1, _w2, weights, ids, **kwargs):
+        calls.append((weights, ids))
+        # A distinct expert contributes a different observable value. The
+        # padded row must contribute zero, without changing either live row.
+        return hidden + (weights * (ids + 1)).sum(dim=-1, keepdim=True)
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "_boltops_w4a8_fused_experts",
+        lambda: fused_experts_impl,
+    )
+    method = SimpleNamespace(
+        moe=SimpleNamespace(
+            hidden_dim=4, activation=SimpleNamespace(value="silu"), num_experts=4
+        ),
+        moe_quant_config=SimpleNamespace(a1_scale=None, a2_scale=None),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((4, 4, 2), dtype=torch.int8, device=device),
+        w2_weight=torch.zeros((4, 4, 1), dtype=torch.int8, device=device),
+        w13_weight_scale=torch.ones((4, 4, 1), device=device),
+        w2_weight_scale=torch.ones((4, 4, 1), device=device),
+        global_num_experts=4, _expert_map=None, swiglu_limit=0.0,
+    )
+    hidden = torch.zeros((3, 4), device=device)
+    ids = torch.tensor([[1, 3], [-1, -1], [2, 0]], dtype=torch.int32, device=device)
+    weights = torch.tensor([[0.25, 0.75], [0.5, 0.5], [0.6, 0.4]], device=device)
+    original_ids, original_weights = ids.clone(), weights.clone()
+
+    def invoke():
+        return compressed_tensors_moe_runtime.apply_vllm_w4a8_moe(
+            method, layer, hidden, weights, ids
+        )
+
+    output = invoke()
+    safe_weights, safe_ids = calls[-1]
+    torch.testing.assert_close(safe_ids[1], torch.tensor([0, 1], device=device, dtype=torch.int32))
+    torch.testing.assert_close(safe_weights[1], torch.zeros(2, device=device))
+    torch.testing.assert_close(safe_ids[[0, 2]], ids[[0, 2]])
+    torch.testing.assert_close(safe_weights[[0, 2]], weights[[0, 2]])
+    expected = torch.tensor([3.5, 0.0, 2.2], device=device)[:, None].expand_as(hidden)
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(ids, original_ids)
+    torch.testing.assert_close(weights, original_weights)
+    if device == "cuda":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                invoke()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = invoke()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected)
+        ids.copy_(torch.tensor([[-1, -1], [1, 3], [2, 0]], device=device))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.tensor([0.0, 3.0, 2.2], device=device)[:, None].expand_as(hidden)
+        torch.testing.assert_close(captured, expected)

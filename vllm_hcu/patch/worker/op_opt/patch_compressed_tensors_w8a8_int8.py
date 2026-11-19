@@ -141,7 +141,13 @@ def apply_to_module(module: ModuleType) -> bool:
         x_and_scale_quanted=None,
     ):
         if not _custom_quantization_enabled():
-            return original_apply(self, layer, x, bias)
+            if x.ndim == 2:
+                return original_apply(self, layer, x, bias)
+            # Core's Triton INT8 GEMM only accepts [M, K]. MTP projections
+            # also pass [..., K]; flatten before quantization so per-token
+            # scales and zero points use the same rows as the GEMM.
+            output = original_apply(self, layer, x.reshape(-1, x.shape[-1]), bias)
+            return output.reshape(x.shape[:-1] + (output.shape[-1],))
         return apply_int8_linear(
             input=x,
             weight=layer.weight,
