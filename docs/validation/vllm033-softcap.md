@@ -942,3 +942,55 @@ Evidence: `evidence/gemma3-window-fp8-r248/` and immutable independent audit
 `61ae8f734751cca35e4ae9a3bc5ceb242b5ecba98243d016dda621c4d6d80d78`.
 The audit reuses saved isolated scores without executing generated code or
 rehashing the weights again; its executed script is retained beside the result.
+
+
+## Original Gemma2 softcap pooling pair: failed exact-vector gates
+
+The original SANA-Video Gemma2Model text encoder was loaded through official
+pooling/convert=embed without architecture overrides. BF16 weights/KV, positive
+attention softcap50, window4096 and all26 original layers (13 sliding/13 full)
+were retained before/after requests. The paired gfx938 device, Core0.33 c440c08,
+Adapter97, dependencies, request bytes and controlled launch/environment match;
+only the Plugin distribution and requested attention backend differ. This is
+an official TRITON versus Plugin FLASH comparison, not a same-backend,
+softcap-change-only causal experiment. Plugin runtime remains39eb839.
+
+| Check | Official TRITON BF16 | Plugin FLASH BF16 |
+| --- | --- | --- |
+| Finite nonzero embedding responses / dimension | 16 /2304 | 16 /2304 |
+| Repeats exactly equal to first response | 4/12 | 4/12 |
+| Largest absolute repeat difference | 0.002187314 | 0.00497845 |
+| Prefix hit tokens | 67072 | 67072 |
+| HIP graph launches / correlated GPU kernels | 54 /214 | 54 /214 |
+| Unified-attention GPU kernels | 208 | 208 |
+| Exit0 within15s / forced cleanup / survivors | Yes /None /None | Yes /None /None |
+| Complete lifecycle | FAIL: nanobind | FAIL: nanobind, EngineDeadError |
+
+Inputs4095/4096/4097/6145 straddle the window with concurrency1/4/8.
+Cross-backend exact-vector comparison fails on all16 vectors and all36864
+coordinates; maximum absolute difference is
+0.0034868. Both within-arm
+repeat gates also fail. These are preserved failures against the predeclared
+exact-coordinate criterion, not a newly chosen tolerance. The official arm's
+repeat failure prevents assigning every difference to the Plugin; neither
+finite vectors nor equal layer/trace counts prove numerical equivalence.
+Each evaluation and controller arm returns1. Both servers drain within the
+original15s grace, but lifecycle diagnostics remain disqualifying.
+
+All18 distributions' RECORDs/payloads, original checkpoint pre/post seals,
+normalized console scripts and frozen control sources reconcile. The audit
+separately double-reads all5 tokenizer assets after the pair. This audit
+reconciles saved weight hashes; it does not rehash model weights again.
+
+Immutable full-coordinate/trace/source audit:
+`evidence/gemma2-softcap-audit-r254/paired/audit.json`
+(SHA256 `8862d3ab4e84c7e2cca47a9ec654a83bea34e5d355b46026caa3419e4f6f8dbd`), with the executed auditor retained alongside it.
+Repeat details: `evidence/gemma2-softcap-audit-r254/repeat-differences.json`
+(SHA256 `085245e0aed87089b9145aeb50b13a0c0aa627b7158579d8963ad9ec055aa528`). Original raw cohorts and frozen protocol:
+`evidence/gemma2-softcap-pair-r252/`. The original failures are not overwritten.
+
+This embedding checkpoint provides no generation/HumanEval qualification;
+FP8 softcap, original generation accuracy, clean lifecycle and serving
+performance remain unqualified. Keep Draft pending numerical attribution and
+the remaining gates. No FlashAttention source/binary/build or production,
+test, CI or packaging change is included in this follow-up.

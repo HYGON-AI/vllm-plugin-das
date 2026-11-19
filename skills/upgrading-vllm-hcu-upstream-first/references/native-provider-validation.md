@@ -236,6 +236,21 @@ prevents attributing the whole difference to formatting; equal normalized
 pass flags do not prove equivalent programs or waive the original raw gate.
 
 
+## Softcap checkpoints that expose embeddings
+
+A pipeline text encoder can exercise real attention softcap and alternating
+windows through the official pooling conversion without providing generation
+weights. Preserve its original architecture, tokenizer and per-layer policy;
+embedding coverage does not replace the required generation/HumanEval gates.
+For vector comparisons, retain every coordinate, repeat identical requests
+across the selected batches and prefix reuse, and compare repeat stability in
+each arm separately from cross-backend equality. Freeze the metric and criterion
+before running. If an official reference also fails exact repeat equality,
+retain that failure and quantify it; do not relax the criterion afterward or
+attribute the entire difference to the Plugin. Verify actual Graph kernels and
+source/payload identity independently. Clean process exit can coexist with
+binding leaks or engine errors and does not qualify the complete lifecycle.
+
 ## Inverse-RoPE rounding boundaries
 
 Compare the target Core's emitted instructions, not only its Python arithmetic.
