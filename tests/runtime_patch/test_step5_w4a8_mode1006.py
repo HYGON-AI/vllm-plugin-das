@@ -87,6 +87,36 @@ def test_permute_aligned_padding_and_default_path():
         ROUTING.read_text(), funcs["permute64"]
     )
     assert "permute_aligned" in src and "alignment=64" in src
-    src = ROUTING.read_text()
-    assert "indices = torch.full(" in src
-    assert "-1" in src
+
+    # The full -1 initialization must be inside permute_aligned itself,
+    # assigned to the m_indices buffer, not merely somewhere in the file.
+    fn = funcs["permute_aligned"]
+    full_calls = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "full"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+    ]
+    assert len(full_calls) == 1
+    call = full_calls[0]
+    assignments = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Assign) and node.value is call
+    ]
+    assert len(assignments) == 1
+    targets = assignments[0].targets
+    assert len(targets) == 1
+    target = targets[0]
+    assert isinstance(target, ast.Name) and target.id == "indices"
+    assert len(call.args) >= 2
+    fill = call.args[1]
+    assert isinstance(fill, ast.UnaryOp) and isinstance(fill.op, ast.USub)
+    assert isinstance(fill.operand, ast.Constant) and fill.operand.value == 1
+    dtype = [kw.value for kw in call.keywords if kw.arg == "dtype"]
+    assert dtype and isinstance(dtype[0], ast.Attribute)
+    assert dtype[0].attr == "int32"
+    assert isinstance(dtype[0].value, ast.Name) and dtype[0].value.id == "torch"
