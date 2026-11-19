@@ -764,8 +764,47 @@ diagnostic. This does not change an installed package or qualify production.
 The new candidate promotes only FP16 inputs on the E4M3 writer route to FP32,
 then calls the unchanged native HCU quantize/scatter. It retains the source
 Q/K/V buffers and caller's cache/scales/slot mapping; two temporary FP32 input
-buffers scale with the active input token count, not KV-cache capacity. Other
+buffers scale with the supplied input shape, including padded rows. Other
 input/cache dtype routes retain their existing inputs. No native library or
 FlashAttention source/build changes. Final wheel/native/model and performance
 qualification must include this candidate; the earlier reader-only results
 cannot qualify the added writer branch.
+
+### Installed candidate regression and matched controls
+
+Runtime candidate `39eb839235ebb9fed4fa6fcee85d25ac0d51aaab` passes
+1426 portable and539 native cases (320 window/scale,32 nonuniform,74 Flash,
+113 E4M3), with zero failures/errors/skips and original references/tolerances.
+Installed-source, wheel payload,18 RECORDs and checkpoint bytes were sealed.
+These results identify that runtime, rather than a fresh CI run on later
+documentation-only commits.
+
+Ordinary Qwen3-8B TP1/BF16 weights, default Graph/prefix and fixed HumanEval0-31
+requests complete for both KV types, each with strict17/17 probes and1280 prefix
+hit-token delta. E4M3 scores raw20/normalized31; E5M2 scores raw21/normalized30.
+Both exit0 within the original15s, without forced cleanup or owned survivors,
+but both retain nanobind leaks; E5M2 also logs EngineDeadError. Complete
+lifecycle therefore fails. This checkpoint does not qualify pretrained
+softcap/window behavior.
+
+Matched merged033 control `c0e608de`, with the same proposed Adapter97/Core,
+checkpoint, device, commands, environment, requests and fixed dependency
+payloads: E4M3 control raw19/normalized30 versus candidate20/31 has no newly
+failed task but five changed messages. E5M2 control raw22/normalized31 versus
+candidate21/30 has a newly failed HumanEval/19 in both scoring modes, with
+messages changed on15/19/31. In19, numeric Enum values become strings, so the
+candidate sorts lexicographically. Preserve that loss; one matched pair does
+not establish deterministic causality. Ordinary zero-softcap/full-window E5M2
+does not require the added softcap/window or FP16/E4M3 branch. An unchanged
+baseline fresh-service repeat remains a separate diagnostic, not acceptance.
+
+FP16/E4M3 writer component timing on gfx938,8 KV heads/head128 and five warmed
+100-call samples per route: corrected Graph replay intervals are about
+12.5–13.7us at1–128 unpadded tokens, versus6.8–8.0us for the numerically
+incorrect unpromoted diagnostic. At8 active/1024 supplied rows, correction is
+about17.3us and adds8MiB of FP32 input payload. The old wrong route is not a
+qualified alternative. These GPU-event intervals include submission gaps and
+do not establish kernel-only or serving performance. No FA library changes
+or tolerance relaxation; keep Draft pending accuracy investigation, real
+softcap/window checkpoint, clean lifecycle, serving performance and the
+proposed Adapter97 dependency's independent qualification/required approval.

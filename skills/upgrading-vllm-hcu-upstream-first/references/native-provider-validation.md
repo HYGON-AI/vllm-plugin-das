@@ -174,6 +174,22 @@ but does not isolate a softcap/window-only change on a full-window, zero-softcap
 checkpoint. Preserve that broader failure and use matched implementations or a
 checkpoint exercising the changed branch before assigning causality.
 
+For differing greedy outputs, preserve the failing cohort and repeat the
+unchanged merged baseline in a fresh service with the same physical device,
+requests, concurrency, default Graph/prefix and private cold caches. Compare
+per-task pass sets and messages, not only total scores. A candidate answer
+reproduced by the baseline narrows that case; it does not explain every change
+or waive the original loss, lifecycle or performance gates. Do not treat two
+absent generated-token fields as token parity; obtain actual integer token
+lists in a separately labeled diagnostic when the target API supports them.
+
+Retain each run's live Inductor/Triton tuning artifacts when compiled reductions
+can differ. Compare selected launch/reduction parameters separately from tuning
+time, source/debug paths and build hashes. Different cold-cache choices are a
+lead, not proof of numerical causality; equal choices do not prove runtime
+equivalence. Any experiment pinning or transferring choices is diagnostic and
+does not qualify the requested default tuning policy.
+
 
 ## Expected outputs in paired probes
 
