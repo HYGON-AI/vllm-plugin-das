@@ -1,7 +1,8 @@
 # Checkpoint recovery and runtime inspection
 
-Use these checks when a model download stalls or a live worker needs an
-execution-path probe. They preserve the evaluation's checkpoint and runtime.
+Use these checks when a model download stalls, a live worker needs an
+execution-path probe or normal shutdown fails. They preserve the evaluation's
+checkpoint and runtime.
 
 ## Recover the same checkpoint
 
@@ -73,3 +74,24 @@ or digest, then run the unchanged isolated evaluator on those inputs. Record
 the original and recovered paths and score receipt. Do not loosen the path
 guard, repeat model generation, or treat recorded functional-probe failures
 as passes because a score was recovered.
+
+## Locate shutdown stalls before changing cleanup
+
+Read the selected Core's actual Worker, runner, Graph and communicator teardown
+before adding Adapter or Plugin cleanup. Preserve the original shutdown limits
+and distinguish controller cleanup from framework-internal worker signals.
+An API exit code of zero or released device memory does not establish natural
+worker exit.
+
+An external Worker-extension RPC can arm a standard-library timed Python stack
+dump before normal stop without replacing lifecycle methods. Bind every result
+to the owned PID/startticks and exact installed source. A Python join on an
+abort thread, an allocator call or a later sample with no Python frame narrows
+the location; it does not prove the native owner or cause. Inspect corresponding
+native stacks and loaded libraries before assigning an attention-provider fault.
+
+When external debugger attachment is needed, recheck worker ownership before
+attaching and retain the raw stacks, mapped-library identities and detach status.
+Attachment pauses the worker: keep that run diagnostic and do not use its exit
+time to qualify the original lifecycle or performance gate. A no-profiler
+control may isolate a profiler message while leaving shutdown failure unresolved.
