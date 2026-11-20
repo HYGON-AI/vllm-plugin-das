@@ -15,13 +15,15 @@ Each case is written so it fails on the pre-fix tree:
 
 CPU only; no Triton JIT, no device.
 """
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 import torch
 
-from hcu_adapter import v41_fp8_indexer as impl
+impl = _adapter_module('v41_fp8_indexer')
 from hcu_adapter.extensions import ExtensionCommitError
 from hcu_vllm_das import fp4_indexer_lightop as reader
 from hcu_vllm_das import v41_indexer as scorer
@@ -233,7 +235,7 @@ def test_mixed_compress_ratios_get_separate_pools():
 
 def test_digest_covers_the_adapter_triton_implementation():
     """The GPU FP4 path runs the adapter Triton kernels; they must be pinned."""
-    import hcu_adapter.v41_fp8_indexer_triton as triton
+    triton = _adapter_module('v41_fp8_indexer_triton')
 
     paths = [Path(p).resolve() for p in activation._digest_paths()]
     assert Path(triton.__file__).resolve() in paths
@@ -474,11 +476,12 @@ def test_seam_check_reports_a_missing_adapter_module(monkeypatch):
     import importlib
 
     real = importlib.import_module
+    missing_owner = _seams.adapter_module_name('dsv41_dspark_registration')
 
     def fake(name, *args, **kwargs):
-        if name == 'hcu_adapter.dsv41_dspark_registration':
+        if name == missing_owner:
             raise ModuleNotFoundError(
-                "No module named 'hcu_adapter.dsv41_dspark_registration'",
+                f"No module named '{missing_owner}'",
                 name=name)
         return real(name, *args, **kwargs)
 
@@ -495,10 +498,10 @@ def test_seam_table_covers_the_ct_activation_binder():
     modules = _seams._seam_modules()
     names = {(module.__name__, name) for module, name, _ in
              _seams._required_seams(modules)}
-    assert ('hcu_adapter.dsv41_activation', 'set_provider_binder') in names
+    assert (_seams.adapter_module_name('dsv41_activation'), 'set_provider_binder') in names
     # The CT activation module calls set_provider_binder on its OWN adapter
     # module; checking the DSV4.1 one would verify a different object.
-    assert ('hcu_adapter.ct_w4a8_registration', 'set_provider_binder') in names
+    assert (_seams.adapter_module_name('ct_w4a8_registration'), 'set_provider_binder') in names
     ct_entries = [(module.__name__, name) for module, name, purpose in
                   _seams._required_seams(modules) if 'CT W4A8' in purpose]
-    assert ('hcu_adapter.ct_w4a8_registration', 'set_provider_binder') in ct_entries
+    assert (_seams.adapter_module_name('ct_w4a8_registration'), 'set_provider_binder') in ct_entries

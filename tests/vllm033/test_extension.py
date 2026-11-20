@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
+
 from concurrent.futures import ThreadPoolExecutor
 import inspect
 import math
@@ -34,7 +36,7 @@ def reset_activation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
     from hcu_vllm_das import rms_provider
-    from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
+    ProcessLocalLifecycle = _adapter_module('runtime_lifecycle').ProcessLocalLifecycle
     monkeypatch.setattr(rms_provider, "_lifecycle", ProcessLocalLifecycle(
         runtime_action=rms_provider._ACTION, error_type=extension.DasExtensionError))
     monkeypatch.setattr(rms_provider, "_provider", None)

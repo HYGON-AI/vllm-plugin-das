@@ -2,13 +2,15 @@
 """Framework-free discovery of the owned HCU V41 PCP/host target model."""
 from __future__ import annotations
 
+from .adapter_api import adapter_module as _adapter_module
+
 import os
 import sys
 from threading import RLock
 from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 from .dsv41_activation import _require_release
 from .environment import _flag
-from hcu_adapter.fp4_indexer import selected as fp4_selected
+fp4_selected = _adapter_module('fp4_indexer').selected
 from .inverse_rope_policy import selected_mode as inverse_rope_mode
 
 _FLAG = 'VLLM_HCU_DSV41_PCP_ATTENTION'

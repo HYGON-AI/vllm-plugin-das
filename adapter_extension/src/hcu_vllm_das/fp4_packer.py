@@ -9,6 +9,8 @@ may already refer to the published implementation.
 """
 from __future__ import annotations
 
+from .adapter_api import adapter_module as _adapter_module
+
 import ast
 import hashlib
 import inspect
@@ -18,9 +20,10 @@ from importlib import import_module
 from pathlib import Path
 from threading import RLock
 
-from hcu_adapter import hcu_env, registry
+hcu_env = _adapter_module('hcu_env')
+registry = _adapter_module('registry')
 from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
-from hcu_adapter.kill_switch import op_disabled
+op_disabled = _adapter_module('kill_switch').op_disabled
 
 from .dsv41_activation import _require_release
 

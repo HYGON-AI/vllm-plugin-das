@@ -17,7 +17,9 @@ adapter, exactly as it did when this module owned the implementation.
 """
 from __future__ import annotations
 
-from hcu_adapter import v41_fp8_indexer as _impl
+from .adapter_api import adapter_module as _adapter_module
+
+_impl = _adapter_module('v41_fp8_indexer')
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config as current_config
 from vllm.forward_context import get_forward_context
@@ -116,7 +118,7 @@ class HcuV41SparseAttnIndexer(_api['base']):
     """
 
     def __init__(self, *args, **kwargs):
-        from hcu_adapter.dsv41_channel_fp8 import _is_v41
+        _is_v41 = _adapter_module('dsv41_channel_fp8')._is_v41
         from .v41_indexer_activation import admit_config
 
         cfg = current_config()

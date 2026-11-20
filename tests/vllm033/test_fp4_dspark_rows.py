@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bind speculative staging bounds to Core's actual per-step PCP ownership."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -41,7 +43,7 @@ def test_unsharded_and_nonspeculative_capacities_preserved():
                          [(True, 5, 96), (False, 5, 768), (True, None, 128)])
 def test_real_indexer_constructor_freezes_the_same_workspace_and_staging_bound(
         monkeypatch, sharded, speculative, expected):
-    from hcu_adapter import dsv41_channel_fp8
+    dsv41_channel_fp8 = _adapter_module('dsv41_channel_fp8')
     from hcu_vllm_das import v41_indexer
 
     cfg = NS(scheduler_config=NS(max_num_seqs=128, max_num_batched_tokens=32768),

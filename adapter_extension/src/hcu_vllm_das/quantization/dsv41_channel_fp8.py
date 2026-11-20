@@ -8,12 +8,14 @@ real state instead of a copy.
 """
 from __future__ import annotations
 
+from ..adapter_api import adapter_module as _adapter_module
+
 import sys
 
 from .. import _seams
 
 _seams.bind_dsv41()
 
-from hcu_adapter import dsv41_channel_fp8 as _impl  # noqa: E402
+_impl = _adapter_module('dsv41_channel_fp8')
 
 sys.modules[__name__] = _impl

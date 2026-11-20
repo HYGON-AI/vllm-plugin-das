@@ -14,6 +14,8 @@ kernel hit, Graph replay and model behaviour remain unverified.
 """
 from __future__ import annotations
 
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
+
 import ast
 import inspect
 import textwrap
@@ -379,7 +381,7 @@ def test_release_gate_rejects_other_release_line(monkeypatch) -> None:
     `Dsv41ActivationError` (a RuntimeError). Pinning the type keeps the gate
     from silently degrading into a bare AttributeError/TypeError.
     """
-    from hcu_adapter.dsv41_activation import Dsv41ActivationError
+    Dsv41ActivationError = _adapter_module('dsv41_activation').Dsv41ActivationError
 
     monkeypatch.setattr(packer, "_state", None, raising=False)
     monkeypatch.setattr(packer, "_failure", None, raising=False)

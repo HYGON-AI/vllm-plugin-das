@@ -3,6 +3,8 @@
 GPU kernels/transport are explicit doubles. Passing does not certify device
 quantization, collective execution, full-model accuracy or OOM elimination.
 """
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 from types import SimpleNamespace as NS
 import weakref
 
@@ -10,7 +12,7 @@ import pytest
 import torch
 
 from test_fp4_full_chain import chain, make_attention, bind_cache, metadata, query
-from hcu_adapter.fp4_indexer import validate_config
+validate_config = _adapter_module('fp4_indexer').validate_config
 from hcu_vllm_das import fp4_indexer as impl, fp4_indexer_lightop as reader
 from hcu_vllm_das import v41_pcp, v41_indexer as scorer
 

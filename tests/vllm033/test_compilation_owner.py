@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real v0.33 configuration owners; no capture, weights or device execution."""
 
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
+
 import inspect
 
 import pytest
@@ -74,7 +76,7 @@ def test_adapter_split_registration_keeps_the_official_configuration_methods():
     assert tuple(inspect.signature(methods[names[0]]).parameters) == (
         "self", "uniform_decode_query_len"
     )
-    from hcu_adapter import v41_fp8_indexer as owner
+    owner = _adapter_module('v41_fp8_indexer')
 
     stock = tuple(CompilationConfig._attention_ops)
     config = _config(CompilationMode.VLLM_COMPILE, CUDAGraphMode.PIECEWISE, False)
@@ -104,7 +106,7 @@ def test_adapter_split_registration_keeps_the_official_configuration_methods():
     ],
 )
 def test_adapter_does_not_append_a_dynamo_split_outside_piecewise(mode, graph_mode, inductor_partition):
-    from hcu_adapter import v41_fp8_indexer as owner
+    owner = _adapter_module('v41_fp8_indexer')
 
     config = _config(mode, graph_mode, inductor_partition)
     before = list(config.compilation_config.splitting_ops)
