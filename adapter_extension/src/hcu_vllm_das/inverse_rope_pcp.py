@@ -4,6 +4,8 @@
 """Replace the inverse RoPE call in Core 5afd482's PCP forward_mqa."""
 from __future__ import annotations
 
+from .adapter_api import adapter_module as _adapter_module
+
 import ast
 import functools
 import hashlib
@@ -12,7 +14,7 @@ import os
 import textwrap
 from types import FunctionType
 
-from hcu_adapter import registry
+registry = _adapter_module('registry')
 from .inverse_rope_policy import selected_mode
 
 _FORWARD_MQA_HASH = "6394555a5e86a54c484fc1dc08ac4dd525fa42f0881df164f078010b7f9868e6"
@@ -58,7 +60,7 @@ def prepare_forward_mqa(base):
     if selected_mode() == "stock":
         return original
     _require_source(original)
-    from hcu_adapter.hcu_env import arch_name
+    arch_name = _adapter_module('hcu_env').arch_name
     from vllm.platforms import current_platform
     from .inverse_rope_hcu import prepare_operator, route
 

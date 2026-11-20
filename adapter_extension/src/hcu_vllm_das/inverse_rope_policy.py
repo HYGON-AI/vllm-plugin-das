@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Framework-free configuration policy for optional PCP inverse RoPE."""
-from hcu_adapter import hcu_config
-from hcu_adapter.kill_switch import op_disabled
+
+from .adapter_api import adapter_module as _adapter_module
+hcu_config = _adapter_module('hcu_config')
+op_disabled = _adapter_module('kill_switch').op_disabled
 
 
 def selected_mode():

@@ -547,6 +547,17 @@ coherent Core build, architecture and submitted source.
 
 ## 已有 MR 的目标版本边界
 
+Adapter 目录迁移须作为组合兼容变更验证：Plugin 通过 `adapter_api` 解析实际
+owner，覆盖静态导入、动态 `_seams`、延迟 RMS 导入与精确模块身份检查。
+`hcu_adapter.infra` 缺失才选择旧 root 布局；新布局中的 owner 或传递依赖缺失
+必须报错，不重试旧模块。保留真实模块和共享状态，不复制导出或增加 Adapter 旧路径壳。
+使用两种布局实际安装的 wheel 和真实 metadata 加载全部 extension factories，
+独立阻止 Torch/宿主/provider 导入。安装态 alias 验证仍须同时检查 Plugin facade
+与 Adapter 目标的 RECORD、路径及模块对象身份。目录兼容通过不代表模型或设备验收。
+配套依赖合入后，核对最终 tree 并补验实际安装组合；历史结果保持原提交范围。
+兼容修复的合入结论须绑定本 MR 的改动与相关验证，不能等同整个升级验收。
+相同基线失败保留失败记录与对照范围，另行跟踪；更新过时的 Draft/依赖说明。
+
 处理已提 MR 时，仍以本次选定的目标版本为交付范围。旧分支请求先作为功能迁移和证据输入；
 核对目标版官方实现与当前 owner 后，仅迁移仍缺少的能力。没有明确的旧版维护要求时，
 不要为修复历史 CI 新建旧发布线请求，也不要直接改 base 夹带跨版本差异。

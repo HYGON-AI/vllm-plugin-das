@@ -553,6 +553,15 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
+## Adapter directory layouts
+
+Adapter's root-module and `infra`/`features` layouts use the same Plugin entry
+points. Plugin imports resolve the actual Adapter owner through `adapter_api`;
+module identity and shared state remain owned by Adapter. A missing `infra`
+namespace selects the legacy layout. Missing owners or dependencies in the new
+layout are errors and never retry legacy providers. See the
+[layout compatibility validation](../docs/validation/vllm033-adapter-layout.md).
+
 ## Historical v0.32 evidence
 
 The [`SiluAndMul`](../docs/validation/v032-adapter-extension-silu.md) and

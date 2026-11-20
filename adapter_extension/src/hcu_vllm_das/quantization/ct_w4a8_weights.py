@@ -10,9 +10,11 @@ view shape. No backend or selector is published here.
 """
 from __future__ import annotations
 
+from ..adapter_api import adapter_module as _adapter_module
+
 import torch
 
-from hcu_adapter.ct_w4a8_packed_loader import PackedCTParameters
+PackedCTParameters = _adapter_module('ct_w4a8_packed_loader').PackedCTParameters
 from vllm.model_executor.utils import replace_parameter
 
 _GUARD_FLOATS = (2 * 1024 * 1024) // 4

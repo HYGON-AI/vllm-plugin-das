@@ -1,11 +1,15 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """FP8 cache admission through real packer/indexer owners and loader, CPU only."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 from types import SimpleNamespace as NS
 
 import pytest
 
-from hcu_adapter import fp4_indexer, hcu_config, hcu_env
+fp4_indexer = _adapter_module('fp4_indexer')
+hcu_config = _adapter_module('hcu_config')
+hcu_env = _adapter_module('hcu_env')
 from hcu_adapter.extensions import ExtensionContext, ExtensionStatus, activate_extensions
 
 
@@ -128,7 +132,7 @@ def test_indexer_constructor_resolves_config_before_native_allocation(owners, mo
 
 def test_pending_mxfp4_admission_keeps_provider_and_digest_checks(owners, monkeypatch):
     from vllm import config
-    from hcu_adapter import registry
+    registry = _adapter_module('registry')
     from hcu_adapter.extensions import ExtensionCommitError
     from hcu_vllm_das import fp4_indexer as native, fp4_indexer_lightop as reader
     monkeypatch.setattr(registry, '_RECORDS', {})
@@ -199,7 +203,7 @@ def test_previous_adapter_keeps_its_original_auto_policy(owners, monkeypatch):
 def test_default_after_public_owner_activation(owners, monkeypatch,
                                               config_available_at_activation,
                                               tp_size, expected_dtype):
-    from hcu_adapter import registry
+    registry = _adapter_module('registry')
     from hcu_adapter.bridges import vllm as bridge
     from hcu_adapter.extensions import ExtensionSpec
     from vllm import config

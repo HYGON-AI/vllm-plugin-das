@@ -15,6 +15,8 @@ No pytest collection, GPU execution, install, service or network is involved.
 """
 from __future__ import annotations
 
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
+
 import argparse
 from contextlib import ExitStack
 import copy
@@ -29,13 +31,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from hcu_adapter import (
-    ct_w4a8_registration,
-    dsv41_activation,
-    dsv41_channel_fp8,
-    dsv41_dspark_registration,
-    dsv41_int8_linear as owned,
-)
+ct_w4a8_registration = _adapter_module('ct_w4a8_registration')
+dsv41_activation = _adapter_module('dsv41_activation')
+dsv41_channel_fp8 = _adapter_module('dsv41_channel_fp8')
+dsv41_dspark_registration = _adapter_module('dsv41_dspark_registration')
+owned = _adapter_module('dsv41_int8_linear')
 from vllm import _custom_ops as ops
 from vllm.model_executor import parameter
 from vllm.model_executor.kernels import linear as kernel_factory

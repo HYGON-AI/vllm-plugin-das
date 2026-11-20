@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Use the HCU rotary kernel for eager PCP prefill queries."""
+
+from .adapter_api import adapter_module as _adapter_module
 from functools import lru_cache, partial
 
 import torch
 
-from hcu_adapter import registry
+registry = _adapter_module('registry')
 
 from . import inverse_rope_hcu
 

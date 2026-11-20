@@ -158,6 +158,22 @@ configuration evidence. If combining JUnit reports, label the derived report,
 retain each original report and verify the exact case multiset. CPU import/ABI
 success does not qualify native numerics, Graph, model accuracy or lifecycle.
 
+If an installed contract forwards the parent's `sysconfig.get_path("purelib")`
+to a child, use an environment whose real prefix and purelib contain the
+candidate distribution. A `--target` install plus a `sys.path`/executable wrapper
+does not change sysconfig; the observed Step5 probes therefore imported an older
+global Plugin. Preserve the original child interpreter flags and verify its
+actual module origins after repairing the environment. On Python 3.12, `-S`
+can retain the base prefix even for a venv executable, so prefix alone is not
+proof of which payload ran.
+
+Check conditional vendor exports before attributing a CPU activation failure to
+the Plugin. The inspected FlashAttention package exports its native callables
+only when `torch.cuda.is_available()` is true at import. Empty compute masks
+leave the package discoverable without `flash_attn_varlen_func`. Preserve that
+failure and qualify the unchanged activation on a real supported device; do not
+fake availability or inject the missing callable to claim host activation.
+
 
 ## Derived audit snapshots and model attribution
 

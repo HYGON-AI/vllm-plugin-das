@@ -1,10 +1,13 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax prefill policy and stream-owned scratch; no private env or debug hooks."""
+
+from ..adapter_api import adapter_module as _adapter_module
 import os
 import torch
-from hcu_adapter import hcu_config, registry
-from hcu_adapter.kill_switch import op_disabled
+hcu_config = _adapter_module('hcu_config')
+registry = _adapter_module('registry')
+op_disabled = _adapter_module('kill_switch').op_disabled
 
 _POLICY = None
 _ENABLED = None

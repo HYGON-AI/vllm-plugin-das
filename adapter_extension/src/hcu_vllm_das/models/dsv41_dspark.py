@@ -10,7 +10,9 @@ only and inherits enumeration/loading unchanged.
 """
 from __future__ import annotations
 
-from hcu_adapter.dsv41_draft_weight_alias import HcuDSV41DraftWeightAliasModel
+from ..adapter_api import adapter_module as _adapter_module
+
+HcuDSV41DraftWeightAliasModel = _adapter_module('dsv41_draft_weight_alias').HcuDSV41DraftWeightAliasModel
 
 
 class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
