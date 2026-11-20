@@ -88,6 +88,15 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## HY4 frontend migration
+
+`das_hcu_hy4_frontend` provides bounded native ByteLevel prompt priming with
+`VLLM_HCU_ENABLE_BYTELEVEL_DETOKENIZER_TAIL=1` (default off). Core keeps its
+detokenization and stop handling. Adapter owns admission and process health;
+the Plugin does not register a platform/general entry point. Source revisions,
+ownership, CPU evidence and the remaining W4A8/PCP/R16 gates are recorded in
+[the HY4 migration ledger](../docs/validation/hy4-v033-migration.md).
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
