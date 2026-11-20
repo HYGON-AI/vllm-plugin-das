@@ -8,7 +8,7 @@ import inspect
 
 from packaging.version import InvalidVersion, Version
 
-from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
+from .adapter_api import adapter_module as _adapter_module
 
 from hcu_adapter.extensions import (
     ExtensionContext,
@@ -17,6 +17,9 @@ from hcu_adapter.extensions import (
 
 from .environment import register_compile_factors, rms_norm_enabled
 from .version import TARGET_VLLM_RELEASE
+
+
+ProcessLocalLifecycle = _adapter_module("runtime_lifecycle").ProcessLocalLifecycle
 
 
 _CAPABILITIES = frozenset({"lightop-rms-norm"})

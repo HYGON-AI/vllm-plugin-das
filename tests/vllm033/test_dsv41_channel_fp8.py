@@ -8,6 +8,8 @@ These checks do not establish checkpoint loading or GPU/model correctness.
 """
 from __future__ import annotations
 
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
+
 import copy
 import importlib
 import inspect
@@ -339,7 +341,7 @@ def test_expert_schema_reaches_scoped_plugin_provider(contracts, monkeypatch, ba
 
 def test_empty_linear_only_and_native_nonempty(monkeypatch):
     import torch
-    from hcu_adapter.channel_fp8_empty_linear import HcuDSV41ChannelFP8LinearMethod
+    HcuDSV41ChannelFP8LinearMethod = _adapter_module('channel_fp8_empty_linear').HcuDSV41ChannelFP8LinearMethod
     method = object.__new__(HcuDSV41ChannelFP8LinearMethod)
     kernel = SimpleNamespace(config=SimpleNamespace(out_dtype=None), input_quant_key=lambda: None)
     obj = SimpleNamespace(processed_weight_dims=(0, 1), weight=torch.empty(3, 5),

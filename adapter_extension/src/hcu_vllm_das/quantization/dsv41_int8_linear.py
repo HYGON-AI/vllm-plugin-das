@@ -7,8 +7,10 @@ adapter module, so attribute access reaches the real class instead of a copy.
 """
 from __future__ import annotations
 
+from ..adapter_api import adapter_module as _adapter_module
+
 import sys
 
-from hcu_adapter import dsv41_int8_linear as _impl
+_impl = _adapter_module('dsv41_int8_linear')
 
 sys.modules[__name__] = _impl

@@ -8,12 +8,12 @@ patch point: it binds the adapter's `graph_allowed` resolver to a hook that
 reads this module's attribute, so a patch here reaches the adapter, including
 its FP4 admission check, without the adapter importing the plugin.
 """
-from hcu_adapter import v41_fp8_indexer as _impl
-from hcu_adapter.v41_fp8_indexer import (
-    OP_NAME,
-    graph_capture_allowed,
-    register_splitting_op,
-)
+
+from .adapter_api import adapter_module as _adapter_module
+_impl = _adapter_module('v41_fp8_indexer')
+OP_NAME = _adapter_module('v41_fp8_indexer').OP_NAME
+graph_capture_allowed = _adapter_module('v41_fp8_indexer').graph_capture_allowed
+register_splitting_op = _adapter_module('v41_fp8_indexer').register_splitting_op
 
 __all__ = ['OP_NAME', 'graph_capture_allowed', 'register_splitting_op']
 

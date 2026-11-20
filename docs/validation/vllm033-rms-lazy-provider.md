@@ -221,3 +221,29 @@ Original control evidence is retained under
 traces, original shutdown diagnostics and pre/post provenance seals. Keep
 Draft: attribution of changed outputs and clean lifecycle remain open;
 performance and the complete upgrade matrix remain unqualified.
+
+## Adapter directory integration on 2026-11-20
+
+Integrate Plugin target `8631a126c254a355269a866fb3a9a9ecdbd3cb32` into
+RMS candidate `fbf271e0e5338e1133502f26c938a1530994228e`. The one textual
+conflict is the extension test fixture: retain its complete activation-lifecycle
+reset while selecting the real lifecycle class through `adapter_api`.
+
+The first installed test collection against Adapter main
+`d9bb7fa5d2ed7a46e74b06f5c7c2f9ef172bd702` fails because the candidate itself
+adds a direct `hcu_adapter.runtime_lifecycle` import after the common ancestor.
+The target's earlier compatibility audit could not cover that new consumer.
+Use the existing `adapter_api.adapter_module` in the production extension,
+retaining the actual Adapter class, activation action and lifecycle behavior.
+No Core, Adapter, vendor or numerical implementation changes are involved.
+
+Three new source contracts import the real extension body, construct its
+lifecycle and call its discovery factory over root, canonical and broken
+canonical Adapter filesystem fixtures. Before the import repair: **1 passed,
+2 failed**. After: **3 passed**, with unchanged tests and framework imports
+forbidden. These fixtures establish the import/identity/failure boundary; they
+do not qualify an actual old-layout installed wheel, device execution or a
+model. The separate installed current-main checks retain their own evidence.
+
+All prior model accuracy, lifecycle, performance and requested gfx836 gaps
+remain open. Keep Draft; the layout repair is not a model-shutdown fix.

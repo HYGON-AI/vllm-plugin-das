@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Distinct DSV4.1 CT W4A8 configuration, leaving official CT selection intact."""
 from __future__ import annotations
+
+from ..adapter_api import adapter_module as _adapter_module
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe import RoutedExperts, UnquantizedFusedMoEMethod
@@ -103,7 +105,7 @@ class HcuDSV41CTW4A8Config(CompressedTensorsConfig):
         if not isinstance(layer,RoutedExperts):
             method=super().get_quant_method(layer,prefix)
             if isinstance(layer,LinearBase) and isinstance(method,CompressedTensorsLinearMethod) and isinstance(layer.scheme,CompressedTensorsW8A8Fp8):
-                from hcu_adapter.channel_fp8_empty_linear import HcuDSV41ChannelFP8LinearMethod
+                HcuDSV41ChannelFP8LinearMethod = _adapter_module('channel_fp8_empty_linear').HcuDSV41ChannelFP8LinearMethod
                 return HcuDSV41ChannelFP8LinearMethod(self)
             if isinstance(layer,LinearBase) and type(method) is CompressedTensorsLinearMethod:
                 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
+
 from concurrent.futures import ThreadPoolExecutor
 import inspect
 import math
@@ -34,7 +36,7 @@ def reset_activation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
     from hcu_vllm_das import rms_provider
-    from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
+    ProcessLocalLifecycle = _adapter_module('runtime_lifecycle').ProcessLocalLifecycle
     if hasattr(extension, "_activation_lifecycle"):
         monkeypatch.setattr(extension, "_activation_lifecycle", ProcessLocalLifecycle(
             runtime_action=extension._ACTIVATION_ACTION, error_type=extension.DasExtensionError))
@@ -166,7 +168,9 @@ def test_factory_does_not_claim_a_future_adapter_api() -> None:
     code = f"""
 import sys
 from types import ModuleType
-from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
+sys.path.insert(0, {os.fspath(PLUGIN_SOURCE_ROOT)!r})
+from hcu_vllm_das.adapter_api import adapter_module
+ProcessLocalLifecycle = adapter_module("runtime_lifecycle").ProcessLocalLifecycle
 
 adapter = ModuleType("hcu_adapter")
 adapter.__path__ = []

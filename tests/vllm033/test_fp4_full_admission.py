@@ -1,13 +1,17 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """FP4 preallocation policy and one-owner publication, CPU only."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 from types import SimpleNamespace as NS
 
 import pytest
 import torch
-from hcu_adapter import hcu_env
+hcu_env = _adapter_module('hcu_env')
 from hcu_adapter.extensions import ExtensionContext, ExtensionCommitError
-from hcu_adapter.fp4_indexer import applicable, selected, validate_config
+applicable = _adapter_module('fp4_indexer').applicable
+selected = _adapter_module('fp4_indexer').selected
+validate_config = _adapter_module('fp4_indexer').validate_config
 from hcu_vllm_das import v41_indexer_activation as activation
 
 
@@ -83,7 +87,7 @@ def test_off_preserves_default_fp8(monkeypatch):
 def test_config_file_optin_uses_real_resolver(monkeypatch):
     monkeypatch.delenv('HCU_VLLM_FP4_INDEXER_IMPL', raising=False)
     monkeypatch.delenv('HCU_DISABLE_OPS', raising=False)
-    from hcu_adapter import hcu_config
+    hcu_config = _adapter_module('hcu_config')
     monkeypatch.setattr(hcu_config, 'lookup', lambda key: 'lightop' if key == 'HCU_VLLM_FP4_INDEXER_IMPL' else None)
     assert hcu_env.resolve('HCU_VLLM_FP4_INDEXER_IMPL')[1] == 'config'
     assert selected()

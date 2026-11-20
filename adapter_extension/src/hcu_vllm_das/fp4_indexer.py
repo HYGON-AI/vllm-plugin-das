@@ -3,12 +3,14 @@
 """Owned V41 FP4 classes reusing official constructors and forward methods."""
 from __future__ import annotations
 
+from .adapter_api import adapter_module as _adapter_module
+
 import hashlib
 import inspect
 from types import FunctionType
 
 import torch
-from hcu_adapter.fp4_indexer import validate_config
+validate_config = _adapter_module('fp4_indexer').validate_config
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41 import attention as common

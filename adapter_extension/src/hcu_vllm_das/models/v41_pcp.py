@@ -9,6 +9,8 @@ checkpoint loading and runner model-state methods stay native.
 """
 from __future__ import annotations
 
+from ..adapter_api import adapter_module as _adapter_module
+
 import hashlib
 import inspect
 from contextvars import ContextVar
@@ -247,7 +249,7 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         if static_eplb.enabled(vllm_config):
             static_eplb.validate_config(vllm_config)
             self._hcu_static_eplb_config = vllm_config
-        from hcu_adapter.fp4_indexer import applicable as fp4_applicable
+        fp4_applicable = _adapter_module('fp4_indexer').applicable
         if fp4_applicable(vllm_config):
             from ..fp4_indexer import preflight
             preflight(vllm_config)
