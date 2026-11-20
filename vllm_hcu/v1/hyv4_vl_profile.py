@@ -66,11 +66,18 @@ def profile_hyv4_vl_vision(runner):
     if mm_config.enable_mm_embeds:
         raise ValueError("HYV4-VL MRV2 profiling supports image inputs only")
     speculative = runner.vllm_config.speculative_config
+    parallel = runner.vllm_config.parallel_config
+    mtp_topology = (
+        (parallel.prefill_context_parallel_size == 16
+         and parallel.data_parallel_size == 1)
+        or (parallel.prefill_context_parallel_size == 1
+            and parallel.data_parallel_size == 16)
+    )
     if speculative is not None and (
         speculative.method != "mtp"
-        or runner.vllm_config.parallel_config.prefill_context_parallel_size != 16
+        or not mtp_topology
     ):
-        raise ValueError("HYV4-VL MRV2 profiling supports only native PCP16 MTP")
+        raise ValueError("HYV4-VL MTP profiling supports PCP16 or DP16 paths")
     accounted = getattr(runner, "_hcu_vl_accounted_state", None)
     if accounted is None or accounted() is not runner.model_state:
         raise ValueError("HYV4-VL state memory must be accounted before worker profiling")
