@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.mla import indexer as metadata
 from . import fp4_packer, wo_a_layout
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
 from .v41_pcp import HcuV41PcpAttention
+from .qkv_split import qualify_qkv_split, split_qkv, supported as qkv_split_supported
 
 
 # anchor-baseline(③): Core 5afd482929, 0.33.1.dev3, constructor globals are
@@ -122,6 +123,13 @@ _INDEXER_INIT = _constructor('indexer', common.DeepseekV4Indexer.__init__,
 
 
 class Fp4Indexer(common.DeepseekV4Indexer):
+    def _wq_b_proj(self, qr, qr_scale=None):
+        if isinstance(qr, torch.Tensor) and qr.dtype == torch.int8:
+            from .int8_wq_b import project
+
+            return project(self.wq_b, qr, qr_scale, indexer=True)
+        return super()._wq_b_proj(qr, qr_scale)
+
     def __init__(self, *args, **kwargs):
         cfg = args[0] if args else kwargs['vllm_config']
         preflight(cfg)
@@ -188,9 +196,24 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
     # MRO routes native AMD super().__init__ to our private common constructor;
     # Its post-init, attention/forward and loading stay native.
     def __init__(self, *args, **kwargs):
+        from .environment import _flag
+
         cfg = args[0] if args else kwargs['vllm_config']
         super().__init__(*args, **kwargs)
+        if (not self.use_pcp and not self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
+                and self.n_local_heads == self.padded_heads == 64):
+            qualify_qkv_split(self.rotary_emb.cos_sin_cache.device)
         self._hcu_wo_a_layout = wo_a_layout.configured(cfg, self.wo_a.weight.device)
+        self._int8_wq_b_device = None
+        self._int8_wq_b_direct = None
+        if type(self) is Fp4Attention and _flag('HCU_DSV41_WQ_B_INT8_DIRECT', default=False):
+            from .int8_wq_b import configure_direct_gemm
+
+            self._int8_wq_b_direct = configure_direct_gemm(cfg)
+        if _flag('VLLM_HCU_DSV41_INT8_WQ_B', default=True) and type(self.indexer) is Fp4Indexer:
+            from .int8_wq_b import configured_device
+
+            self._int8_wq_b_device = configured_device(self.indexer.vllm_config)
 
     def _o_proj(self, attn_out, positions):
         if self._hcu_wo_a_layout and wo_a_layout.supported(self, attn_out):
@@ -199,6 +222,49 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
 
     def _indexer_cls(self, k_cache):
         return Fp4Indexer
+
+    def _split_qkv_and_norm(self, qr_kv):
+        qr, qr_scale, kv = super()._split_qkv_and_norm(qr_kv)
+        if (self._int8_wq_b_device is not None and type(self) is Fp4Attention
+                and type(self.indexer) is Fp4Indexer
+                and self._prepare_and_attn_fn == self._prepare_and_attn
+                and getattr(self.indexer.forward_q, '__func__', None) is Fp4Indexer.forward_q):
+            from .int8_wq_b import share
+
+            # FULL, reindex and serial prep already carry the pair over their
+            # own fork/join (or call) boundaries. It is never stored on a layer.
+            qr, qr_scale = share(self.indexer.vllm_config, self._int8_wq_b_device,
+                                 self, qr, qr_scale)
+        return qr, qr_scale, kv
+
+    def _wq_b_proj(self, qr, qr_scale=None):
+        if self._int8_wq_b_direct is not None:
+            from .int8_wq_b import project_direct
+
+            out = project_direct(self._int8_wq_b_direct, self.wq_b, qr, qr_scale)
+            if out is not None:
+                return out
+        if isinstance(qr, torch.Tensor) and qr.dtype == torch.int8:
+            from .int8_wq_b import project
+
+            return project(self.wq_b, qr, qr_scale, indexer=False)
+        return super()._wq_b_proj(qr, qr_scale)
+
+    def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+        if (isinstance(attn_metadata, dict) and not self.use_pcp
+                and not self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
+                and self.n_local_heads == self.padded_heads == 64):
+            swa = attn_metadata.get(self.swa_cache_layer.prefix)
+            cache = self.swa_cache_layer.kv_cache
+            if (swa is not None and swa.block_size in (32, 64)
+                    and cache.dtype == torch.uint8
+                    and cache.ndim > 0 and cache.shape[0] > 0
+                    and cache.numel() == cache.shape[0] * swa.block_size * 584):
+                cache = cache.view(cache.shape[0], swa.block_size, 584)
+                cos_sin = self.rotary_emb.cos_sin_cache
+                if qkv_split_supported(q, kv, cache, swa.slot_mapping, positions, cos_sin):
+                    return split_qkv(q, kv, cache, swa.slot_mapping, positions, cos_sin)
+        return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
 
 class Fp4PcpAttention(HcuV41PcpAttention, _Fp4CommonAttention):
