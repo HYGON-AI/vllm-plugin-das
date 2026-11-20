@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU native CT loader integration. HIPC conversion's device packer is doubled."""
 import json
+import inspect
 from types import SimpleNamespace as NS
 
 import pytest
@@ -58,17 +59,31 @@ def make_experts(rank):
 
 
 @pytest.mark.parametrize('rank', [0, 1])
-def test_native_ct_fanout_scales_shapes_and_reload_guard(tmp_path, chain, monkeypatch, rank):
+@pytest.mark.parametrize('model_key', ['CTModel', 'HYV4ForCausalLM', 'HYV4MTP'])
+@pytest.mark.parametrize('keyword', [False, True])
+def test_native_ct_fanout_scales_shapes_and_reload_guard(
+        tmp_path, chain, monkeypatch, rank, model_key, keyword):
     row = [2, 0, 3, 1, 0, 1]
     config = placement_config(width=2, num_redundant_experts=2)
     config.model_config.hf_config.n_routed_experts = 4
     path = tmp_path / 'map.json'
     document = {'version': 2, 'format': 'vllm_offline_eplb_physical_to_logical_by_model',
-        'model_maps': {'CTModel': {
-            'record_kind': 'proposal', 'model_class': 'CTModel',
+        'model_maps': {model_key: {
+            'record_kind': 'proposal', 'model_class': model_key,
             'model_name': config.model_config.model, 'num_moe_layers': 1,
             'num_logical_experts': 4, 'num_physical_experts': 6,
             'num_redundant_experts': 2, 'physical_to_logical_map': [row]}}}
+    if model_key != 'CTModel':
+        # Replay real loader fan-out with a two-rank/tiny-expert CPU fixture.
+        # Full PCP16 scope admission is tested separately, without this double.
+        config.model_config.hf_config.model_type = 'hy_v4'
+        from hcu_vllm_das import hy4_static_scope
+        from hcu_adapter.bridges import vllm as host
+        monkeypatch.setattr(hy4_static_scope, 'validate_scope', lambda *a, **k: True)
+        monkeypatch.setattr(host, 'require_extension_healthy', lambda name: None)
+        document.pop('format')
+        document['model_maps'][model_key].pop('record_kind')
+        document['model_maps'][model_key].pop('model_name')
     path.write_text(json.dumps(document))
     config.additional_config['hcu_static_eplb'].update(
         expert_map_path=str(path), num_redundant_experts=2)
@@ -76,7 +91,7 @@ def test_native_ct_fanout_scales_shapes_and_reload_guard(tmp_path, chain, monkey
     model = NS(moe_mlp_layers=[NS(experts=NS(routed_experts=experts))],
         num_moe_layers=1, num_redundant_experts=2,
         num_physical_experts=6, num_logical_experts=4)
-    monkeypatch.setattr(runtime, 'resolve_model_key', lambda model: 'CTModel')
+    monkeypatch.setattr(runtime, 'resolve_model_key', lambda model: model_key)
     monkeypatch.setattr('vllm.model_executor.models.interfaces.get_mixture_of_experts_model',
                         lambda model: model)
     runtime.bind_placement(model, config)
@@ -95,8 +110,13 @@ def test_native_ct_fanout_scales_shapes_and_reload_guard(tmp_path, chain, monkey
                 ('weight_shape', torch.tensor([rows, columns]))]:
                 name = stem + '_' + suffix
                 parameter = getattr(experts, name)
-                actual = parameter.weight_loader(parameter, data, name,
-                    shard_id=shard, expert_id=logical, return_success=True)
+                if keyword:
+                    actual = parameter.weight_loader(param=parameter, loaded_weight=data,
+                        weight_name=name, shard_id=shard, expert_id=logical,
+                        return_success=True)
+                else:
+                    actual = parameter.weight_loader(parameter, data, name,
+                        shard_id=shard, expert_id=logical, return_success=True)
                 assert bool(actual) == (logical in row[rank * 3:(rank + 1) * 3])
 
     for local, logical in enumerate(row[rank * 3:(rank + 1) * 3]):
@@ -105,6 +125,24 @@ def test_native_ct_fanout_scales_shapes_and_reload_guard(tmp_path, chain, monkey
             assert torch.all(getattr(experts, stem + '_weight_scale')[local] == logical + 1)
         assert torch.equal(experts.w13_weight_shape[local], torch.tensor([256, 512]))
         assert torch.equal(experts.w2_weight_shape[local], torch.tensor([512, 256]))
+
+    # Core layerwise loading replaces the top-level bound `param` argument.
+    # Confirm both call forms expose it and replay into replacement CPU storage,
+    # rather than leaving the target hidden in *args or writing the old tensor.
+    original = experts.w13_weight_packed
+    meta = torch.nn.Parameter(torch.empty_like(original, device='meta'), requires_grad=False)
+    replacement = torch.nn.Parameter(torch.full_like(original, -1), requires_grad=False)
+    data = torch.full((256, 64), 7, dtype=torch.int32)
+    arguments = dict(param=meta, loaded_weight=data, weight_name='w13_weight_packed',
+                     shard_id='w1', expert_id=row[rank * 3], return_success=True)
+    signature = inspect.signature(first_loader)
+    bound = (signature.bind(**arguments) if keyword else
+             signature.bind(*arguments.values()))
+    bound.arguments['param'] = replacement
+    before = original.clone()
+    assert first_loader(*bound.args, **bound.kwargs)
+    assert torch.equal(original, before)
+    assert torch.all(replacement[0, :256] == 7)
 
     owner.pack(lambda tensor: tensor)
     before = experts.w13_weight_packed.clone()

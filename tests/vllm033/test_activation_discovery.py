@@ -58,7 +58,7 @@ def test_full_provider_contract_is_still_checked_at_activation(monkeypatch):
     assert not _seams._bound
 
 
-@pytest.mark.parametrize('owner', ['hy4_frontend', 'hy4_quant_activation'])
+@pytest.mark.parametrize('owner', ['hy4_frontend', 'hy4_quant_activation', 'hy4_static_activation'])
 def test_hy4_discovery_does_not_import_framework_or_vendor(owner):
     code = f'''
 import sys, importlib, importlib.abc

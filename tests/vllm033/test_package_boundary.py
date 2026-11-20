@@ -29,6 +29,9 @@ EXPECTED_ENTRY_POINTS = {
         "das_hcu_v41_pcp": "hcu_vllm_das.v41_pcp_activation:extension_spec",
         "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
         "das_hcu_step5_config": "hcu_vllm_das.step5_activation:extension_spec",
+        "das_hcu_hy4_frontend": "hcu_vllm_das.hy4_frontend:extension_spec",
+        "das_hcu_hy4_ct_w4a8": "hcu_vllm_das.hy4_quant_activation:extension_spec",
+        "das_hcu_hy4_static": "hcu_vllm_das.hy4_static_activation:extension_spec",
     }
 }
 

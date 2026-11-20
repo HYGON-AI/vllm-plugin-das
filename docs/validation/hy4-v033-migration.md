@@ -46,7 +46,7 @@ MR or copy an existing mechanism just to obtain three MRs.
 | H04 | Learnable attention sink | Reuse Core wrappers; Adapter restores DTK call ABI through the public backend registry | Component prefill/packed decode/changed-input Graph checks pass on gfx938; distributed/model accuracy pending; DCP excluded |
 | H05 | Public `fp8_e4m3` vs physical `fp8_ds_mla` | Core owns geometry; Adapter restores HCU ABI and provider eligibility | Packed cache, scales, RoPE and actual writer pending |
 | H06 | CT W4A8 routed experts, weight/scale reload | Distinct Plugin `hcu_hy4_ct_w4a8` config; reuse existing HIPC method and Core loader/runner | HY4 schema/delegation CPU checks added; actual load, native calls and layerwise reload remain pending |
-| H07 | Offline R16 EPLB, nearest dispatch and recording | Plugin mechanism, reusing `static_eplb*`; Core owns router and loader APIs | Existing runtime is owned-model/PCP-specific; HY4 backbone/MTP mapping and redundant slot sizes pending |
+| H07 | Offline R16 EPLB, nearest dispatch and recording | Plugin mechanism, reusing `static_eplb*`; Core owns router and loader APIs | HY4 backbone/MTP deployment binding implemented for eager PCP16; CPU/config checks below. HY4 recording and full-model/native placement remain pending |
 | H08 | `VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH` | Plugin optimization with correct communicator ownership | Recheck target modular DeepEP buffers before carrying legacy scratch |
 | H09 | `VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING` | First assess Core sparse prefill batching; Plugin only for remaining algorithm | Not yet proven equivalent on HCU; retain as pending |
 | H10 | `VLLM_HCU_ENABLE_TRITON_CP_GATHER` | First reuse Core CP gather; Adapter for ABI-only gaps | Packed page strides and changed-input tests pending |
@@ -143,12 +143,68 @@ decode/changed-input Graph component tests passed on actual gfx938; see Adapter
 MR153 for the scope and key-only DTK LSE contract. This does not establish
 whole-model accuracy, offline R16 readiness or performance equivalence.
 
-Portable source checks: **93 passed, 1 deselected** across HY4 frontend, HY4 CT
+Earlier portable source checks: **93 passed, 1 deselected** across HY4 frontend, HY4 CT
 policy/delegation and discovery. The deselected existing full-provider-contract
 test was attempted and failed at its unavailable `vllm` import;
 it is not a passing integration test. No Core/Torch native stack is installed in
-this portable environment. This increment does not yet provide the HY4-specific
+this portable environment. These earlier checks did not provide the HY4-specific
 offline-R16 model binding or establish native HIPC/DeepEP ABI acceptance.
+
+### HY4 offline placement increment
+
+The optional `das_hcu_hy4_static` extension publishes owned backbone and MTP
+classes through the public Core ModelRegistry. Adapter owns admission, lifecycle
+and persistent failure. Core model globals, forward methods, checkpoint mapping,
+runner and compile constructor wrapper remain intact; private constructor
+bindings select owned MoE children. Request
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hy4-ct-w4a8,hy4-static-eplb` explicitly.
+
+The initial scope is eager PCP16/TP1/DP1/PP1/DCP1, DeepEP HT and DeepGEMM, with
+`FLASHMLA_SPARSE`, LoRA off and Core dynamic EPLB off. The sidecar allocates 272
+physical experts before parameter creation (256 logical +16 redundant), then
+reuses the existing named loader fan-out and nearest static router. Unsupported
+topologies, routing simulation and HY4 calibration fail before allocation.
+The existing V41 scope and strict proposal reader are retained.
+
+The separate HY4 reader accepts the original cookbook version-2 map with
+`HYV4ForCausalLM` and `HYV4MTP` keys. This artifact has no recorded checkpoint
+name or calibration metadata; do not infer either from compatibility. The
+tested map SHA256 is
+`9b99af7c6aa4824cfeca3e008365cf8a8bdaff071f458ddec9039f62b568a94b`.
+The actual checkpoint declares 78 backbone layers (77 MoE) and one MTP layer
+at index 78. Both map entries and physical counts are checked before loading;
+file changes between preflight and loader binding are rejected.
+
+Core's native MTP proposer does not inherit the target's attention backend.
+Include `attention_backend` in the speculative configuration as well:
+
+```bash
+--attention-backend FLASHMLA_SPARSE \
+--speculative-config '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true,"attention_backend":"FLASHMLA_SPARSE"}' \
+--additional-config '{"hcu_static_eplb":{"expert_map_path":"r16.json","num_redundant_experts":16,"static_dispatch_policy":"nearest"}}'
+```
+
+This retains natural MTP acceptance. MTP precision follows Core's checkpoint
+configuration rather than forcing a new draft quantization format.
+
+Validation covers map/schema failures, unchanged compile wrappers/Core globals,
+pre-allocation physical capacity, public registry ownership, startup failure
+latching, backbone/MTP loader order, CT weight/scale/shape fan-out and positional
+or keyword `param` replacement replay. Distributed membership, expert allocation
+and device packing in these CPU cases are leaf doubles. Replacement-argument
+replay is not a full post-packing layerwise reload test; the existing packed
+loader deliberately rejects unsupported reload after conversion.
+
+The installed-stack affected CPU suite passed **218 tests**, including the
+existing V41 static suite, complete extension discovery and wheel boundary.
+This replaces overlapping earlier counts; it is not an additional 218 native
+kernel or model-accuracy checks. Independent source review found no confirmed
+correctness defect in this initial scope.
+
+Installed configuration probing selects both owned model classes and validates
+the complete original 77+1-row map. It does not allocate full weights or execute
+MoE kernels. Full-model HIPC/DeepEP loading, HumanEval and performance remain
+required before this scope can be accepted.
 
 ### Device order
 
@@ -163,5 +219,7 @@ offline-R16 model binding or establish native HIPC/DeepEP ABI acceptance.
 5. Compare repeated matched baseline/candidate runs. Pending CPU or device rows
    cannot be called accepted; performance parity remains open until measured.
 
-Current stage is source migration and CPU checks only, as requested. No machines
-were reserved and no service/container installation was changed in this stage.
+The initial stage used source/CPU checks. Later authorized component validation
+built an isolated Python3.12/DTK2610 stack in a dedicated POD1_CN2 container;
+Core source remains unchanged. Both nodes became occupied by other workloads
+before full-model validation. No other containers or GPU jobs were stopped.
