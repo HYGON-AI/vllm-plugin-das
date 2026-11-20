@@ -126,6 +126,14 @@ class HcuCompressedTensorsW4A8Int8MoEMethod(
     def supports_eplb(self) -> bool:
         return getattr(self, "_hcu_static_eplb", False)
 
+    def process_weights_after_loading(self, layer):
+        if getattr(layer, "_hy4_w4a8_megamoe", False):
+            from vllm_hcu.models.hy_v4.megamoe import install_hy4_w4a8_mega_kernel
+
+            install_hy4_w4a8_mega_kernel(self, layer)
+            return
+        super().process_weights_after_loading(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,

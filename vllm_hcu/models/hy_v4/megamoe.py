@@ -1,4 +1,4 @@
-"""Channel-FP8 routed expert packing and execution for HY4-VL EP16."""
+"""EP16 MegaMoE for HY4-VL channel FP8 and HY4 channel INT4 experts."""
 
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -49,6 +49,19 @@ def pack_hy4_mega_weights(provider, gate_up, down, gate_up_scale, down_scale):
     return provider.transform_weights_for_mega_moe(*pairs)
 
 
+def _stage_w4a8(hidden, physical_ids, weights, buffer):
+    from vllm.model_executor.layers.quantization.utils.int8_utils import _per_token_quant_int8
+
+    rows, width = hidden.shape
+    hidden = hidden.contiguous()
+    _per_token_quant_int8[(rows,)](
+        hidden, buffer.x, buffer.x_sf, hidden.stride(0), buffer.x.stride(0), width,
+        BLOCK=8192, num_warps=8, num_stages=1,
+    )
+    buffer.topk_idx[:rows].copy_(physical_ids)
+    buffer.topk_weights[:rows].copy_(weights)
+
+
 def run_hy4_mega_experts(provider, hidden, physical_ids, weights, packed, buffer, clamp):
     """Consume the physical top-8 IDs selected by the static EPLB router."""
     rows = hidden.shape[0]
@@ -58,12 +71,34 @@ def run_hy4_mega_experts(provider, hidden, physical_ids, weights, packed, buffer
         raise ValueError("HY4 MegaMoE routing must supply eight IDs and weights per token")
     if rows > buffer.num_max_tokens_per_rank:
         raise ValueError("HY4 MegaMoE per-rank token capacity exceeded")
-    if rows:
+    w4a8 = getattr(buffer, "mode", None) == "w4a8"
+    if rows and w4a8:
+        _stage_w4a8(hidden, physical_ids, weights, buffer)
+    elif rows:
         provider.mega_moe_preprocess(hidden.contiguous(), physical_ids.long().contiguous(),
                                      weights.float().contiguous(), buffer, rows)
     # Empty ranks must also participate in dispatch and combine.
     output = torch.empty_like(hidden)
-    provider.fp8_mega_moe(output, *packed, buffer, activation_clamp=clamp, is_int8=False)
+    if w4a8:
+        (gate_up, gate_up_div16), (down, down_div16) = packed
+        provider._C.w4a8_mega_moe(
+            output, gate_up, down, gate_up_div16, down_div16,
+            buffer.buffer, buffer.local_buffer, buffer.handle.buffer_ptrs,
+            buffer.handle.signal_ptrs, buffer.group.rank(), buffer.num_max_tokens_per_rank,
+            buffer.num_experts, buffer.num_topk, clamp, True,
+            l1_weights_sf_div16=gate_up_div16, l2_weights_sf_div16=down_div16,
+        )
+    else:
+        provider.fp8_mega_moe(output, *packed, buffer, activation_clamp=clamp, is_int8=False)
+    if w4a8 and not getattr(buffer, "_hy4_w4a8_launched", False):
+        buffer._hy4_w4a8_launched = True
+        if buffer.group.rank() == 0:
+            from vllm.logger import init_logger
+
+            init_logger("vllm.hy4.megamoe").info(
+                "Launched HY4 _C.w4a8_mega_moe via %s, rows=%d, clamp=%g",
+                provider._C.__file__, rows, clamp,
+            )
     return output
 
 
@@ -93,7 +128,7 @@ class Hy4MegaKernel:
 
     def apply(self, hidden_states, w1, w2, topk_weights, topk_ids, activation,
               global_num_experts, expert_map, apply_router_weight_on_input,
-              shared_experts=None, shared_experts_input=None):
+              shared_experts=None, shared_experts_input=None, shared_experts_x_and_scale_quanted=None):
         if self.decode:
             if global_num_experts != 256 or apply_router_weight_on_input:
                 raise ValueError("HY4 decode MegaMoE requires 256 output-weighted experts")
@@ -124,17 +159,19 @@ class Hy4MegaKernel:
         return torch.cat(outputs)
 
 
-def _group_buffer(provider, ep, experts, capacity):
+def _group_buffer(provider, ep, experts, capacity, *, w4a8=False):
     existing = getattr(ep, "_hy4_mega_buffer", None)
     if existing is not None:
         if (existing.num_experts, existing.num_max_tokens_per_rank) != (experts, capacity):
             raise ValueError("HY4 MegaMoE group buffer geometry changed")
+        if (getattr(existing, "mode", None) == "w4a8") != w4a8:
+            raise ValueError("HY4 MegaMoE group buffer quantization changed")
         return existing
     # Keep the IPC allocation bounded independently of the global 40960
     # scheduler budget. A 2560-token shard fits a normal PCP16 prefill step.
     buf = provider.get_symm_buffer_for_mega_moe(
         ep.device_group, experts, capacity, 8, 6144, 2048, use_fp8_dispatch=True,
-        activation="swiglu",
+        activation="swiglu", **({"mode": "w4a8"} if w4a8 else {}),
     )
     destroy_group = ep.destroy
 
@@ -225,3 +262,52 @@ def install_hy4_mega_kernel(method, layer):
             capacity,
         )
     return True
+
+
+def install_hy4_w4a8_mega_kernel(method, layer):
+    from vllm.config import get_current_vllm_config
+    from vllm.distributed import get_ep_group
+    from vllm.logger import init_logger
+    import deepgemm.mega as mega
+    from deepgemm import pack_w4a8_moe_hipc_weight
+    from deepgemm.version import git_hash
+
+    config = get_current_vllm_config()
+    parallel = config.parallel_config
+    if parallel.enable_dbo or config.lora_config is not None:
+        raise ValueError("HY4 W4A8 MegaMoE does not support DBO or LoRA")
+    ep = get_ep_group()
+    if not (config.model_config.enforce_eager and config.model_config.dtype == torch.bfloat16
+            and parallel.enable_expert_parallel and parallel.prefill_context_parallel_size == ep.world_size == 16
+            and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == parallel.data_parallel_size == 1
+            and parallel.expert_placement_strategy == "linear" and method.supports_eplb
+            and getattr(layer, "_vllm_hcu_static_eplb_row", None) is not None
+            and layer.global_num_experts == 272 and not layer.apply_router_weight_on_input
+            and layer.swiglu_limit == 10):
+        raise ValueError("HY4 W4A8 MegaMoE requires eager BF16 PCP16/EP16 static R16 and clamp=10")
+    if not hasattr(getattr(mega, "_C", None), "w4a8_mega_moe"):
+        raise RuntimeError("HY4 W4A8 MegaMoE requires the DeepGEMM MegaMoe_w4a8 extension")
+    if isinstance(method.moe_kernel, Hy4MegaKernel):
+        raise RuntimeError("Restart HY4 MegaMoE before reloading routed expert weights")
+    w1, w2 = layer.w13_weight, layer.w2_weight
+    s1, s2 = layer.w13_weight_scale, layer.w2_weight_scale
+    if (w1.shape != (17, 4096, 3072) or w2.shape != (17, 6144, 1024)
+            or w1.dtype != torch.int8 or w2.dtype != torch.int8):
+        raise ValueError("Unexpected HY4 W4A8 packed INT4 layout")
+    if any(scale.dtype != torch.float32 or scale.shape not in ((17, width), (17, width, 1))
+           for scale, width in ((s1, 4096), (s2, 6144))):
+        raise ValueError("HY4 W4A8 MegaMoE requires FP32 output-channel scales")
+    w1.data = pack_w4a8_moe_hipc_weight(mega.tile256_gate_up(w1))
+    w2.data = pack_w4a8_moe_hipc_weight(w2)
+    s1.data = mega.tile256_gate_up(s1)
+    packed = ((w1.data, s1.reshape(17, 4096)), (w2.data, s2.reshape(17, 6144)))
+    shard_rows = (config.scheduler_config.max_num_batched_tokens + ep.world_size - 1) // ep.world_size
+    capacity = min(4096, ((shard_rows + 63) // 64) * 64)
+    buffer = _group_buffer(mega, ep, 272, capacity, w4a8=True)
+    method.moe_quant_config = method.get_fused_moe_quant_config(layer)
+    method.moe_kernel = Hy4MegaKernel(mega, packed, buffer, ep, layer.swiglu_limit)
+    if ep.rank_in_group == 0:
+        init_logger("vllm.hy4.megamoe").info(
+            "Installed HY4 W4A8 MegaMoE: layer=%s revision=%s capacity=%d",
+            method.layer_name, git_hash, buffer.num_max_tokens_per_rank,
+        )

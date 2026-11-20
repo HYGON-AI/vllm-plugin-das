@@ -3,7 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 import runpy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -14,6 +14,30 @@ import torch.multiprocessing as mp
 def _load_megamoe():
     return runpy.run_path(str(Path(__file__).resolve().parents[2]
                               / "vllm_hcu/models/hy_v4/megamoe.py"))
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_w4a8_launch_uses_predivided_scales_and_participates_when_empty(rows):
+    run = _load_megamoe()["run_hy4_mega_experts"]
+    provider = Mock()
+    buf = SimpleNamespace(mode="w4a8", group=Mock(), handle=Mock(), buffer=object(),
+                          local_buffer=object(), num_experts=272, num_topk=8,
+                          num_max_tokens_per_rank=2560, _hy4_w4a8_launched=True)
+    hidden = torch.empty((rows, 6144), dtype=torch.bfloat16)
+    ids = torch.empty((rows, 8), dtype=torch.long)
+    weights = torch.empty((rows, 8))
+    gate_up, down, gate_up_scale, down_scale = [object() for _ in range(4)]
+    with patch.dict(run.__globals__, _stage_w4a8=Mock()) as symbols:
+        output = run(provider, hidden, ids, weights,
+                     ((gate_up, gate_up_scale), (down, down_scale)), buf, 10.)
+        assert symbols["_stage_w4a8"].call_count == int(rows > 0)
+    assert output.shape == hidden.shape
+    provider._C.w4a8_mega_moe.assert_called_once_with(
+        output, gate_up, down, gate_up_scale, down_scale, buf.buffer, buf.local_buffer,
+        buf.handle.buffer_ptrs, buf.handle.signal_ptrs, buf.group.rank(), 2560, 272, 8,
+        10., True, l1_weights_sf_div16=gate_up_scale, l2_weights_sf_div16=down_scale,
+    )
+    provider.fp8_mega_moe.assert_not_called()
 
 
 def _worker(rank, rendezvous):

@@ -495,7 +495,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         super().__init__()
 
         config = _normalize_hyv4_config(vllm_config.model_config.hf_config)
-        self.use_mega_moe = get_hcu_config(vllm_config).hy4_fp8_megamoe
+        features = get_hcu_config(vllm_config)
+        self.use_mega_moe = features.hy4_fp8_megamoe or features.hy4_w4a8_megamoe
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -602,6 +603,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 assert isinstance(layer.mlp, HYV4MoEFused)
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
+                if features.hy4_w4a8_megamoe:
+                    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+                        HcuCompressedTensorsW4A8Int8MoEMethod,
+                    )
+                    owner = layer.mlp.experts.routed_experts
+                    if not isinstance(owner.quant_method, HcuCompressedTensorsW4A8Int8MoEMethod):
+                        raise ValueError(f"HY4 W4A8 MegaMoE requires compressed INT4 experts for {owner}")
+                    owner._hy4_w4a8_megamoe = True
 
         if example_layer is None:
             self.num_moe_layers = 0

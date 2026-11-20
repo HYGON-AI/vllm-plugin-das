@@ -602,6 +602,16 @@ def test_hy4_megamoe_cli_survives_worker_config_round_trip() -> None:
         args.create_engine_config()
     module.EngineArgs(moe_backend="deep_gemm").create_engine_config()
 
+    model.architectures = ["HYV4ForCausalLM"]
+    text = args.create_engine_config()
+    assert text.kernel_config.moe_backend == "deep_gemm"
+    features = get_hcu_config(pickle.loads(pickle.dumps(text)))
+    assert features.hy4_w4a8_megamoe and not features.hy4_fp8_megamoe
+    ordinary = module.EngineArgs(moe_backend="deep_gemm").create_engine_config()
+    assert not get_hcu_config(ordinary).hy4_w4a8_megamoe
+    model.hf_config.quantization_config["format"] = "float-quantized"
+    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm_mega_moe"
+
     model.architectures = ["DeepseekV4ForCausalLM"]
     native = args.create_engine_config()
     assert native.kernel_config.moe_backend == "deep_gemm_mega_moe"

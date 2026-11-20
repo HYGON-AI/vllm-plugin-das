@@ -519,14 +519,17 @@ def _resolve_hy4_megamoe_backend(config):
     kernel = getattr(config, "kernel_config", None)
     if getattr(kernel, "moe_backend", None) != HY4_MEGAMOE_BACKEND:
         return
-    if getattr(config.model_config, "architectures", None) != ["HYV4VLForConditionalGeneration"]:
+    arch = getattr(config.model_config, "architectures", None)
+    quant = getattr(getattr(config.model_config, "hf_config", None), "quantization_config", None)
+    text_w4 = (arch == ["HYV4ForCausalLM"] and config.model_config.quantization == "compressed-tensors"
+               and isinstance(quant, dict) and quant.get("format") == "pack-quantized")
+    if not text_w4 and arch != ["HYV4VLForConditionalGeneration"]:
         return
-    # HY4 uses the DeepGEMM FP8 oracle and replaces the resolved expert kernel.
-    # Other architectures retain vLLM's native MegaMoE selection.
     config.kernel_config = copy.copy(kernel)
     config.kernel_config.moe_backend = "deep_gemm"
     config.additional_config = dict(config.additional_config or {})
-    set_hcu_config(config, moe_backend="deep_gemm", hy4_fp8_megamoe=True)
+    set_hcu_config(config, moe_backend="deep_gemm", hy4_fp8_megamoe=not text_w4,
+                   hy4_w4a8_megamoe=text_w4)
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
