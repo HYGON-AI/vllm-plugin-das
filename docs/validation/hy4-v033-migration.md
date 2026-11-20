@@ -45,7 +45,7 @@ MR or copy an existing mechanism just to obtain three MRs.
 | H03 | PCP16 metadata, indexer and cache ownership | Reuse Core `v1/attention/backends/mla/{indexer,flashmla_sparse}.py` | Requires HY4 HCU dispatch/stride/empty-chunk and distributed tests |
 | H04 | Learnable attention sink | Reuse Core `hy_v4/nvidia/flashmla_sparse.py` wrappers and validation | Vendor ABI and prefill/decode sink semantics pending; never omit sink |
 | H05 | Public `fp8_e4m3` vs physical `fp8_ds_mla` | Core owns geometry; Adapter restores HCU ABI and provider eligibility | Packed cache, scales, RoPE and actual writer pending |
-| H06 | CT W4A8 routed experts, weight/scale reload | Plugin HCU method; reuse Core loader/runner and existing packed provider where compatible | Core INT4×INT8 MoE is ARM CPU-only; existing Plugin admission is DSV4.1-specific; HY4 remains pending |
+| H06 | CT W4A8 routed experts, weight/scale reload | Distinct Plugin `hcu_hy4_ct_w4a8` config; reuse existing HIPC method and Core loader/runner | HY4 schema/delegation CPU checks added; actual load, native calls and layerwise reload remain pending |
 | H07 | Offline R16 EPLB, nearest dispatch and recording | Plugin mechanism, reusing `static_eplb*`; Core owns router and loader APIs | Existing runtime is owned-model/PCP-specific; HY4 backbone/MTP mapping and redundant slot sizes pending |
 | H08 | `VLLM_HCU_STATIC_HT_W4A8_COUNT_SCRATCH` | Plugin optimization with correct communicator ownership | Recheck target modular DeepEP buffers before carrying legacy scratch |
 | H09 | `VLLM_HCU_ENABLE_PREFILL_MQA_GROUPING` | First assess Core sparse prefill batching; Plugin only for remaining algorithm | Not yet proven equivalent on HCU; retain as pending |
@@ -103,6 +103,36 @@ parent and a real spawn child without importing Torch or vLLM. This probe uses
 Adapter's source protocol; it does not certify an installed Adapter/Core/native stack.
 
 ## Acceptance order
+
+### HY4 CT admission increment
+
+The paired Adapter adds `set_additional_config_provider(name, factory)` to its
+existing CT registration transaction. It retains the legacy DSV4.1 name and
+never overwrites official CT/FP8 entries. The Plugin supplies
+`HcuHY4CTW4A8Config` as a lazy provider, restricted to `model_type=hy_v4`, packed
+static channel INT4 weights and dynamic symmetric token INT8 activations.
+Other models, explicit quantizer choices and different formats are not claimed.
+
+The HY4 config delegates scheme parsing and execution to the existing packed
+method, including INT8 dense layers and positive SwiGLU clamp. No DSV4.1 router,
+model class or weights are substituted. The shared schema predicate was factored
+into a framework-free helper without changing its DSV4.1 contract.
+
+The additional `das_hcu_hy4_ct_w4a8` extension checks the Adapter-owned public
+registration; it does not own a second registry transaction or common admission.
+Older Adapter revisions retain DSV4.1 binding, but the HY4 capability explicitly
+refuses the missing additional-provider seam. For an HY4 validation deployment,
+require `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hy4-ct-w4a8`; keep the existing
+CT native/stock policy and kill switch.
+
+Portable source checks: **93 passed, 1 deselected** across HY4 frontend, HY4 CT
+policy/delegation and discovery. The deselected existing full-provider-contract
+test was attempted and failed at its unavailable `vllm` import;
+it is not a passing integration test. No Core/Torch native stack is installed in
+this portable environment. This increment does not yet provide the HY4-specific
+offline-R16 model binding or establish native HIPC/DeepEP ABI acceptance.
+
+### Device order
 
 1. Finish source ownership/disposition and affected CPU contracts.
 2. Install ABI-matched Core + Adapter + Plugin wheels; verify parent/spawn module origins.

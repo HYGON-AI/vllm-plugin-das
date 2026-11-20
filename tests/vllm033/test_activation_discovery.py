@@ -56,3 +56,21 @@ def test_full_provider_contract_is_still_checked_at_activation(monkeypatch):
         with pytest.raises(_seams.AdapterContractError, match='set_moe_provider'):
             bind()
     assert not _seams._bound
+
+
+@pytest.mark.parametrize('owner', ['hy4_frontend', 'hy4_quant_activation'])
+def test_hy4_discovery_does_not_import_framework_or_vendor(owner):
+    code = f'''
+import sys, importlib, importlib.abc
+sys.path[:0] = {list(sys.path)!r}
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {{'vllm', 'torch', 'aiter', 'lightop', 'deepgemm', 'tokenizers'}}:
+            raise AssertionError('discovery imported ' + fullname)
+sys.meta_path.insert(0, Block())
+module = importlib.import_module('hcu_vllm_das.{owner}')
+assert callable(module.extension_spec().activate)
+'''
+    result = subprocess.run([sys.executable, '-S', '-B', '-c', code],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr

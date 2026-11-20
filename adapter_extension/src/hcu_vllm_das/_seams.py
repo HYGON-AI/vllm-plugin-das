@@ -127,6 +127,12 @@ def _ct_w4a8_config_provider():
     return HcuDSV41CTW4A8Config
 
 
+def _hy4_ct_w4a8_config_provider():
+    from .quantization.hy4_ct_w4a8 import HcuHY4CTW4A8Config
+
+    return HcuHY4CTW4A8Config
+
+
 def _engram_edp_install():
     from .v41_engram_edp import install_engram_edp_guard
 
@@ -175,4 +181,7 @@ def bind_ct_w4a8() -> None:
     modules = _bindings()
     require_adapter_seams()
     modules["ct_w4a8_registration"].set_config_provider(_ct_w4a8_config_provider)
+    additional = getattr(modules["ct_w4a8_registration"], 'set_additional_config_provider', None)
+    if callable(additional):
+        additional('hcu_hy4_ct_w4a8', _hy4_ct_w4a8_config_provider)
     _bound.add("ct_w4a8")
