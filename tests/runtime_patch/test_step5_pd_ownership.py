@@ -64,3 +64,22 @@ def test_shared_dsa_preserves_original_aliases_without_pd_opt_in():
     assert v.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
     assert k.stride() == (cache.stride(2), cache.stride(1), 1)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('eager', [False, True])
+@pytest.mark.parametrize('role,expected', [('kv_consumer',3),('kv_producer',2)])
+def test_import_capacity_is_reserved_for_both_consumer_execution_modes(ownership,eager,role,expected):
+    path=ROOT/'vllm_hcu/models/step5_text.py'
+    tree=ast.parse(path.read_text(encoding='utf-8'))
+    model=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Step5Model')
+    init=next(n for n in model.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
+    block=next(n for n in init.body if isinstance(n,ast.If)
+               and isinstance(n.test,ast.Name) and n.test.id=='sparse_layers')
+    # Execute the actual startup budget selection without constructing a model.
+    selection=ast.Module(body=block.body[:2],type_ignores=[])
+    config=SimpleNamespace(model_config=SimpleNamespace(
+        hf_config=SimpleNamespace(model_type='step5'),enforce_eager=eager),
+        kv_transfer_config=SimpleNamespace(kv_connector='MooncakeConnector',kv_role=role))
+    namespace={'vllm_config':config,'is_step5_pd_config':ownership.is_step5_pd_config}
+    exec(compile(selection,str(path),'exec'),namespace)
+    assert namespace['pending_per_request']==expected

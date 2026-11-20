@@ -25,19 +25,11 @@ def aux():
     return module
 
 
-class Pending:
-    def __init__(self):
-        self.rows = {}
-
-    def acquire(self, slot):
-        return self.rows.setdefault(slot, len(self.rows))
-
-
 def make_state():
     state = SimpleNamespace(
         num_layers=2, dtype=torch.bfloat16, block_size=16, regions_per_page=2,
         geometry=SimpleNamespace(region_size=8, proxy_dim=4),
-        pending=Pending(), step_cache={},
+        pending=real_pending(32), step_cache={},
         summary=torch.zeros((2, 26, 1, 4), dtype=torch.float8_e4m3fn),
         pending_key=torch.zeros((2, 32, 8, 4), dtype=torch.bfloat16),
         pending_z=torch.zeros((2, 32, 8, 4), dtype=torch.bfloat16),
@@ -46,7 +38,7 @@ def make_state():
     return state
 
 
-def make_manager(aux, producer, rank=0):
+def make_manager(aux, producer, rank=0, *, eager=True):
     state = make_state()
     names = [f"model.layers.{i}.self_attn" for i in range(2)]
     indexers = {name: SimpleNamespace(state=state, slot=i) for i, name in enumerate(names)}
@@ -56,7 +48,8 @@ def make_manager(aux, producer, rank=0):
     engine.batch_register_memory = lambda ptrs, sizes: (engine.registrations.extend(zip(ptrs, sizes)) or 0)
     worker = SimpleNamespace(
         is_kv_producer=producer, engine=engine, seen_base_addresses=[], tp_rank=rank,
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=4)),
+        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=4),
+                                   model_config=SimpleNamespace(enforce_eager=eager)),
         _layer_group_indices={name: 0 for name in names},
         _logical_to_kernel_block_ids=lambda groups: [list(g) for g in groups],
         transfer_topo=SimpleNamespace(tp_ratio=lambda other: -4),
@@ -253,7 +246,7 @@ def test_producer_fence_records_the_worker_stream_before_next_forward(aux, monke
 @pytest.mark.parametrize("blocks", [[], [[]], [[], []]])
 def test_notification_only_pull_skips_all_auxiliary_restoration(aux, blocks):
     manager = object.__new__(aux.Step5AuxManager)
-    pull = SimpleNamespace(local_block_ids=blocks, num_prompt_tokens=0,
+    pull = SimpleNamespace(d_req_id="d", local_block_ids=blocks, num_prompt_tokens=0,
                            dsa_aux={"stale": object()})
     # No worker/mapper exists: notification handling must return before either
     # translating blocks or accessing any summary/pending-region storage.
@@ -264,8 +257,8 @@ def test_notification_only_pull_skips_all_auxiliary_restoration(aux, blocks):
 def test_allocated_pull_still_requires_prompt_length(aux):
     manager, state, _, _ = make_manager(aux, False)
     with pytest.raises(ValueError, match="prompt token count"):
-        manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=0))
-    assert not state.pending.rows
+        manager.prepare_pull(SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=0))
+    assert not state.pending._row_of_slot
 
 
 @pytest.mark.parametrize("cancelled_first", [True, False])
@@ -293,8 +286,8 @@ def test_preallocation_abort_notification_survives_mixed_worker_batch(aux, monke
     worker.is_kv_consumer = True
     worker._remote_agents = {"producer": object()}
     worker.receiver_loop = object()
-    cancelled = SimpleNamespace(local_block_ids=blocks, num_prompt_tokens=0, dsa_aux={})
-    active = SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=8, dsa_aux={})
+    cancelled = SimpleNamespace(d_req_id="cancelled", local_block_ids=blocks, num_prompt_tokens=0, dsa_aux={})
+    active = SimpleNamespace(d_req_id="active", local_block_ids=[[2]], num_prompt_tokens=8, dsa_aux={})
     pulls = dict([("cancelled", cancelled), ("active", active)] if cancelled_first
                  else [("active", active), ("cancelled", cancelled)])
     dispatched = []
@@ -306,7 +299,7 @@ def test_preallocation_abort_notification_survives_mixed_worker_batch(aux, monke
     assert dispatched == [("producer", pulls)]
     assert cancelled.dsa_aux == {}
     assert active.dsa_aux
-    assert len(state.pending.rows) == 1
+    assert len(state.pending._row_of_slot) == 1
 
 
 def copy_registered(source_worker, destination_worker, pointers):
@@ -348,7 +341,7 @@ def test_replicated_summaries_and_last_region_survive_tp1_to_tp4(aux, tokens):
 
     for rank in range(4):
         consumer, dstate, _, dworker = make_manager(aux, False, rank)
-        pull = SimpleNamespace(local_block_ids=[destination_blocks], num_prompt_tokens=tokens, dsa_aux={})
+        pull = SimpleNamespace(d_req_id="d", local_block_ids=[destination_blocks], num_prompt_tokens=tokens, dsa_aux={})
         consumer.prepare_pull(pull)
         peer = SimpleNamespace(remote_tp_size=4, dsa_aux={"d": pull.dsa_aux})
         copy_registered(pworker, dworker, producer.transfer_parameters(
@@ -356,7 +349,7 @@ def test_replicated_summaries_and_last_region_survive_tp1_to_tp4(aux, tokens):
             [source_blocks], [destination_blocks],
         ))
         slot = destination_blocks[-1] * 2 + ((tokens - 1) % 16) // 8
-        row = dstate.pending.rows[slot]
+        row = dstate.pending._row_of_slot[slot]
         for layer in range(2):
             for source_block, destination_block in zip(source_blocks, destination_blocks):
                 assert torch.equal(
@@ -423,7 +416,7 @@ def test_missing_peer_auxiliary_state_fails_instead_of_decoding_with_empty_summa
 def test_incompatible_auxiliary_descriptors_fail_before_any_memory_copy(aux, field, value):
     producer, _, _, _ = make_manager(aux, True)
     consumer, _, _, _ = make_manager(aux, False)
-    pull = SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5, dsa_aux={})
+    pull = SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=5, dsa_aux={})
     consumer.prepare_pull(pull)
     name = next(iter(pull.dsa_aux))
     descriptor = list(pull.dsa_aux[name])
@@ -438,7 +431,7 @@ def test_incompatible_auxiliary_descriptors_fail_before_any_memory_copy(aux, fie
 def test_auxiliary_block_bounds_are_checked(aux, source, destination):
     producer, _, _, _ = make_manager(aux, True)
     consumer, _, _, _ = make_manager(aux, False)
-    pull = SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5, dsa_aux={})
+    pull = SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=5, dsa_aux={})
     consumer.prepare_pull(pull)
     peer = SimpleNamespace(remote_tp_size=4, dsa_aux={"d": pull.dsa_aux})
     with pytest.raises(ValueError, match="exceeds its registered pool"):
@@ -448,7 +441,7 @@ def test_auxiliary_block_bounds_are_checked(aux, source, destination):
 def test_auxiliary_restore_requires_prompt_length(aux):
     consumer, _, _, _ = make_manager(aux, False)
     with pytest.raises(ValueError, match="prompt token count"):
-        consumer.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=0))
+        consumer.prepare_pull(SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=0))
 
 
 def test_ordinary_non_pd_prefill_does_not_consume_a_snapshot_row(aux):
@@ -461,9 +454,9 @@ def test_imported_tail_is_not_erased_by_deferred_cleanup_of_reused_block(aux):
     manager, state, _, _ = make_manager(aux, False)
     slot = 2 * 2
     state._schedule = SimpleNamespace(completed_slots=[slot, slot + 1])
-    manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5, dsa_aux={}))
+    manager.prepare_pull(SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=5, dsa_aux={}))
     assert state._schedule.completed_slots == [slot + 1]
-    assert slot in state.pending.rows
+    assert slot in state.pending._row_of_slot
 
 
 def test_snapshot_keys_preserve_kv_group_identity(aux):
@@ -610,8 +603,8 @@ def test_rebound_auxiliary_allocations_reject_transfer_but_keep_cleanup_usable(a
     original = getattr(state, field)
     setattr(state, field, original.clone())
     with pytest.raises(RuntimeError, match='re-register'):
-        manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5))
-    cleanup = SimpleNamespace(local_block_ids=[], num_prompt_tokens=0, dsa_aux={'old': ()})
+        manager.prepare_pull(SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=5))
+    cleanup = SimpleNamespace(d_req_id="d", local_block_ids=[], num_prompt_tokens=0, dsa_aux={'old': ()})
     manager.prepare_pull(cleanup)
     assert cleanup.dsa_aux == {}
     assert any(original is t for _, tensors, _ in manager._allocations.values() for t in tensors)
@@ -622,7 +615,7 @@ def test_inplace_storage_rebinding_is_rejected(aux):
     registered_pointer = state.pending_key.data_ptr()
     state.pending_key.set_(torch.zeros_like(state.pending_key))
     with pytest.raises(RuntimeError, match='re-register'):
-        manager.prepare_pull(SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=5))
+        manager.prepare_pull(SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=5))
     assert any(s.data_ptr() == registered_pointer for s in manager._registered_storages)
 
 
@@ -635,9 +628,10 @@ def real_pending(capacity):
     return scope['Step4PendingTable'](capacity)
 
 
-def test_cancelled_import_stays_reserved_until_dma_finishes(aux):
-    manager,state,_,_=make_manager(aux,False)
-    state.pending=real_pending(2);manager._compiled_consumer=True
+@pytest.mark.parametrize('eager', [False, True])
+def test_cancelled_import_stays_reserved_until_dma_finishes(aux,eager):
+    manager,state,_,_=make_manager(aux,False,eager=eager)
+    state.pending=real_pending(2)
     manager.prepare_pull(SimpleNamespace(d_req_id='request',local_block_ids=[[2]],num_prompt_tokens=5))
     owner=manager._imports['request'].owner;slot=4
     for i in range(8):
@@ -650,9 +644,10 @@ def test_cancelled_import_stays_reserved_until_dma_finishes(aux):
     assert slot not in state.pending._row_of_slot and not manager._imports
 
 
-def test_ready_import_waits_for_consumption_and_stale_cleanup_cannot_release_reuse(aux):
-    manager,state,_,_=make_manager(aux,False)
-    state.pending=real_pending(2);manager._compiled_consumer=True
+@pytest.mark.parametrize('eager', [False, True])
+def test_ready_import_waits_for_consumption_and_stale_cleanup_cannot_release_reuse(aux,eager):
+    manager,state,_,_=make_manager(aux,False,eager=eager)
+    state.pending=real_pending(2)
     manager.prepare_pull(SimpleNamespace(d_req_id='request',local_block_ids=[[2]],num_prompt_tokens=5))
     old=manager._imports['request'].owner;slot=4
     manager.finish_pulls({'request'},set())
@@ -668,6 +663,84 @@ def test_ready_import_waits_for_consumption_and_stale_cleanup_cannot_release_reu
         state.pending.reserve(slot,object())
 
 
+@pytest.mark.parametrize('eager', [False, True])
+def test_slow_import_cannot_overwrite_another_requests_tail(aux,eager):
+    manager,state,_,_=make_manager(aux,False,eager=eager)
+    state.pending=real_pending(2)
+    pull=SimpleNamespace(d_req_id='slow',local_block_ids=[[2]],num_prompt_tokens=5)
+    manager.prepare_pull(pull)
+    slot=4
+    import_row=state.pending._row_of_slot[slot]
+    state.pending.begin_step()
+    state.pending.acquire(10)
+    state.pending.begin_step()
+    other_row=state.pending.acquire(11)
+    state.pending_key[:,other_row].fill_(3)
+    # This is the address already advertised to P, even if decode advances.
+    state.pending_key[:,import_row].fill_(37)
+    assert bool((state.pending_key[:,other_row]==3).all())
+    assert slot in state.pending._row_of_slot
+    manager.finish_pulls({'slow'},set())
+    assert state.pending.get(slot)==import_row
+    assert bool((state.pending_key[:,import_row]==37).all())
+    manager.finish_pulls(set(),set())
+    assert not manager._imports
+
+
+@pytest.mark.parametrize('eager', [False, True])
+def test_all_consumers_fence_prior_compute_before_preparing_pulls(aux,monkeypatch,eager):
+    manager,_,_,_=make_manager(aux,False,eager=eager)
+    events=[]
+    manager._validate_allocations=lambda:events.append('validate')
+    manager._allocations={0:(None,(SimpleNamespace(is_cuda=True,device='cuda:0'),),())}
+    manager.prepare_pull=lambda pull:events.append('prepare')
+    fence=SimpleNamespace(record=lambda stream:events.append(('record',stream)))
+    monkeypatch.setattr(torch.cuda,'is_current_stream_capturing',lambda:False)
+    monkeypatch.setattr(torch.cuda,'current_stream',lambda device:'compute-stream')
+    monkeypatch.setattr(torch.cuda,'Event',lambda:fence)
+    pull=SimpleNamespace(local_block_ids=[[2]])
+    assert manager.prepare_pulls([pull]) is fence
+    assert events==['validate',('record','compute-stream'),'prepare']
+
+
+@pytest.mark.parametrize('eager', [False, True])
+def test_import_reservations_and_fence_with_real_device_memory(aux,eager):
+    if not torch.cuda.is_available():
+        pytest.skip('GPU is required')
+    _,state,indexers,worker=make_manager(aux,False,eager=eager)
+    for name in ('summary','pending_key','pending_z'):
+        setattr(state,name,getattr(state,name).to('cuda'))
+    state.pending=real_pending(2)
+    caches={name:torch.empty((13,1,16,8),dtype=torch.uint8,device='cuda')
+            for name in indexers}
+    manager=aux.Step5AuxManager(worker,indexers,caches)
+    pull=SimpleNamespace(d_req_id='slow',local_block_ids=[[2]],num_prompt_tokens=5)
+    compute,transfer=torch.cuda.Stream(),torch.cuda.Stream()
+    with torch.cuda.stream(compute):
+        state.pending_key.zero_()
+        state.pending_z.zero_()
+        readiness=manager.prepare_pulls([pull])
+        assert readiness is not None
+        import_row=state.pending._row_of_slot[4]
+        state.pending.begin_step();state.pending.acquire(10)
+        state.pending.begin_step();other_row=state.pending.acquire(11)
+        state.pending_key[:,other_row].fill_(3)
+    # An independent stream stands in for delayed external writes. It must
+    # honor the same readiness event used by the Mooncake receiver.
+    with torch.cuda.stream(transfer):
+        transfer.wait_event(readiness)
+        state.pending_key[:,import_row].fill_(37)
+        state.pending_z[:,import_row].fill_(41)
+    transfer.synchronize();compute.synchronize()
+    assert bool((state.pending_key[:,other_row]==3).all())
+    manager.finish_pulls({'slow'},set())
+    assert state.pending.get(4)==import_row
+    assert bool((state.pending_key[:,import_row]==37).all())
+    assert bool((state.pending_z[:,import_row]==41).all())
+    manager.finish_pulls(set(),set())
+    assert not manager._imports
+
+
 def test_all_reserved_rows_fail_instead_of_overwriting_live_dma():
     pending=real_pending(1);owner=object();pending.reserve(7,owner)
     pending.begin_step()
@@ -678,10 +751,11 @@ def test_all_reserved_rows_fail_instead_of_overwriting_live_dma():
     assert pending.acquire(8)==0
 
 
+@pytest.mark.parametrize('eager', [False, True])
 @pytest.mark.parametrize('block',[-1,13])
-def test_invalid_import_destination_does_not_reserve_a_pending_row(aux,block):
-    manager,state,_,_=make_manager(aux,False)
-    state.pending=real_pending(2);manager._compiled_consumer=True
+def test_invalid_import_destination_does_not_reserve_a_pending_row(aux,block,eager):
+    manager,state,_,_=make_manager(aux,False,eager=eager)
+    state.pending=real_pending(2)
     with pytest.raises(ValueError,match='registered pool'):
         manager.prepare_pull(SimpleNamespace(d_req_id='request',local_block_ids=[[block]],num_prompt_tokens=5))
     assert state.pending._reservations=={}
@@ -698,7 +772,7 @@ def test_coalesced_summary_transfer_keeps_tail_and_neighbor_bytes(aux, source, d
     pool.tensor[:, slot].fill_(17)
     pstate.summary.copy_((torch.arange(pstate.summary.numel()).reshape(pstate.summary.shape) % 31).to(pstate.summary.dtype))
     dstate.summary.view(torch.uint8).fill_(211)
-    pull = SimpleNamespace(local_block_ids=[destination], num_prompt_tokens=47)
+    pull = SimpleNamespace(d_req_id="d", local_block_ids=[destination], num_prompt_tokens=47)
     consumer.prepare_pull(pull)
     plan = producer.transfer_parameters('d', SimpleNamespace(remote_tp_size=4, dsa_aux={'d': pull.dsa_aux}), [source], [destination])
     assert len(plan[0]) == 6  # One summary run and two tail tensors per layer.
@@ -710,7 +784,7 @@ def test_coalesced_summary_transfer_keeps_tail_and_neighbor_bytes(aux, source, d
                                dstate.summary[layer, dst*2:(dst+1)*2].view(torch.uint8))
         for block in set(range(13)) - set(destination):
             assert bool((dstate.summary[layer, block*2:(block+1)*2].view(torch.uint8) == 211).all())
-        row = dstate.pending.rows[destination[-1]*2 + 1]
+        row = dstate.pending._row_of_slot[destination[-1]*2 + 1]
         assert bool((dstate.pending_key[layer, row] == 17).all())
         assert bool((dstate.pending_z[layer, row] == 17).all())
 
@@ -744,7 +818,7 @@ def test_connector_reports_transfer_and_request_completion_to_import_leases(monk
 def test_missing_kv_group_is_reported_before_pointer_lookup(aux, source_groups, target_groups):
     producer, _, _, _ = make_manager(aux, True)
     consumer, _, _, _ = make_manager(aux, False)
-    pull = SimpleNamespace(local_block_ids=[[2]], num_prompt_tokens=8, dsa_aux={})
+    pull = SimpleNamespace(d_req_id="d", local_block_ids=[[2]], num_prompt_tokens=8, dsa_aux={})
     consumer.prepare_pull(pull)
     peer = SimpleNamespace(remote_tp_size=4, dsa_aux={"d": pull.dsa_aux})
     with pytest.raises(ValueError, match="group mapping"):

@@ -100,8 +100,6 @@ class Step5AuxManager:
         self.pools: dict[int, _SnapshotPool] = {}
         self._sources: dict[str, list[list[int]]] = {}
         self._lock = threading.RLock()
-        self._compiled_consumer = not worker.is_kv_producer and not getattr(
-            getattr(worker.vllm_config, "model_config", None), "enforce_eager", True)
         self._imports: dict[str, _ImportLease] = {}
         # Transport and captured consumers retain these addresses. Keep the
         # allocations alive, and reject rebinding until KV is registered again.
@@ -171,12 +169,13 @@ class Step5AuxManager:
 
     def prepare_pulls(self, pulls: list[Any]):
         readiness = None
-        if self._compiled_consumer and any(any(p.local_block_ids) for p in pulls):
+        # RDMA can overlap later model steps in either execution mode.
+        if not self.worker.is_kv_producer and any(any(p.local_block_ids) for p in pulls):
             self._validate_allocations()
             first = next(iter(self._allocations.values()))[1][0]
             if first.is_cuda:
                 if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Step5 PD restoration must run before graph replay")
+                    raise RuntimeError("Step5 PD restoration must run outside CUDA graphs")
                 # Do not block the model worker: the receiver waits for this
                 # event before RDMA can overwrite a recycled pending row.
                 readiness = torch.cuda.Event()
@@ -311,9 +310,10 @@ class Step5AuxManager:
             raise ValueError("Step5 DSA P/D requires the prompt token count")
         descriptors = {}
         rows: dict[tuple[int, int], int] = {}
-        lease = None
-        if self._compiled_consumer:
-            lease = self._imports.setdefault(pull_meta.d_req_id, _ImportLease())
+        # Eager consumers also receive asynchronously while other requests
+        # decode. Pin their advertised DMA destinations until consumed or
+        # cancelled after receipt, just as for captured consumers.
+        lease = self._imports.setdefault(pull_meta.d_req_id, _ImportLease())
         for name, indexer in self.indexers.items():
             state = indexer.state
             group = self.worker._layer_group_indices[name]
@@ -338,13 +338,10 @@ class Step5AuxManager:
                         old_slot for old_slot in previous.completed_slots
                         if old_slot != slot
                     ]
-                if lease is None:
-                    rows[key] = state.pending.acquire(slot)
-                else:
-                    rows[key] = state.pending.reserve(slot, lease.owner)
-                    if not any(old_state is state and old_slot == slot
-                               for old_state, old_slot in lease.rows):
-                        lease.rows.append((state, slot))
+                rows[key] = state.pending.reserve(slot, lease.owner)
+                if not any(old_state is state and old_slot == slot
+                           for old_state, old_slot in lease.rows):
+                    lease.rows.append((state, slot))
             row = rows[key]
             summary = state.summary[indexer.slot]
             tail_k = state.pending_key[indexer.slot, row]

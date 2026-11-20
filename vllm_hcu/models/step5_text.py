@@ -1386,8 +1386,7 @@ class Step5Model(nn.Module):
         if sparse_layers:
             pending_per_request = 2
             if (is_step5_pd_config(vllm_config)
-                    and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
-                    and not vllm_config.model_config.enforce_eager):
+                    and vllm_config.kv_transfer_config.kv_role == "kv_consumer"):
                 # Imported tails are pinned until their first scheduled use.
                 # Keep their budget separate from active/rollback regions.
                 pending_per_request += 1
