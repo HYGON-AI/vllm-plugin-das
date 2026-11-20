@@ -11,7 +11,7 @@ import pytest
 
 CASES = ("discovery", "default-off", "versions", "platform", "registry", "foreign",
          "partial", "drift", "fork", "fork-partial", "spawn", "constructors",
-         "config", "loaders", "streaming")
+         "config", "speculative-config", "loaders", "streaming")
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -29,6 +29,14 @@ def test_installed_qwen4_dense_contract(case):
     run = subprocess.run(command, env=env, cwd="/", capture_output=True, text=True, timeout=120)
     assert run.returncode == 0, run.stdout + run.stderr
     assert "QWEN4_DENSE_OK=" + case in run.stdout
+
+
+def _dense_hf_override(config):
+    # Core first probes callable overrides with a dummy PretrainedConfig.
+    from vllm.transformers_utils.config import get_hf_text_config
+    if config.model_type in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"}:
+        get_hf_text_config(config).indexer_n_heads = None
+    return config
 
 
 def _point():
@@ -246,6 +254,46 @@ def _scenario(case):
             assert all(isinstance(c.hf_text_config, Qwen4ExpTextConfig) for c in configs)
             assert all(c.hf_text_config.layer_types == text.layer_types for c in configs)
             assert configs[0].compute_hash() != configs[1].compute_hash()
+    elif case == "speculative-config":
+        import pickle
+        import tempfile
+        from transformers import PretrainedConfig
+        from vllm.config import ModelConfig, ParallelConfig
+        from vllm.config.speculative import SpeculativeConfig
+        dummy = PretrainedConfig()
+        assert _dense_hf_override(dummy) is dummy
+        for root in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                text = text_config(4, num_hidden_layers=2, mtp_num_hidden_layers=1,
+                    layer_types=["indexed_attention", "linear_attention"])
+                saved = (Qwen4ExpConfig(text_config=text,
+                    architectures=["Qwen4ExpForConditionalGeneration"]) if root
+                    else text)
+                if not root:
+                    saved.architectures = ["Qwen4ExpForCausalLM"]
+                saved.save_pretrained(directory)
+                override = ({"text_config": {"indexer_n_heads": None}} if root
+                            else {"indexer_n_heads": None})
+                for setting, expected in (({}, (4, 4)), (override, (None, 4)),
+                                          (_dense_hf_override, (None, None))):
+                    target = ModelConfig(model=directory, tokenizer_mode="skip",
+                        dtype="bfloat16", max_model_len=4096, hf_overrides=setting)
+                    spec = SpeculativeConfig(method="mtp", num_speculative_tokens=3,
+                        target_model_config=target,
+                        target_parallel_config=ParallelConfig(tensor_parallel_size=4))
+                    draft = spec.draft_model_config
+                    assert (target.hf_text_config.indexer_n_heads,
+                            draft.hf_text_config.indexer_n_heads) == expected
+                    assert draft.architectures == ["Qwen4ExpMTP"]
+                    resolved, _ = ModelRegistry.resolve_model_cls(
+                        draft.architectures, NS(model_impl="vllm"))
+                    assert resolved is candidate.HcuQwen4ExpMTP
+                    restored = pickle.loads(pickle.dumps(draft.hf_overrides))
+                    loaded = type(saved).from_pretrained(directory)
+                    transformed = restored(loaded)
+                    from vllm.transformers_utils.config import get_hf_text_config
+                    assert get_hf_text_config(transformed).indexer_n_heads == expected[1]
+                    assert type(saved).from_pretrained(directory).to_dict() == saved.to_dict()
     elif case == "streaming":
         text = text_config()
         value = torch.ones(2, 2)

@@ -50,6 +50,41 @@ Those remain required device/end-to-end gates before this capability is Ready.
 Disabling QSA changes the model's attention semantics; it is an explicit mode,
 not a transparent accuracy-preserving optimization.
 
+## MTP configuration boundary
+
+At the inspected Core target, dictionary `hf_overrides` apply only to the
+target. Actual `SpeculativeConfig` construction reloads the draft checkpoint:
+the nested JSON override above gives target `indexer_n_heads=None` but draft
+`indexer_n_heads=4` on the trained checkpoint. Copying the already overridden
+target config into `hf_config_override` does not test this construction path.
+The JSON CLI example alone therefore does not select dense MTP.
+
+For explicitly dense target **and** draft, the official Python API composes a
+callable override into both configurations. Put the callable at module scope
+in an importable application module so spawned workers can deserialize it:
+
+```python
+def dense_hf_override(config):
+    from vllm.transformers_utils.config import get_hf_text_config
+
+    if config.model_type in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"}:
+        get_hf_text_config(config).indexer_n_heads = None
+    return config
+
+# Pass through the public LLM/EngineArgs Python API:
+# hf_overrides=dense_hf_override,
+# speculative_config={"method": "mtp", "num_speculative_tokens": 3}
+```
+
+Core also probes this callable with a dummy `PretrainedConfig`; preserve
+unmatched configurations unchanged. Keep the explicit extension selection.
+This uses the official configuration composition, model constructors and MTP
+implementation without changing checkpoint files or a shared config method.
+The `speculative-config` CPU scenario exercises complete `ModelConfig` and
+`SpeculativeConfig` construction for root and standalone text checkpoints,
+including unchanged defaults, JSON target-only behavior, callable propagation
+and pickling. Actual accepted tokens and model accuracy remain device gates.
+
 The installed CPU qualification for runtime `1fba2bc1` (Core `c440c089`,
 Adapter/native `d9bb7fa5`) passes the complete portable selection: 1408 cases,
 including the 15 new CPU scenarios, plus 11 fresh public-selector processes.
@@ -145,3 +180,40 @@ Evidence: `evidence/qwen4-dense-full-checkpoint-20261120-r2-device/audit.json`.
 **Keep Draft.** Default CPU offload, original raw-format/lifecycle findings,
 MTP acceptance, the remaining replay/mixed-batch matrix and performance gates
 remain open. This documentation/skill follow-up changes no production code.
+
+## Trained MTP startup follow-up (2026-11-20)
+
+A separate TP4/device-PLE run uses the explicit callable Python API above and
+official MTP with three speculative tokens. The new installed CPU scenario
+passes; the previous 20 affected CPU results belong to the unchanged production
+payload. Target and draft checkpoint loading both complete their 131-shard
+iteration, and workers report 56.7 GiB model memory each. The official
+speculator identifies `HcuQwen4ExpMTP` and retains text-only draft inputs.
+
+This run fails during target profiling/compilation before service health,
+worker RPC inspection, Graph replay or generation. The first fatal stack
+reaches the target HC projection's `vllm.rocm_unquantized_gemm`, whose compiled
+input has K=10240 and weight shape `[336, 10240]`, and reports
+`HIPBLAS_STATUS_INTERNAL_ERROR`. A later GDN prefill warmup reports
+`hipErrorNoBinaryForGpu`; its timing does not establish that it caused the
+earlier GEMM failure. Preserve the allocator warnings and both diagnostics;
+the underlying memory/driver/kernel cause is not established.
+
+A separate process on the same gfx938 device executes Torch linear and the
+installed official GEMM at K=10240/N=336 and M=1/4/16/64/1024 against a nonzero
+analytic BF16 reference. All ten comparisons and three changing-input Graph
+replays at M=1024 pass exactly. This does not reproduce the loaded model's
+memory state, establish its actual profiling M, or resolve the startup failure.
+
+HumanEval and drafted/accepted counters are **NOT_RUN**, rather than zero-score
+or MTP success. No trained output comparison with the non-MTP run is available.
+The server exits1 with tracker0, no controller cleanup signals and no owned
+survivors; framework worker SIGTERM remains. All 14 distribution RECORDs,
+source controls and the complete 146-file checkpoint double-read before/after
+seal verify unchanged. Evidence:
+`evidence/qwen4-dense-full-checkpoint-20261120-r3-mtp/audit.json` and
+`evidence/qwen4-dense-mtp-preflight-20261120/`.
+
+Keep Draft. This follow-up adds the configuration regression and documents the
+official API boundary; production loader, activation, Core and FlashAttention
+bytes remain unchanged. MTP execution/accuracy and the previous gates are open.

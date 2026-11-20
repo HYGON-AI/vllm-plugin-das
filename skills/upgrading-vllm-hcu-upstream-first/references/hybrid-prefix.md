@@ -18,6 +18,16 @@ optional capability and remaining validation gates are documented in
 `docs/qwen4_dense_checkpoint.md` in the Plugin repository. CPU constructor/loader
 contracts do not establish device, mixed-batch, MTP or model accuracy acceptance.
 
+Exercise complete `SpeculativeConfig` construction before claiming an override
+reaches MTP. At the inspected 0.33 target, JSON/dict `hf_overrides` remain
+target-only while callable overrides are composed into the reloaded draft.
+Manually transforming a copy of the already overridden target misses this
+boundary. For explicitly dense target and draft, use the official Python API
+with an importable module-level callable, preserve Core's dummy/unmatched
+config probe, and verify root/text configs, pickling and the actual draft class.
+Keep this separate from the JSON CLI path and require real drafted/accepted
+tokens before qualifying execution; see the repository's checkpoint document.
+
 For native Qwen4 loader probes, keep the miniature configuration consistent
 with the target's hybrid model and state manager. An all-attention fixture can
 be rejected as having no Mamba layers before the loader is exercised. Inspect
