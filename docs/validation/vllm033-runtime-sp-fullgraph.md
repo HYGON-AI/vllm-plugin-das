@@ -110,3 +110,22 @@ trained checkpoint/default runner, all required topology/features, HumanEval32,
 original numerical gates, performance, normal shutdown and gfx836 acceptance
 must still be completed. CPU default Inductor is not a GPU or model verdict.
 Keep #479 Draft. AI-assisted implementation/review: OpenAI Codex.
+
+## Native projection gate
+
+`test_runtime_sp_projection_hcu.py` adds 24 installed-device cases: six real
+QKV/attention-row/dense/shared MLP projection paths, BF16/FP16, with and without
+an explicit padding mask. The tests create an actual Core TP1 NCCL group and
+retain Core's loader, post-load processing and selected GEMM implementation.
+They use default Inductor with `fullgraph=True`, then capture that compiled path
+in a HIP Graph. Three replays change inputs and masks at persistent addresses;
+masked NaNs must be removed before GEMM. An independent CPU FP32 dyadic-input
+oracle followed by the output dtype cast requires exact equality.
+
+The existing device tier selects the file through its `hcu` marker and
+`VLLM033_HCU_TEST=1`; portable selection excludes its `_hcu.py` filename. No
+workflow, gate, provider, compiler backend or native source is relaxed.
+Adding the gate is not a passing result. Pending device execution must stay
+pending; the prior green CI does not qualify these added cases. TP1 does not
+exercise multi-rank exchange/gather/scatter, model activation, Worker replay
+health, a trained checkpoint or HumanEval. Those original gates remain open.
