@@ -60,3 +60,28 @@ Real checkpoint-index inspection selects 39 indexer names and preserves all
 architecture mapping for multimodal and standalone text configurations.
 Configuration probes use `tokenizer_mode="skip"`; they do not qualify actual
 multimodal processing. The device/model gates above remain open.
+
+
+## Native startup follow-up (2026-11-20)
+
+The original 18-distribution environment failed during default router warmup:
+installed CUDA CuTeDSL made an SM90-style warmup appear available on gfx938,
+then its `quack` import failed. No loader probe or generation was reached in
+that attempt. Earlier miniature fixtures also retain their pre-loader failures:
+all-attention layers are incompatible with the hybrid state manager, and the
+Transformers default output gate `None` is rejected by the target GDN.
+
+A separate environment omits the four optional CUDA CUTLASS distributions and
+their package path entry. Core, Adapter, Plugin and FlashAttention code/native
+payloads stay identical. All 14 retained owned distributions are reverified;
+this is a different dependency cohort and does not qualify the original one.
+The miniature uses one dense attention layer, one GDN layer, and the local
+trained checkpoint's `sigmoid` output gate; weights remain synthetic.
+
+The separate HIP dependency cohort completed both synthetic arms with exact saved token/logprob parity.
+Default Graph and prefix caching remain enabled. Graph capture is recorded
+separately from replay-trace qualification. Full trained-checkpoint loading,
+MTP, mixed-batch coverage, HumanEval and performance remain unqualified.
+Both synthetic arms also report nanobind leaks and framework forced cleanup at
+shutdown. Their lifecycle gates fail despite exit0 and no surviving owned process.
+Keep Draft; earlier validation failures and model gates are unchanged.
