@@ -49,3 +49,14 @@ Graph replay, mixed decode/prefill, MTP acceptance, model accuracy or performanc
 Those remain required device/end-to-end gates before this capability is Ready.
 Disabling QSA changes the model's attention semantics; it is an explicit mode,
 not a transparent accuracy-preserving optimization.
+
+The installed CPU qualification for runtime `1fba2bc1` (Core `c440c089`,
+Adapter/native `d9bb7fa5`) passes the complete portable selection: 1408 cases,
+including the 15 new CPU scenarios, plus 11 fresh public-selector processes.
+There are no failures/errors/skips; 46 HCU cases are deliberately deselected.
+All 18 owned distribution RECORDs are unchanged before/after the run.
+Real checkpoint-index inspection selects 39 indexer names and preserves all
+152049 other names. Clean-environment probes also retain the official MTP
+architecture mapping for multimodal and standalone text configurations.
+Configuration probes use `tokenizer_mode="skip"`; they do not qualify actual
+multimodal processing. The device/model gates above remain open.
