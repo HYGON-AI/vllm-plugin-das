@@ -1776,6 +1776,7 @@ def test_unified_attention_proxy_forces_single_stage_and_preserves_other_kwargs(
     ]
 
 
+
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e5m2])
 @pytest.mark.parametrize("with_output", [False, True])
@@ -2163,3 +2164,85 @@ def test_build_leaves_split_metadata_empty_when_the_switch_is_off(
         metadata.decode_query_len,
         metadata.prefill_max_query_len,
     ) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("batch", [1, 4, 64])
+def test_hcu_fa_paged_descales_are_zero_copy_scalars(
+    monkeypatch, layout, page_size, positional, batch,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    # Nonzero offset verifies that the layer's value, not storage[0], is used.
+    base = torch.tensor([-99.0, 0.25, 0.5, 0.75])
+    scales = [base[i : i + 1].expand(batch, 2) for i in range(1, 4)]
+    key = torch.zeros(2, page_size, 2, 8)
+
+    def vendor(
+        q, k, v, q_descale=None, k_descale=None, v_descale=None, *, layout="bshd",
+    ):
+        return q_descale, k_descale, v_descale
+
+    wrapped = fa_utils._with_kv_cache_layout(vendor, "probe")
+    if positional:
+        actual = wrapped(None, key, key, *scales)
+    else:
+        actual = wrapped(
+            q=None, k=key, v=key, q_descale=scales[0],
+            k_descale=scales[1], v_descale=scales[2],
+        )
+    for source, scalar in zip(scales, actual):
+        assert scalar.numel() == 1
+        assert scalar.data_ptr() == source.data_ptr()
+        assert scalar.storage_offset() == source.storage_offset()
+        assert scalar.dtype == source.dtype
+        torch.testing.assert_close(scalar, source[0, 0].view(1))
+    base[1:].add_(1.0)
+    for index, scalar in enumerate(actual, 1):
+        torch.testing.assert_close(scalar, base[index].view(1))
+
+
+
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("kind", ["per_head", "per_sequence", "dense", "empty", "none"])
+def test_hcu_fa_boundary_does_not_discard_independent_descales(
+    monkeypatch, layout, page_size, kind,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    scale = {
+        "per_head": lambda: torch.tensor([0.25, 0.75]).expand(4, 2),
+        "per_sequence": lambda: torch.arange(4.0).view(4, 1).expand(4, 2),
+        "dense": lambda: torch.ones(4, 2),
+        "empty": lambda: torch.empty(0, 2),
+        "none": lambda: None,
+    }[kind]()
+    key = torch.zeros(2, page_size, 2, 8)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        return kwargs["k_descale"]
+
+    assert fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=None, k=key, v=key, k_descale=scale,
+    ) is scale
+
+
+@pytest.mark.parametrize("entrypoint", [
+    "flash_attn_varlen_func", "hg_flash_attn_varlen_func", "varlen_fwd_unified",
+])
+def test_hcu_fa_all_paged_entrypoints_receive_scalar_broadcasts(monkeypatch, entrypoint):
+    fa_utils, calls = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    scale = torch.tensor(0.5).expand(64, 1)
+    key = torch.zeros(2, 64, 1, 8)
+    getattr(fa_utils, entrypoint)(q=None, k=key, v=key, k_descale=scale)
+    actual = calls[entrypoint][0]["k_descale"]
+    assert actual.numel() == 1
+    assert actual.data_ptr() == scale.data_ptr()
+
+
+def test_hcu_fa_nonpaged_descales_keep_original_shape(monkeypatch):
+    fa_utils, calls = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    scale = torch.tensor(0.5).expand(4, 2)
+    fa_utils.flash_attn_varlen_func(k=torch.zeros(8, 2, 8), k_descale=scale)
+    assert calls["flash_attn_varlen_func"][0]["k_descale"] is scale
