@@ -43,7 +43,7 @@ MR or copy an existing mechanism just to obtain three MRs.
 | H01 | HY4 backbone, iHC, routing and SwiGLU clamp | Reuse Core `vllm/models/hy_v4/{amd,nvidia}` | Source inspected; HCU checkpoint/accuracy pending |
 | H02 | MTP3 and inherited quantization | Reuse Core `hy_v4/nvidia/mtp.py`; preserve the checkpoint's actual MTP dtype | Source inspected; HCU loader/drafted/accepted tokens pending |
 | H03 | PCP16 metadata, indexer and cache ownership | Reuse Core `v1/attention/backends/mla/{indexer,flashmla_sparse}.py` | Requires HY4 HCU dispatch/stride/empty-chunk and distributed tests |
-| H04 | Learnable attention sink | Reuse Core `hy_v4/nvidia/flashmla_sparse.py` wrappers and validation | Vendor ABI and prefill/decode sink semantics pending; never omit sink |
+| H04 | Learnable attention sink | Reuse Core wrappers; Adapter restores DTK call ABI through the public backend registry | Component prefill/packed decode/changed-input Graph checks pass on gfx938; distributed/model accuracy pending; DCP excluded |
 | H05 | Public `fp8_e4m3` vs physical `fp8_ds_mla` | Core owns geometry; Adapter restores HCU ABI and provider eligibility | Packed cache, scales, RoPE and actual writer pending |
 | H06 | CT W4A8 routed experts, weight/scale reload | Distinct Plugin `hcu_hy4_ct_w4a8` config; reuse existing HIPC method and Core loader/runner | HY4 schema/delegation CPU checks added; actual load, native calls and layerwise reload remain pending |
 | H07 | Offline R16 EPLB, nearest dispatch and recording | Plugin mechanism, reusing `static_eplb*`; Core owns router and loader APIs | Existing runtime is owned-model/PCP-specific; HY4 backbone/MTP mapping and redundant slot sizes pending |
@@ -109,7 +109,8 @@ Adapter's source protocol; it does not certify an installed Adapter/Core/native 
 The paired Adapter adds `set_additional_config_provider(name, factory)` to its
 existing CT registration transaction. It retains the legacy DSV4.1 name and
 never overwrites official CT/FP8 entries. The Plugin supplies
-`HcuHY4CTW4A8Config` as a lazy provider, restricted to `model_type=hy_v4`, packed
+`HcuHY4CTW4A8Config` as a lazy provider, restricted to `model_type=hy_v4` or Core's
+native `hy_v4_mtp` draft type, packed
 static channel INT4 weights and dynamic symmetric token INT8 activations.
 Other models, explicit quantizer choices and different formats are not claimed.
 
@@ -124,6 +125,23 @@ Older Adapter revisions retain DSV4.1 binding, but the HY4 capability explicitly
 refuses the missing additional-provider seam. For an HY4 validation deployment,
 require `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hy4-ct-w4a8`; keep the existing
 CT native/stock policy and kill switch.
+
+Installed-stack probing found two startup gaps not covered by the initial CPU
+doubles: the HY4 capability ran before CT publication (priority 106 vs 105), and
+Core renames the draft model type to `hy_v4_mtp` while propagating the target's
+quantizer. The capability now runs at priority 104, and both exact HY4 types
+retain the same packed scheme checks. Other families/quantizers stay excluded.
+Both failures were reproduced before fixing; new tests cover actual Adapter
+dispatch ordering and draft admission. The installed Core/Adapter/Plugin CPU
+suite then passed **106 tests**. Configuration probing also passed for PCP16 and
+natural MTP3; no model weights or generated outputs were involved.
+
+Adapter's paired increment restores D576 sparse FlashMLA with Core's original
+sink/padding/metadata/PCP methods, changing only vendor-call bindings. Explicit
+`--attention-backend FLASHMLA_SPARSE` selects it. BF16 prefill and packed-FP8
+decode/changed-input Graph component tests passed on actual gfx938; see Adapter
+MR153 for the scope and key-only DTK LSE contract. This does not establish
+whole-model accuracy, offline R16 readiness or performance equivalence.
 
 Portable source checks: **93 passed, 1 deselected** across HY4 frontend, HY4 CT
 policy/delegation and discovery. The deselected existing full-provider-contract

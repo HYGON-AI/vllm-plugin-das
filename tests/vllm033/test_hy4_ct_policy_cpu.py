@@ -19,15 +19,19 @@ def checkpoint():
 
 
 @pytest.mark.parametrize('choice', [None, 'compressed-tensors', 'hcu_hy4_ct_w4a8'])
-def test_compatible_hy4_backbone_or_mtp_config_is_selected(choice):
-    hf = SimpleNamespace(model_type='hy_v4')
+@pytest.mark.parametrize('model_type', ['hy_v4', 'hy_v4_mtp'])
+def test_compatible_hy4_backbone_or_mtp_config_is_selected(choice, model_type):
+    # SpeculativeConfig.hf_config_override renames the draft to hy_v4_mtp
+    # and propagates the target's selected quantizer to ModelConfig.
+    hf = SimpleNamespace(model_type=model_type)
     config = checkpoint()
     before = deepcopy(config)
     assert accepts_checkpoint(config, choice, hf)
     assert config == before
 
 
-@pytest.mark.parametrize('model_type', ['deepseek_v41', 'hy_v3', 'hy_v4_vl', None])
+@pytest.mark.parametrize('model_type', ['deepseek_v41', 'hy_v3', 'hy_v4_vl',
+                                       'hy_v4_vl_mtp', 'hy_v3_mtp', None])
 def test_other_model_families_are_not_claimed(model_type):
     assert not accepts_checkpoint(checkpoint(), None, SimpleNamespace(model_type=model_type))
 
@@ -91,6 +95,10 @@ def test_real_hy4_config_delegates_without_claiming_other_models(monkeypatch):
         assert calls == ['health']
         assert cls().get_quant_method('layer', 'model.layers.1') == 'delegated'
         assert calls[-1] == ('layer', 'model.layers.1')
+        current.model_config.hf_config.model_type = 'hy_v4_mtp'
+        assert cls.override_quantization_method(checkpoint(), cls.get_name(),
+            current.model_config.hf_config) == cls.get_name()
+        assert cls().get_quant_method('draft', 'model.layers.80') == 'delegated'
         current.model_config.hf_config.model_type = 'deepseek_v41'
         assert cls.override_quantization_method(checkpoint(), None, current.model_config.hf_config) is None
         with pytest.raises(ValueError, match='HY4'):

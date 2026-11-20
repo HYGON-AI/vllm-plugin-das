@@ -74,3 +74,45 @@ assert callable(module.extension_spec().activate)
     result = subprocess.run([sys.executable, '-S', '-B', '-c', code],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('registration_enabled', [True, False])
+def test_hy4_capability_waits_for_ct_registration(monkeypatch, registration_enabled):
+    """Use the real dispatcher and declared priorities; isolate registry I/O."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from hcu_adapter.extensions import (
+        ExtensionContext, RequiredExtensionError, activate_extensions,
+    )
+    from hcu_vllm_das import hy4_quant_activation as hy4
+
+    ct = _adapter_module('ct_w4a8_registration')
+    calls = []
+
+    def register(context):
+        if not registration_enabled:
+            raise RuntimeError('CT registration disabled')
+        calls.append('registered')
+
+    def health():
+        if calls != ['registered']:
+            raise RuntimeError('CT W4A8 registration is not active')
+
+    monkeypatch.setattr(hy4, 'check_health', health)
+    specs = {
+        'ct': replace(ct.extension_spec(), activate=register),
+        'hy4': hy4.extension_spec(),
+    }
+    # Reverse input order: sorting, rather than discovery order, must enforce
+    # the dependency. Existing CT publication/kill tests cover its transaction.
+    points = [SimpleNamespace(name=n, load=lambda n=n: lambda: specs[n])
+              for n in ('hy4', 'ct')]
+    context = ExtensionContext('0.5.22', '0.33.0',
+        requested_capabilities=frozenset({'hy4-ct-w4a8'}))
+    if registration_enabled:
+        reports = activate_extensions(context, entry_points=points)
+        assert all(report.status.value == 'active' for report in reports)
+    else:
+        with pytest.raises(RequiredExtensionError, match='hy4-ct-w4a8'):
+            activate_extensions(context, entry_points=points)

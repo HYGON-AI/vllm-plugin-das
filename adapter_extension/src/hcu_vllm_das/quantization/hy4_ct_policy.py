@@ -7,7 +7,8 @@ NAME = 'hcu_hy4_ct_w4a8'
 
 
 def is_hy4(config):
-    return getattr(config, 'model_type', None) == 'hy_v4'
+    # Core renames the same checkpoint when building its native MTP draft.
+    return getattr(config, 'model_type', None) in ('hy_v4', 'hy_v4_mtp')
 
 
 def accepts_checkpoint(quant, user_quant, hf_config):

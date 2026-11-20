@@ -26,6 +26,8 @@ def activate(context):
 
 
 def extension_spec():
-    return ExtensionSpec(name='das-hcu-hy4-ct-w4a8', api_version=1, priority=106,
+    # Adapter dispatches larger priorities first. CT publishes at 105; this
+    # capability verifies that transaction only after it has completed.
+    return ExtensionSpec(name='das-hcu-hy4-ct-w4a8', api_version=1, priority=104,
         capabilities=frozenset({'hy4-ct-w4a8'}), activate=activate,
         check_health=check_health)
