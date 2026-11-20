@@ -138,11 +138,35 @@ Local source-bound evidence is retained under
 `installed-discovery-{main,152}.json`, `layout-unit-r3.xml`, and the
 `affected-{main,152}-{r2,extra}` logs, JUnits and source seals.
 
-## Remaining acceptance
+## Merge scope and remaining runtime validation
 
-These results do not qualify #152 as a complete refactor or establish its paired
-native/provider Graph execution, activation of all providers, gfx836, model
-accuracy/HumanEval32, serving performance or clean Worker shutdown. DeepSeek
-checkpoint/device adaptation remains last in the user's order; its existing
-discovery contract is included here. Keep this MR
-Draft until the remaining required combination checks are complete.
+Adapter #152 is now merged at `d9bb7fa5d2ed7a46e74b06f5c7c2f9ef172bd702`.
+Its old root infrastructure modules are absent, so the released Plugin needs
+this compatibility fix when used with the new Adapter. The merge scope is the
+directory/import contract, covered by both-layout portable runs, installed
+factory/identity checks and the completed CI above.
+
+A final independent build installs the Plugin `e3039e8` and merged Adapter
+`d9bb7fa5` host-only wheels into fresh noneditable prefixes. All 12 real metadata
+factories plus RMS lifecycle identity pass (13/13) in separate framework-blocked
+interpreters. Production source/wheel/installed bytes, original RECORD rows,
+installed hashes and exact module/namespace origins are verified. Evidence is in
+`/models/zb/vllm033-resume-20261114/evidence/plugin486-ready-merge-20261120/`.
+The merged Adapter differs from tested `bf730928` in three files: SGLang FP8
+padding, its repro and tier documentation; the final discovery check is new
+evidence for the merged wheel, not a relabeling of earlier full portable runs.
+
+Subsequent Qwen3-1.7B controls hold Plugin `e3039e8` fixed and compare actual
+paired native wheels for Adapter `bf730928` and old main `8490a6b6`. All 32
+messages, finish reasons and completion-token counts match; both retain the
+same four normalized HumanEval misses, 13 strict-protocol failures and forced
+EngineCore termination after the original grace period. Those failures remain
+failures. This comparison does not establish Plugin-main equivalence, qualify
+the merged Adapter's full runtime or resolve the shutdown issue.
+
+These outstanding runtime investigations do not extend this import repair into
+whole-upgrade acceptance. Activation of all providers, gfx836, full model and
+HumanEval32 acceptance, performance and clean shutdown remain separate work.
+DeepSeek checkpoint/device adaptation remains excluded from this MR. With its
+compatibility checks complete, this MR can leave Draft; historical instructions
+to keep it Draft pending the entire runtime matrix are superseded.
