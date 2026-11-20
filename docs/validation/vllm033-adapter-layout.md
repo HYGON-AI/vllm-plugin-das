@@ -17,7 +17,10 @@ and facade alias semantics. It adds no numerical algorithm or version pin.
 - Legacy Adapter: main `8490a6b6072bda681982e95b23cbcae313b1eec6`.
   All 815 Git blobs were verified against the immutable upstream tree.
 - Relocated Adapter: proposed #152
-  `1629cd664a8b105eb09b7565374e5fbcff56e396`; all 876 Git blobs verified.
+  `bf7309281952df32e2aed0241a8d504651c79c9b`; all 876 Git blobs verified
+  against canonical tree `0c0baf5e8336618b09288b916d269e8819d64731`.
+  The original affected portable results below used predecessor `1629cd66`;
+  they are not relabeled as results for the newer head.
 - Independent noneditable Plugin and Adapter host-only wheels were installed into
   task prefixes. Production source/wheel/installed payloads and original RECORD
   hashes match. Adapter keeps its independent 0.5.22 version. No new native kernel
@@ -38,7 +41,7 @@ returned specs. Imported files were bound to installed RECORDs, including exact
 declared Adapter aliases and namespace-package locations; no production source
 tree was on those discovery processes' import paths.
 
-The portable runs hid `/dev/kfd` and `/dev/dri` in a private mount namespace,
+The initial affected-file runs hid `/dev/kfd` and `/dev/dri` in a private mount namespace,
 retained the original assertions and initialized no GPU. Core ROCm import used
 only a bounded architecture-metadata double, restored before pytest; the tests'
 existing operator doubles remain existing test scope. Those results do not prove
@@ -63,11 +66,53 @@ Early discovery harness checks also rejected legitimate Adapter-owned aliases
 and namespace modules; the corrected audit uses the existing exact alias guard
 and validates namespace paths, without a general origin exemption.
 
+## Subsequent installed and CI checks
+
+The latest relocated Adapter wheel passes the same real metadata factories and
+RMS identity checks (13/13). Its changed SGLang lazy-import guard passes all seven
+original cases; the predecessor wheel fails those exact seven cases on the old
+root import. This verifies the changed import, not the entire Adapter refactor.
+
+[CI run 44671131998](https://github.com/HYGON-AI/vllm-plugin-das/actions/runs/44671131998)
+tests Plugin commit `def84abe9c429f00104a51ca67cdfca39be83adf` and finishes with
+all eight jobs successful: source 8, portable 1393, gfx936 components 255 and
+gfx938 components 14. Artifact digests, ZIP integrity, JUnit failures/errors/skips
+and checkout bindings were checked; portable case IDs exactly match the original
+1393-node roster. This run uses the approved runtime Adapter, not proposed #152.
+
+A separate real gfx936 host-startup probe with Adapter main selects the official
+`HcuPlatform`, activates the required Flash and Step5 capabilities through real
+installed metadata and passes repeated activation/health checks. All 74 loaded
+Adapter/Plugin modules resolve to that installed pair. Packages, Core and vendor
+trees are mounted read-only, JIT caches are private and copied payload/RECORD
+hashes remain unchanged. The worker exits 0 and its owned process group is empty.
+This is startup evidence without a model or native numerical acceptance claim.
+
+The initial two complete local portable attempts retain 1390 passes and three
+failures each. DeepGEMM cannot obtain a CU count when management nodes are hidden;
+two Step5 children use global purelib and import an older Plugin. Repairing the
+environment with real venv prefixes, real management queries, empty compute
+masks and a Torch-initialization guard makes the unchanged native-import node
+and full Step5 file pass 12/12 per layout. No tests or production code changed;
+the complete two-layout reruns are tracked separately from this focused result.
+
+Those complete reruns now pass **1393/1393 per layout**, using Adapter main
+`8490a6b6` and proposed #152 `bf730928`, respectively. Both match the original
+74-file/1393-node roster exactly, with zero failures/errors/skips and the same
+46 marker deselections as CI. Production/test source and copied wheel RECORDs
+remain unchanged. Each arm records 104 process-origin observations without
+global package contamination or Torch GPU initialization. The audit distinguishes
+installed modules, existing filesystem fixtures and explicitly loaded
+byte-identical source; it does not label every subprocess as installed-only.
+
 ## Reproduction
 
 Build and install the Plugin project (`adapter_extension`) and each Adapter
 `packaging/hcu-adapter` host-only wheel into separate prefixes with `--no-deps`.
-Do not use editable installs. Run `tests/vllm033/test_adapter_layout.py` and
+For the complete portable lane, use real venv prefixes whose purelib contains
+the candidate, retaining real management queries and empty compute masks. A
+`--target` install alone does not change the parent's sysconfig or a child's
+discovery paths. Do not use editable installs. Run `tests/vllm033/test_adapter_layout.py` and
 `tests/ci/test_v033_installed_module_ownership.py`, then the affected files listed
 below against each installed layout with `HCU_V033_VERIFY_INSTALLED=1`:
 
@@ -95,9 +140,9 @@ Local source-bound evidence is retained under
 
 ## Remaining acceptance
 
-This is directory/import compatibility only. It does not qualify #152 as a
-complete refactor, the full portable suite, activation of all providers, actual
-GPU Graph replay, gfx836, model accuracy/HumanEval32, serving performance or
-clean Worker shutdown. DeepSeek checkpoint/device adaptation remains last in the
-user's order; its existing discovery contract is included here. Keep this MR
+These results do not qualify #152 as a complete refactor or establish its paired
+native/provider Graph execution, activation of all providers, gfx836, model
+accuracy/HumanEval32, serving performance or clean Worker shutdown. DeepSeek
+checkpoint/device adaptation remains last in the user's order; its existing
+discovery contract is included here. Keep this MR
 Draft until the remaining required combination checks are complete.
