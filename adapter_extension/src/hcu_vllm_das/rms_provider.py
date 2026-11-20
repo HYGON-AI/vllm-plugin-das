@@ -3,7 +3,9 @@
 """Process-local, serialized admission of the optional native RMS provider."""
 from __future__ import annotations
 
-from hcu_adapter.runtime_lifecycle import ProcessLocalLifecycle
+from .adapter_api import adapter_module as _adapter_module
+
+ProcessLocalLifecycle = _adapter_module('runtime_lifecycle').ProcessLocalLifecycle
 
 from .extension import DasExtensionError
 

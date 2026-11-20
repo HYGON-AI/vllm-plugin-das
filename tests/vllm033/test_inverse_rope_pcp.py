@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts and real-Core-source replay for PCP inverse RoPE."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 import ast
 import __future__
 import os
@@ -13,7 +15,8 @@ import torch
 
 from hcu_vllm_das import inverse_rope_hcu as inverse
 from hcu_vllm_das import inverse_rope_pcp
-from hcu_adapter import hcu_config, hcu_env
+hcu_config = _adapter_module('hcu_config')
+hcu_env = _adapter_module('hcu_env')
 from hcu_adapter.kernels import pcp_fork
 from hcu_vllm_das.inverse_rope_policy import selected_mode
 

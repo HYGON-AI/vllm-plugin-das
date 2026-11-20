@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """Discovery checks only the binder; provider contracts are activation-time."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 import subprocess
 import sys
 
@@ -23,14 +25,16 @@ class Block(importlib.abc.MetaPathFinder):
             raise AssertionError('discovery imported ' + fullname)
 sys.meta_path.insert(0, Block())
 from hcu_vllm_das._seams import AdapterContractError
+from hcu_vllm_das.adapter_api import adapter_module, adapter_module_name
+qualified_owner = adapter_module_name({adapter_owner!r})
 if {missing_binder!r}:
-    module = importlib.import_module('hcu_adapter.{adapter_owner}')
+    module = adapter_module({adapter_owner!r})
     del module.set_provider_binder
 try:
     facade = importlib.import_module('hcu_vllm_das.{owner}')
 except AdapterContractError as error:
     assert {missing_binder!r}, str(error)
-    assert 'hcu_adapter.{adapter_owner}.set_provider_binder' in str(error)
+    assert qualified_owner + '.set_provider_binder' in str(error)
 else:
     assert not {missing_binder!r}, 'missing binder was accepted'
     assert facade.extension_spec().check_health is not None
@@ -45,7 +49,7 @@ def test_full_provider_contract_is_still_checked_at_activation(monkeypatch):
     from hcu_vllm_das import _seams
     # Providers can now be imported inside the framework, but missing seams
     # must still refuse with their name before any provider is bound.
-    from hcu_adapter import dsv41_channel_fp8
+    dsv41_channel_fp8 = _adapter_module('dsv41_channel_fp8')
     monkeypatch.setattr(_seams, '_bound', set())
     monkeypatch.delattr(dsv41_channel_fp8, 'set_moe_provider')
     for bind in (_seams.bind_dsv41, _seams.bind_ct_w4a8):

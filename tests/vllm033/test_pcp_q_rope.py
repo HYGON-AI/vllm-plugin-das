@@ -1,12 +1,14 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """Contracts for the optional in-place PCP query rotation."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from hcu_adapter import hcu_config
+hcu_config = _adapter_module('hcu_config')
 from hcu_adapter.kernels import pcp_fork
 from hcu_vllm_das import inverse_rope_hcu, pcp_q_rope, v41_pcp, v41_pcp_activation
 

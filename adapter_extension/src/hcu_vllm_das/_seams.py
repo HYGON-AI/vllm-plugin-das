@@ -9,6 +9,8 @@ demand and the adapter never imports or names the plugin.
 """
 from __future__ import annotations
 
+from .adapter_api import adapter_module, adapter_module_name
+
 # A mixed revision pair can be missing a whole module, not just a function: the
 # adapter module that owns a seam may not exist yet in the installed revision.
 # Importing eagerly at module scope turns that into a `ModuleNotFoundError` from
@@ -29,21 +31,17 @@ class AdapterContractError(RuntimeError):
 
 def _seam_modules(names=_SEAM_MODULES):
     """Import only the requested adapter owners, naming any that is absent."""
-    from importlib import import_module
-
-    import hcu_adapter
-
     modules, missing = {}, []
     for name in names:
         try:
-            modules[name] = import_module("hcu_adapter." + name)
+            modules[name] = adapter_module(name)
         except ModuleNotFoundError as error:
             # Only treat a missing *adapter* module as a revision mismatch; a
             # missing third-party dependency inside it is a different problem
             # and must not be reported as "upgrade the adapter".
-            if error.name not in (None, "hcu_adapter." + name):
+            if error.name not in (None, adapter_module_name(name)):
                 raise
-            missing.append("hcu_adapter." + name)
+            missing.append(adapter_module_name(name))
     if missing:
         raise AdapterContractError(
             "hcu_vllm_das plugin requires a newer hcu_adapter; missing modules: "

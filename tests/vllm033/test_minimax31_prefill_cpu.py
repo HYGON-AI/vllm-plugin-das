@@ -1,12 +1,15 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 """Configuration policy and forward-local metadata ownership; no GPU required."""
+
+from hcu_vllm_das.adapter_api import adapter_module as _adapter_module
 import json
 import os
 from types import SimpleNamespace as NS
 import pytest
 import torch
-from hcu_adapter import hcu_config, registry
+hcu_config = _adapter_module('hcu_config')
+registry = _adapter_module('registry')
 from hcu_vllm_das.parallel import minimax31_prefill as opt
 from hcu_vllm_das.parallel import minimax31_msa as msa
 

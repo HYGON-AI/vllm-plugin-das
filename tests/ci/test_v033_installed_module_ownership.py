@@ -66,6 +66,38 @@ class InstalledModuleOwnership(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'hcu_vllm_das.rms_norm'):
             self.check()
 
+    def test_exact_relocated_adapter_owners_are_accepted(self):
+        for alias, legacy in self.guard._ADAPTER_ALIASES.items():
+            target = self.guard._RELOCATED_ADAPTER_ALIASES.get(legacy)
+            if target is not None:
+                with self.subTest(alias=alias):
+                    self.add_alias(alias, target)
+                    self.check()
+
+    def test_relocated_owners_require_both_records_and_module_identity(self):
+        for alias, legacy in self.guard._ADAPTER_ALIASES.items():
+            target = self.guard._RELOCATED_ADAPTER_ALIASES.get(legacy)
+            if target is None:
+                continue
+            facade, module = self.add_alias(alias, target)
+            for owner, path in [('hcu_vllm_das', facade.resolve()),
+                                ('hcu_adapter', Path(module.__file__).resolve())]:
+                with self.subTest(alias=alias, missing=owner):
+                    self.guard._OWNERS[owner].remove(path)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, 'not owned'):
+                            self.check()
+                    finally:
+                        self.guard._OWNERS[owner].add(path)
+            with self.subTest(alias=alias, missing='identity'):
+                replacement = ModuleType(target)
+                replacement.__file__ = module.__file__
+                self.modules[alias] = replacement
+                with self.assertRaisesRegex(RuntimeError, alias):
+                    self.check()
+                self.modules[alias] = module
+            self.check()
+
     def test_undeclared_plugin_alias_to_owned_adapter_module_is_rejected(self):
         target = self.add_module('hcu_adapter.other', self.site / 'hcu_adapter/other.py', 'hcu_adapter')
         self.modules['hcu_vllm_das.unrelated'] = target
