@@ -1,5 +1,4 @@
-
-## Qwen4 optional dense-QSA checkpoint boundary (0.33)
+# Qwen4 optional dense-QSA checkpoint boundary (0.33)
 
 Inspect the actual AMD decoder before carrying `VLLM_HCU_DISABLE_QSA` wrappers.
 The 0.33 decoder already selects dense `Qwen3NextAttention` when the text config's

@@ -179,10 +179,18 @@ def _scenario(case):
     import torch
     from torch import nn
     from types import SimpleNamespace as NS
+    assert owner._MODULE not in sys.modules  # Publication is genuinely lazy.
     from vllm.models.qwen4_exp.amd import model as official
     from vllm.models.qwen4_exp.amd.mtp import Qwen4ExpMTP, Qwen4ExpMultiTokenPredictor
     from hcu_vllm_das.models import qwen4_dense as candidate
     from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
+
+    def text_config(heads=None, **kwargs):
+        if heads is not None:
+            kwargs.update(indexer_n_heads=heads, indexer_kv_heads=1,
+                          indexer_head_dim=256, indexer_budget=2048,
+                          indexer_compress_ratio=4)
+        return Qwen4ExpTextConfig(**kwargs)
 
     pairs = [(candidate.HcuQwen4ExpForCausalLM, official.Qwen4ExpForCausalLM),
              (candidate.HcuQwen4ExpForConditionalGeneration, official.Qwen4ExpForConditionalGeneration),
@@ -190,7 +198,8 @@ def _scenario(case):
     if case == "registry":
         assert owner._MODULE not in before
         for derived, base in pairs:
-            resolved, arch = ModelRegistry.resolve_model_cls([base.__name__])
+            resolved, arch = ModelRegistry.resolve_model_cls(
+                [base.__name__], NS(model_impl="vllm"))
             assert resolved is derived and arch == base.__name__
             assert derived.__init__ is base.__init__
             assert derived.forward is base.forward
@@ -210,7 +219,7 @@ def _scenario(case):
                 mp.setattr(official, name, Leaf)
             mp.setattr(official, "is_hc_sequence_parallel_enabled", lambda _: False)
             for heads in (None, 4):
-                text = Qwen4ExpTextConfig(indexer_n_heads=heads, ple_layer_ids=[])
+                text = text_config(heads, ple_layer_ids=[])
                 before_config = text.to_dict()
                 config = NS(model_config=NS(hf_text_config=text), quant_config=None,
                             cache_config=None, parallel_config=NS(use_sequence_parallel_moe=False))
@@ -227,8 +236,8 @@ def _scenario(case):
         import tempfile
         from vllm.config import ModelConfig
         with tempfile.TemporaryDirectory() as directory:
-            text = Qwen4ExpTextConfig(num_hidden_layers=2,
-                layer_types=["indexed_attention", "linear_attention"], indexer_n_heads=4)
+            text = text_config(4, num_hidden_layers=2,
+                layer_types=["indexed_attention", "linear_attention"])
             Qwen4ExpConfig(text_config=text, architectures=["Qwen4ExpForConditionalGeneration"]).save_pretrained(directory)
             configs = [ModelConfig(model=directory, tokenizer_mode="skip", dtype="bfloat16",
                 max_model_len=4096, hf_overrides=override) for override in (
@@ -238,7 +247,7 @@ def _scenario(case):
             assert all(c.hf_text_config.layer_types == text.layer_types for c in configs)
             assert configs[0].compute_hash() != configs[1].compute_hash()
     elif case == "streaming":
-        text = Qwen4ExpTextConfig(indexer_n_heads=None)
+        text = text_config()
         value = torch.ones(2, 2)
         seen = []
         def weights():
@@ -252,12 +261,12 @@ def _scenario(case):
         assert len(seen) == 2
         assert next(filtered) == ("visual.indexer.weight", value)
         stream = weights()
-        assert candidate._dense_weights(Qwen4ExpTextConfig(indexer_n_heads=4), stream) is stream
+        assert candidate._dense_weights(text_config(4), stream) is stream
     elif case == "loaders":
         def inner(cls, heads):
             model = cls.__new__(cls)
             nn.Module.__init__(model)
-            model.config = Qwen4ExpTextConfig(indexer_n_heads=heads, num_experts=0)
+            model.config = text_config(heads)
             model.is_fused_shared_expert_enabled = False
             model._qsa_layer_ids = frozenset() if heads is None else frozenset({0})
             model.hyper_connection_mixer = None
@@ -272,7 +281,7 @@ def _scenario(case):
         def root(cls, heads):
             model = cls.__new__(cls)
             nn.Module.__init__(model)
-            text = Qwen4ExpTextConfig(indexer_n_heads=heads)
+            text = text_config(heads)
             if issubclass(cls, official.Qwen4ExpForConditionalGeneration):
                 model.config = Qwen4ExpConfig(text_config=text)
                 model.language_model_only = False
