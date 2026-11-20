@@ -85,3 +85,63 @@ MTP, mixed-batch coverage, HumanEval and performance remain unqualified.
 Both synthetic arms also report nanobind leaks and framework forced cleanup at
 shutdown. Their lifecycle gates fail despite exit0 and no surviving owned process.
 Keep Draft; earlier validation failures and model gates are unchanged.
+
+## Trained-checkpoint startup follow-up (2026-11-20)
+
+The HIP dependency cohort was also exercised with the local trained
+`Qwen3.8-Flash-Next-FP8-Channelwise` checkpoint, whose architecture is Qwen4,
+on four gfx938 devices. The 20 affected installed CPU checks pass. The first
+full-checkpoint startup retained default CPU-offloaded PLE, dense attention,
+default Graph, prefix caching and chunked prefill.
+
+That startup fails in the inherited official PLE constructor at
+`torch.empty(device="cpu", pin_memory=True)`, before checkpoint weight loading
+or generation. The BF16 PLE allocation is `[80000384, 160]`,
+25,600,122,880 bytes per rank and 102,400,491,520 bytes across four ranks.
+The HIP OOM at this host allocation does not establish exhausted device memory
+or a failure of the Plugin's indexer filter. The underlying driver cause has
+not been established. HumanEval is **NOT_RUN** for this attempt.
+
+All 14 retained distribution RECORDs and the checkpoint's full before/after
+double-read seal pass. The service exits 1 with no owned survivors or controller
+cleanup signals, while the framework's worker SIGTERM diagnostic remains in the
+log. This is a failed startup, with no normal-serving lifecycle qualification.
+Evidence: `evidence/qwen4-dense-full-checkpoint-20261120-r1/`.
+
+The official `--engram-config '{"cpu_offload":false}'` selects a separate
+device-resident PLE implementation. A result from that configuration cannot
+qualify the failed default CPU-offload path. Neither configuration changes
+Core, Adapter, FlashAttention or the checkpoint bytes.
+
+The separate TP4 device-resident run completes all 131 weight shards and uses
+56.02 GiB per rank. Actual worker inspection confirms the Plugin conditional
+model class, `indexer_n_heads=None`, the checkpoint's `sigmoid` output gate,
+and one GPU-resident BF16 PLE table of the shape above on each rank. Official
+Triton FP8 MoE and default FULL/PIECEWISE Graph remain enabled. Compilation
+emits allocator OOM warnings but subsequently completes; the warnings are
+retained rather than classified as a fatal startup result.
+
+Arithmetic passes 13/13, prefix probes pass 3/3 with 3136 cache hits, and
+concurrency probes cover 1/4/8 requests. The four worker traces contain
+3162/3163/3163/3163 GPU kernel events and 53 Graph launches each. This observes
+Graph execution; it does not close the separate changed-input replay and
+mixed decode/prefill matrix.
+
+Original HumanEval0–31, temperature0/seed0/max2048/thinking-off, completes with
+**raw 0/32, normalized 32/32**, 4815 completion tokens, and no truncation.
+All 32 responses start with a Python Markdown fence; raw scoring retains its
+syntax failures, and both score variants execute in the unchanged isolated
+uid65534 evaluator. This candidate has no matched trained QSA baseline, so the
+result does not establish QSA-equivalent semantics or a numerical regression
+comparison.
+
+The server exits0 within the original 15-second grace without controller
+cleanup signals or survivors. Nevertheless, framework worker SIGTERM,
+`EngineDeadError` and nanobind leak diagnostics keep the original lifecycle
+gate **FAIL**. All 14 distribution RECORDs, source controls and 146 checkpoint
+assets (237,133,280,448 bytes, full double-read before/after) verify unchanged.
+Evidence: `evidence/qwen4-dense-full-checkpoint-20261120-r2-device/audit.json`.
+
+**Keep Draft.** Default CPU offload, original raw-format/lifecycle findings,
+MTP acceptance, the remaining replay/mixed-batch matrix and performance gates
+remain open. This documentation/skill follow-up changes no production code.

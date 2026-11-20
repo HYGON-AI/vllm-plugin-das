@@ -40,3 +40,19 @@ dependency on HIP. Installed CUDA CUTLASS can make an optional warmup
 appear available even when it cannot execute on HCU. A separate HIP-only
 dependency cohort must retain the original failure and reverify all retained
 distributions; it cannot qualify the original package combination.
+
+For a trained checkpoint that fails in PLE construction, inspect the allocation
+arguments before classifying a HIP OOM as exhausted VRAM. The official pinned
+host implementation uses `torch.empty(device="cpu", pin_memory=True)` and can
+fail before the Plugin's checkpoint filter runs. Record the table dtype and
+ETP-local shape, total resident host footprint, available host memory and worker
+cleanup. Free VRAM alone does not establish pinned-host capacity or the driver
+failure's cause. Reuse prior matching allocation diagnostics where applicable.
+
+When the target exposes `--engram-config '{"cpu_offload":false}'`, its official
+device-resident PLE is a separate supported configuration to validate. Keep
+Graph, prefix, chunked prefill and the original accuracy/exit gates; verify the
+actual worker table device and dtype. Preserve the failed default-offload run
+and mark CPU offload unqualified even if device-resident inference passes.
+Do not replace pinned tables with pageable tensors or transfer older-version
+offload environment switches without checking the installed allocation/UVA path.
