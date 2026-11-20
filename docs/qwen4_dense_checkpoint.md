@@ -217,3 +217,64 @@ seal verify unchanged. Evidence:
 Keep Draft. This follow-up adds the configuration regression and documents the
 official API boundary; production loader, activation, Core and FlashAttention
 bytes remain unchanged. MTP execution/accuracy and the previous gates are open.
+
+
+## Observed profiling follow-up (2026-11-20)
+
+A separate diagnostic run retains the same trained checkpoint, TP4, device PLE,
+MTP3, max batch1024 and default Graph/prefix/chunked configuration. Its public
+worker hook observes the installed profile and ROCm GEMM code with Python
+profiling events; it does not replace those functions or alter tensors. The
+four workers confirm the actual target/draft classes and dense overrides before
+profiling. Each records 102 successful HC calls, with first input `[1024,10240]`
+and weight `[336,10240]`, contiguous BF16 and 256-byte-aligned pointers.
+All 675 observed GEMM calls per worker return normally, with zero observer
+errors, allocator retries or allocator OOMs. Physical HCU memory peaks at
+85,365/85,401/85,577/85,127 MiB on cards0–3. These are external card readings;
+the SMI process query does not establish per-process attribution.
+
+The global Python profiler changes compilation timing substantially: backbone
+compile takes about271s. Target/draft prewarming and Graph capture finish, but
+the API misses the original900s startup deadline. The controller retains that
+failure and sends its original graceful interrupt; HumanEval, served probes and
+drafted/accepted counters are **NOT_RUN**. Server exit is -2, tracker0, with no
+controller-forced cleanup or survivors within the original15s grace; framework
+worker SIGTERM and nanobind diagnostics remain. The 14 RECORDs, control sources
+and all146 checkpoint files verify unchanged before/after.
+
+This is diagnostic evidence, not a production fix, performance result or proof
+that the earlier HIPBLAS failure is resolved. Keep the original failed run and
+its unknown root cause. Evidence:
+`evidence/qwen4-dense-full-checkpoint-20261120-r4-observed/audit.json`.
+
+
+A follow-up uses Python3.12 local `sys.monitoring` events on the same installed
+profile/GEMM code, preserving callable identity and original returns/exceptions.
+Six observer CPU checks and installed event registration/cleanup pass. The same
+trained configuration again completes target/draft weight loading, then fails
+before health. Dynamo takes7.8–8.3s and backbone compilation about64s; these
+instrumented timings are diagnostic, not performance qualification.
+
+The first HC call on each rank has actual input `[1024,10240]` and weight
+`[336,10240]`, contiguous BF16, offset0 and pointer alignment256. Rank0's call
+raises `HIPBLAS_STATUS_INTERNAL_ERROR`; the other three HC calls return normally
+before their profile scopes unwind. Each rank's preceding110 GEMMs return
+normally, with no observer error. At the HC call, allocated memory is
+61,171,682,816 bytes/rank and reserved memory is
+92,547,317,760 / 92,274,688,000 / 92,274,688,000 / 92,652,175,360 bytes
+for TP0/1/2/3. The observed allocator counters still report zero retries/OOMs,
+while the complete server log retains769 allocator allocation-failure warning
+lines. Do not equate those two measurements or discard either.
+
+External card0–3 memory peaks at94,107/94,104/94,104/94,116 MiB. Those sampled
+card totals do not establish the allocation responsible for the error, continuous
+peak usage or a unique root cause. The later GDN no-binary warning from the
+original failed run does **not** recur here.
+
+HumanEval, served probes, accepted-token metrics and runtime Graph replay are
+**NOT_RUN**. Server1/tracker0 exit within the original15s grace with no controller
+forced cleanup or survivors. All14 RECORDs, control sources and146 checkpoint
+assets pass full before/after verification. This reproduces the startup error
+with measured loaded-memory/layout evidence; it does not fix it. Keep Draft and
+retain the default CPU-offload, raw-format/lifecycle and wider model gates.
+Evidence: `evidence/qwen4-dense-full-checkpoint-20261120-r5-local-events/audit.json`.

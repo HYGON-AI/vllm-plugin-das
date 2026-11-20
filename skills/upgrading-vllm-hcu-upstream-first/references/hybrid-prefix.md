@@ -66,3 +66,16 @@ actual worker table device and dtype. Preserve the failed default-offload run
 and mark CPU offload unqualified even if device-resident inference passes.
 Do not replace pinned tables with pageable tensors or transfer older-version
 offload environment switches without checking the installed allocation/UVA path.
+
+
+When observing a loaded-model profiling failure, record actual worker/draft
+classes, runtime tensor shapes/layout and allocator counters, and sample
+physical device residency throughout the run. Keep SMI card totals separate
+from per-process attribution. A global Python profiler can change compilation
+and allocation timing substantially; a successful observed GEMM does not fix a
+prior unobserved model failure. Preserve original startup/exit deadlines and
+NOT_RUN results. If less intrusive evidence is needed, first validate local
+code-event monitoring against the installed Python/runtime: preserve existing
+tools, original returns/exceptions and callable identity, and release the
+observer on success, exception and observer failure. Keep such instrumentation
+in diagnostic worker hooks, separate from production model/attention code.
