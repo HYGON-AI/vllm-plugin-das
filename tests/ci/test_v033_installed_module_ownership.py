@@ -66,11 +66,87 @@ class InstalledModuleOwnership(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'hcu_vllm_das.rms_norm'):
             self.check()
 
+    def test_exact_relocated_adapter_owners_are_accepted(self):
+        for alias, legacy in self.guard._ADAPTER_ALIASES.items():
+            target = self.guard._RELOCATED_ADAPTER_ALIASES.get(legacy)
+            if target is not None:
+                with self.subTest(alias=alias):
+                    self.add_alias(alias, target)
+                    self.check()
+
+    def test_relocated_owners_require_both_records_and_module_identity(self):
+        for alias, legacy in self.guard._ADAPTER_ALIASES.items():
+            target = self.guard._RELOCATED_ADAPTER_ALIASES.get(legacy)
+            if target is None:
+                continue
+            facade, module = self.add_alias(alias, target)
+            for owner, path in [('hcu_vllm_das', facade.resolve()),
+                                ('hcu_adapter', Path(module.__file__).resolve())]:
+                with self.subTest(alias=alias, missing=owner):
+                    self.guard._OWNERS[owner].remove(path)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, 'not owned'):
+                            self.check()
+                    finally:
+                        self.guard._OWNERS[owner].add(path)
+            with self.subTest(alias=alias, missing='identity'):
+                replacement = ModuleType(target)
+                replacement.__file__ = module.__file__
+                self.modules[alias] = replacement
+                with self.assertRaisesRegex(RuntimeError, alias):
+                    self.check()
+                self.modules[alias] = module
+            self.check()
+
     def test_undeclared_plugin_alias_to_owned_adapter_module_is_rejected(self):
         target = self.add_module('hcu_adapter.other', self.site / 'hcu_adapter/other.py', 'hcu_adapter')
         self.modules['hcu_vllm_das.unrelated'] = target
         with self.assertRaisesRegex(RuntimeError, 'hcu_vllm_das.unrelated'):
             self.check()
+
+    def test_pcp_dspark_facade_requires_both_records_and_exact_module_identity(self):
+        alias, target = 'hcu_vllm_das.pcp_dspark', 'hcu_adapter.kernels.pcp_dspark'
+        self.assertEqual(self.guard._ADAPTER_ALIASES.get(alias), target)
+        facade, module = self.add_alias(alias, target)
+        destination = Path(module.__file__).resolve()
+        self.check()
+
+        for owner, path in [('hcu_vllm_das', facade.resolve()), ('hcu_adapter', destination)]:
+            with self.subTest(missing_record=owner):
+                self.guard._OWNERS[owner].remove(path)
+                try:
+                    expected_owner = target if owner == 'hcu_adapter' else alias
+                    with self.assertRaisesRegex(RuntimeError, expected_owner):
+                        self.check()
+                finally:
+                    self.guard._OWNERS[owner].add(path)
+
+        replacement = ModuleType(target)
+        replacement.__file__ = module.__file__
+        self.modules[alias] = replacement
+        with self.assertRaisesRegex(RuntimeError, alias):
+            self.check()
+        self.modules[alias] = module
+
+        del self.modules[target]
+        with self.assertRaisesRegex(RuntimeError, alias):
+            self.check()
+        self.modules[target] = module
+
+        other = self.add_module('hcu_adapter.other', self.site / 'hcu_adapter/other.py', 'hcu_adapter')
+        self.modules[alias] = other
+        with self.assertRaisesRegex(RuntimeError, alias):
+            self.check()
+        self.modules[alias] = module
+
+        foreign = self.site.parent / 'checkout/hcu_adapter/kernels/pcp_dspark.py'
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(destination.read_bytes())
+        module.__file__ = str(foreign)
+        with self.assertRaisesRegex(RuntimeError, 'not owned'):
+            self.check()
+        module.__file__ = str(destination)
+        self.check()
 
     def test_missing_facade_record_is_rejected(self):
         alias, target = next(iter(self.guard._ADAPTER_ALIASES.items()))

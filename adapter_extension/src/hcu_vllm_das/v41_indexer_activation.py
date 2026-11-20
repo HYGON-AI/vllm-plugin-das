@@ -2,6 +2,8 @@
 """Framework-free discovery and public OOT publication of an opt-in indexer."""
 from __future__ import annotations
 
+from .adapter_api import adapter_module as _adapter_module
+
 import os
 from threading import RLock
 
@@ -9,7 +11,9 @@ from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 
 from .dsv41_activation import _require_release
 from .environment import _flag
-from hcu_adapter.fp4_indexer import applicable as fp4_applicable, selected as fp4_selected
+fp4_policy = _adapter_module('fp4_indexer')
+fp4_applicable = _adapter_module('fp4_indexer').applicable
+fp4_selected = _adapter_module('fp4_indexer').selected
 
 _state = None
 _failure = None
@@ -44,8 +48,8 @@ def _digest_paths():
     indexing kernels; leaving it out meant a changed kernel kept the old digest.
     """
     from pathlib import Path
-    from hcu_adapter import v41_fp8_indexer
-    import hcu_adapter.v41_fp8_indexer_triton as triton
+    v41_fp8_indexer = _adapter_module('v41_fp8_indexer')
+    triton = _adapter_module('v41_fp8_indexer_triton')
     return (
         Path(__file__).with_name('fp4_indexer.py'),
         Path(__file__).with_name('fp4_indexer_lightop.py'),
@@ -99,13 +103,20 @@ def _uses_fp4_cache(cfg=None):
     if cfg is None:
         from vllm.config import get_current_vllm_config_or_none
         cfg = get_current_vllm_config_or_none()
+        # A model config may already exist while general plugins activate.
+        # Keep auto pending until the platform has checked both provider owners
+        # and resolved the effective dtype. Explicit admission always uses cfg.
+        default_requested = getattr(fp4_policy, 'default_requested', None)
+        pending = _state is None or _state.get('fp4') is None
+        if pending and default_requested is not None and default_requested(cfg):
+            return None
     return None if cfg is None else fp4_applicable(cfg)
 
 
 def _prepare_fp4():
     from . import fp4_packer
     from .fp4_indexer_lightop import load_providers
-    from hcu_adapter import hcu_env
+    hcu_env = _adapter_module('hcu_env')
     if hcu_env.resolve('HCU_VLLM_SPARSE_INDEXER_IMPL', host='vllm')[0] != 'stock':
         raise RuntimeError('C4 and V41 FP4 cannot own the same OOT key')
     fp4_packer.check_health()
@@ -116,7 +127,7 @@ def _prepare_fp4():
 
 
 def _record_fp4():
-    from hcu_adapter import registry as adapter_registry
+    adapter_registry = _adapter_module('registry')
     adapter_registry.register(
         op='vllm_fp4_indexer', impl='lightop',
         target='vllm.model_executor.layers.sparse_attn_indexer.SparseAttnIndexer',
@@ -186,7 +197,7 @@ def check_health():
             # A reloaded binding module would leave the adapter resolver table
             # and its owner pointing at the previous module object, so the
             # published state would describe code that is no longer executing.
-            from hcu_adapter import v41_fp8_indexer as _impl
+            _impl = _adapter_module('v41_fp8_indexer')
             if _impl.resolver_owner() != _state['owner']:
                 _fatal('V41 indexer binding module was replaced; restart process')
             if _state.get('fp4', False):
@@ -272,7 +283,7 @@ def activate_extension(context):
             # The public OOT key is the class name; the compilation switch is
             # the original lower-case op name. Preserve the latter for users.
             HcuV41SparseAttnIndexer.name = SparseAttnIndexer.name
-            from hcu_adapter import v41_fp8_indexer as _impl
+            _impl = _adapter_module('v41_fp8_indexer')
             _state = dict(enabled=selected, fp4=fp4, digest=digest,
                           signature=signature, registry=registry,
                           owner=_impl.resolver_owner(), **{

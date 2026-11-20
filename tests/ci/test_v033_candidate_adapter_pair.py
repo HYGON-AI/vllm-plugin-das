@@ -23,7 +23,7 @@ KERNEL_VERSION = '0.0.0+' + BUILD
 
 
 def component_wheel(distribution, *, version=None, requirement=None, extra=None,
-                    missing_native=False, metadata_name=None):
+                    missing_native=False, metadata_name=None, omit=()):
     host = distribution == 'hcu-adapter'
     version = version or (HOST_VERSION if host else KERNEL_VERSION)
     namespace = distribution.replace('-', '_')
@@ -31,6 +31,10 @@ def component_wheel(distribution, *, version=None, requirement=None, extra=None,
     payload = {namespace + '/__init__.py': b'raise AssertionError("must not import during inspection")\n'}
     if host:
         payload.update({'hcu_adapter/' + name: b'# reviewed host interface\n' for name in C.ADAPTER_SEAMS})
+        payload['hcu_adapter/kernels/pcp_dspark.py'] = b'# reviewed companion interface\n'
+        payload['hcu_adapter/hcu_config.py'] = (
+            b'BACKEND_CATALOG = {"vllm_pcp_q_rope": {"backends": '
+            b'{"hcu": {"status": "candidate"}}}}\n')
         payload['sitecustomize.py'] = b'# reviewed bootstrap\n'
     elif not missing_native:
         payload['sgl_kernel/native_ops.cpython-312-x86_64-linux-gnu.so'] = b'native fixture, not device evidence'
@@ -39,6 +43,8 @@ def component_wheel(distribution, *, version=None, requirement=None, extra=None,
         meta += 'Requires-Dist: ' + (requirement or 'sgl-kernel==' + KERNEL_VERSION) + '\n'
     payload[info + '/METADATA'] = meta.encode()
     payload.update(extra or {})
+    for name in omit:
+        payload.pop(name)
     record = info + '/RECORD'
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, 'w') as archive:
@@ -89,6 +95,23 @@ class PairFixture:
 
 
 class PairedPreparationTests(PairFixture, unittest.TestCase):
+    def test_preparation_rejects_missing_dspark_and_unregistrable_pcp_q(self):
+        cases = [
+            component_wheel('hcu-adapter', omit=('hcu_adapter/kernels/pcp_dspark.py',)),
+            component_wheel('hcu-adapter', omit=('hcu_adapter/hcu_config.py',)),
+        ]
+        for source in (
+                b'BACKEND_CATALOG = {}\n',
+                b'BACKEND_CATALOG = {"vllm_pcp_q_rope": {"backends": {"stock": {}}}}\n',
+                b'BACKEND_CATALOG = {"vllm_pcp_q_rope": {"backends": {"hcu": {"status": "planned"}}}}\n',
+                b'BACKEND_CATALOG = load_runtime_config()\n',
+                b'BACKEND_CATALOG = {}\nBACKEND_CATALOG = {}\n'):
+            cases.append(component_wheel('hcu-adapter', extra={'hcu_adapter/hcu_config.py': source}))
+        for index, host in enumerate(cases):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as directory, \
+                    self.assertRaises(C.CandidateError):
+                self.prepare(Path(directory), host=host)
+
     def test_partial_or_malformed_dispatch_cannot_select_an_unreviewed_pair(self):
         env, manifest, _ = self.inputs()
         C.adapter_manifest(manifest, C.request_inputs(env))
@@ -193,6 +216,19 @@ class InstalledPairTests(PairFixture, unittest.TestCase):
             self.assertTrue(result['prepared_payload_verified'])
             self.assertEqual(set(result['installed_records']), set(owners))
             self.assertFalse(result['model_qualified'])
+
+    def test_installed_legacy_catalog_refuses_before_native_inspection_with_valid_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site, report, owners = self.installed(Path(directory))
+            # Reproduce a self-consistent older image, not a corrupt installation.
+            (site / 'hcu_adapter/hcu_config.py').write_text('BACKEND_CATALOG = {}\n')
+            self.rewrite_record(site, 'hcu-adapter')
+            with patch.object(metadata, 'distributions', return_value=list(owners.values())), \
+                 patch.object(metadata, 'distribution', side_effect=owners.__getitem__), \
+                 patch.object(C, 'architectures') as arch, \
+                 self.assertRaisesRegex(C.CandidateError, 'vllm_pcp_q_rope/hcu'):
+                C.inspect_image()
+            arch.assert_not_called()
 
     def test_isolated_inspection_discovers_payload_without_bootstrap_or_pth(self):
         with tempfile.TemporaryDirectory() as directory:

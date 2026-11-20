@@ -17,7 +17,9 @@ adapter, exactly as it did when this module owned the implementation.
 """
 from __future__ import annotations
 
-from hcu_adapter import v41_fp8_indexer as _impl
+from .adapter_api import adapter_module as _adapter_module
+
+_impl = _adapter_module('v41_fp8_indexer')
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config as current_config
 from vllm.forward_context import get_forward_context
@@ -116,7 +118,7 @@ class HcuV41SparseAttnIndexer(_api['base']):
     """
 
     def __init__(self, *args, **kwargs):
-        from hcu_adapter.dsv41_channel_fp8 import _is_v41
+        _is_v41 = _adapter_module('dsv41_channel_fp8')._is_v41
         from .v41_indexer_activation import admit_config
 
         cfg = current_config()
@@ -126,16 +128,14 @@ class HcuV41SparseAttnIndexer(_api['base']):
         if self._hcu_fp4:
             from vllm import envs
             from .fp4_workspace import query_chunk_rows
-            from .fp4_indexer_lightop import staging_plan
+            from .fp4_indexer_lightop import decode_rows, staging_plan
             cfg = current_config()
             self.fp4_max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024**2
             self.fp4_query_chunk_rows = query_chunk_rows(
                 self.max_model_len, self.fp4_max_logits_bytes)
             self.fp4_decode_rows = min(
                 cfg.scheduler_config.max_num_batched_tokens,
-                cfg.scheduler_config.max_num_seqs * (
-                    1 + (cfg.speculative_config.num_speculative_tokens
-                         if cfg.speculative_config else 0)))
+                decode_rows(cfg))
             self.fp4_page_records = cfg.cache_config.block_size // self.compress_ratio
             self.fp4_staging_plan = staging_plan(cfg, self.max_model_len, self.compress_ratio)
 

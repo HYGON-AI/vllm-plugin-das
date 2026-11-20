@@ -29,6 +29,25 @@ The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
+## V4.1 indexer cache default
+
+With the paired Adapter's V4.1 default policy, `indexer_kv_dtype=auto` resolves
+to `mxfp4` during HCU platform configuration when the deployment meets FP4
+admission and the V4.1 Indexer and E2M1 packer extensions are active and
+healthy. Deployments outside FP4 admission retain Core's FP8 default. The
+effective dtype is set before Core model construction, cache allocation and
+configuration hashing. Explicit
+`--attention-config '{"indexer_kv_dtype":"fp8"}'` selects FP8, and explicit
+`mxfp4` retains the existing FP4 admission. Other model families retain their
+Core defaults.
+
+`HCU_VLLM_FP4_INDEXER_IMPL=stock`, disabling the Indexer or packer through the
+existing kill switches, a stock packer, or absent paired providers preserves
+the existing FP8 resolution of `auto` in a fresh process. Earlier compatible
+Adapter versions retain their original auto policy. General-plugin activation
+defers an unresolved V4.1 auto configuration until the platform resolves it.
+The existing FP4 deployment admission and provider checks still apply.
+
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
@@ -201,6 +220,38 @@ CPU contracts cover registration, dispatch, local capacity, empty ranks and
 loader preservation. They do not certify multi-rank execution, vendor kernel
 availability, model accuracy or performance. PCP8 hardware acceptance remains
 required after merging these providers.
+
+## Optional PCP inverse RoPE
+
+Select the HCU provider in an `HCU_CONFIG` file with the PCP model owner enabled.
+
+```yaml
+version: 1
+ops:
+  vllm_pcp: native
+  vllm_inverse_rope: hcu
+```
+
+Inverse RoPE defaults to `stock`. `HCU_DISABLE_OPS=vllm_inverse_rope` selects
+Core inverse RoPE in a fresh process. The choice enters the PCP compile factor.
+Source or policy drift after publication requires a process restart.
+
+The provider applies `hcu_vllm_das::deepseek_v4_inv_rope` to the unrotated
+64-dimension BF16 output tail on gfx938. PyTorch builds the packaged HIP sources
+in its user build cache before model construction. Explicit HCU selection
+requires HIP PyTorch, matching hipcc and a C++ build toolchain. A missing selected
+provider fails during preparation. Ineligible tensor shapes use Core inverse RoPE.
+Prefill retains Core's compressed KV and SWA gather and dequantization.
+
+## DeepSeek V4.1 static EPLB candidate
+
+The owned PCP model accepts `additional_config.hcu_static_eplb` for a fixed
+version-2 expert map or offline calibration. The FP4 constructor composes
+static placement with the existing PCP attention, Engram and decoder SWA
+replay gate. The scoped DeepGEMM/DeepEP HT method admits the configured
+physical expert count. Global runtime EPLB remains disabled.
+Configuration, migration ownership and validation scope are recorded in
+[static EPLB](../docs/validation/v41-static-eplb.md).
 
 ## Compatibility
 
@@ -513,6 +564,15 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
+
+## Adapter directory layouts
+
+Adapter's root-module and `infra`/`features` layouts use the same Plugin entry
+points. Plugin imports resolve the actual Adapter owner through `adapter_api`;
+module identity and shared state remain owned by Adapter. A missing `infra`
+namespace selects the legacy layout. Missing owners or dependencies in the new
+layout are errors and never retry legacy providers. See the
+[layout compatibility validation](../docs/validation/vllm033-adapter-layout.md).
 
 ## Historical v0.32 evidence
 

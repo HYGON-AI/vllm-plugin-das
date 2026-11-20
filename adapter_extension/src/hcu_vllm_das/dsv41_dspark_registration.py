@@ -8,8 +8,10 @@ registry state instead of a copy.
 """
 from __future__ import annotations
 
+from .adapter_api import adapter_module as _adapter_module
+
 import sys
 
-from hcu_adapter import dsv41_dspark_registration as _impl
+_impl = _adapter_module('dsv41_dspark_registration')
 
 sys.modules[__name__] = _impl

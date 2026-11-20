@@ -23,7 +23,8 @@ from vllm.platforms import current_platform
 from ..dsv41.profile_worker import profile_token_capacity
 
 
-def validate_config(config, moe, *, supports_swa_bounded_replay=False):
+def validate_config(config, moe, *, supports_swa_bounded_replay=False,
+                    supports_static_eplb=False):
     p = config.parallel_config
     if (p.tensor_parallel_size != 1 or p.data_parallel_size != 1
             or p.pipeline_parallel_size != 1 or moe.pcp_size != 8
@@ -36,15 +37,25 @@ def validate_config(config, moe, *, supports_swa_bounded_replay=False):
     if (getattr(getattr(config, "cache_config", None), "swa_bounded_replay", False)
             and not supports_swa_bounded_replay):
         raise ValueError("V41 PCP MegaMoE token pool does not support SWA bounded replay")
-    if p.enable_eplb or moe.num_experts != moe.num_logical_experts:
-        raise ValueError("V41 PCP MegaMoE does not support EPLB or redundant experts")
+    physical_experts = 384
+    if supports_static_eplb:
+        from .. import static_eplb_runtime
+        options = static_eplb_runtime.read_options(config)
+        if options is not None:
+            static_eplb_runtime.validate_config(config)
+            if not options.recording:
+                physical_experts += options.num_redundant_experts
+    if (p.enable_eplb or moe.num_logical_experts != 384
+            or moe.num_experts != physical_experts):
+        raise ValueError("V41 PCP expert counts require an admitted static EPLB layout, "
+                         "otherwise redundant experts and runtime EPLB are unsupported")
     if not moe.moe_parallel_config.use_deepep_ht_kernels:
         raise ValueError("V41 MegaMoE requires deepep_high_throughput metadata")
     if (moe.in_dtype != torch.bfloat16 or moe.is_sequence_parallel
             or moe.has_bias or moe.is_lora_enabled or not moe.is_act_and_mul
             or moe.activation.value != "silu"):
         raise ValueError("V41 MegaMoE requires BF16 gated SiLU without SP/bias/LoRA")
-    if (moe.num_experts, moe.experts_per_token, moe.hidden_dim, moe.intermediate_size_per_partition) != (384, 6, 5120, 2304):
+    if (moe.experts_per_token, moe.hidden_dim, moe.intermediate_size_per_partition) != (6, 5120, 2304):
         raise ValueError("V41 MegaMoE requires the vendor-compiled target shape (6, 5120, 2304)")
     if moe.swiglu_alpha is not None or moe.swiglu_beta is not None:
         raise ValueError("V41 MegaMoE does not support parameterized SwiGLU")
@@ -276,12 +287,14 @@ class MegaKernel(mk.FusedMoEKernel):
 
 class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     supports_swa_bounded_replay = False
+    supports_static_eplb = False
 
     def __init__(self, weight_quant, input_quant, moe, prefix):
         FusedMoEMethodBase.__init__(self, moe)
         config = get_current_vllm_config()
         validate_config(config, moe,
-                        supports_swa_bounded_replay=self.supports_swa_bounded_replay)
+                        supports_swa_bounded_replay=self.supports_swa_bounded_replay,
+                        supports_static_eplb=self.supports_static_eplb)
         self.buffer_capacity = profile_token_capacity(config, moe.pcp_size, moe.max_num_tokens)
         self.weight_quant, self.input_quant = weight_quant, input_quant
         self.weight_block_size = None
@@ -293,7 +306,7 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
 
     @property
     def supports_eplb(self):
-        return False
+        return self.supports_static_eplb
 
     def maybe_roundup_sizes(self, hidden_size, intermediate_size_per_partition,
                             act_dtype, moe_parallel_config):

@@ -15,13 +15,32 @@ _ADAPTER_ALIASES = {
     'hcu_vllm_das.dsv41_activation': 'hcu_adapter.dsv41_activation',
     'hcu_vllm_das.ct_w4a8_activation': 'hcu_adapter.ct_w4a8_registration',
     'hcu_vllm_das.dsv41_dspark_registration': 'hcu_adapter.dsv41_dspark_registration',
+    'hcu_vllm_das.pcp_dspark': 'hcu_adapter.kernels.pcp_dspark',
     'hcu_vllm_das.quantization.dsv41_channel_fp8': 'hcu_adapter.dsv41_channel_fp8',
     'hcu_vllm_das.quantization.dsv41_int8_linear': 'hcu_adapter.dsv41_int8_linear',
+}
+
+# The same public owners have these exact canonical locations after Adapter's
+# directory migration. No other Plugin facade or Adapter target is admitted.
+_RELOCATED_ADAPTER_ALIASES = {
+    'hcu_adapter.dsv41_activation':
+        'hcu_adapter.features.dsv41.dsv41_activation',
+    'hcu_adapter.ct_w4a8_registration':
+        'hcu_adapter.features.ct_w4a8.ct_w4a8_registration',
+    'hcu_adapter.dsv41_dspark_registration':
+        'hcu_adapter.features.dsv41.dsv41_dspark_registration',
+    'hcu_adapter.dsv41_channel_fp8':
+        'hcu_adapter.features.dsv41.dsv41_channel_fp8',
+    'hcu_adapter.dsv41_int8_linear':
+        'hcu_adapter.features.dsv41.dsv41_int8_linear',
 }
 
 
 def _owned_adapter_alias(name, module, modules):
     target = _ADAPTER_ALIASES.get(name)
+    relocated = _RELOCATED_ADAPTER_ALIASES.get(target)
+    if relocated is not None and getattr(module, '__name__', None) == relocated:
+        target = relocated
     if target is None or module is not modules.get(target):
         return False
     if getattr(module, '__name__', None) != target:
