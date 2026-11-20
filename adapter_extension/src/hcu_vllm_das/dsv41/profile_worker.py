@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..environment import dsv41_profile_worker_enabled
 
 WORKER = "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"
+W4A8_WORKER = "hcu_vllm_das.dsv41.w4a8_profile.W4A8PcpProfileWorker"
 
 
 def local_token_bound(global_tokens, max_reqs, pcp_size):
@@ -32,6 +33,11 @@ def _select(worker_cls: str, config) -> str:
 
         if uses_pcp_channel_fp8(config):
             return WORKER
+        if config.model_config.quantization == "hcu_dsv41_ct_w4a8":
+            from .w4a8_profile import uses_w4a8_pcp_profile
+
+            if uses_w4a8_pcp_profile(config):
+                return W4A8_WORKER
     return worker_cls
 
 
