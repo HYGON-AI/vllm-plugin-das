@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Owned static placement composed around native HY4 constructors/loaders.
 
-No forward, attention, checkpoint mapping or compile wrapper is copied. Child
+No forward, attention, loader loop or compile wrapper is copied. Child
 factories live in private native constructor namespaces; Core globals remain
 untouched. Dynamic Core EPLB stays off while each owned MoE gets fixed slots.
 """
@@ -14,6 +14,7 @@ from vllm.models.hy_v4.nvidia import model as nvidia, moe, mtp
 from .. import static_eplb_runtime as runtime
 from ..hy4_constructor import bind_constructor
 from ..hy4_static_plan import load_hy4_plan
+from .hy4_ct import HcuHY4CTBackbone, HcuHY4CTMTP
 
 
 def _static_factory(*args, **kwargs):
@@ -44,9 +45,18 @@ class HcuHY4StaticDecoder(native.HYV4DecoderLayer):
                                {'HYV4MoEFused': HcuHY4StaticMoE})
 
 
-class HcuHY4StaticBackbone(native.HYV4Model):
+def _logical_expert_mapping(*args, **kwargs):
+    # The static loader owns replica fan-out. Core's dynamic mapping would
+    # emit a second set of physical IDs for repeated logical checkpoint keys.
+    return native.fused_moe_make_expert_params_mapping(
+        *args, **{**kwargs, 'num_redundant_experts': 0})
+
+
+class HcuHY4StaticBackbone(HcuHY4CTBackbone):
     __init__ = bind_constructor(native.HYV4Model.__init__,
         {'HYV4DecoderLayer': HcuHY4StaticDecoder, 'HYV4MoEFused': HcuHY4StaticMoE})
+    get_expert_mapping = bind_constructor(native.HYV4Model.get_expert_mapping,
+        {'fused_moe_make_expert_params_mapping': _logical_expert_mapping})
 
 
 _OUTER_INIT = bind_constructor(native.HYV4ForCausalLM.__init__,
@@ -146,7 +156,7 @@ class HcuHY4StaticForCausalLM(_StaticProtocol, native.HYV4ForCausalLM):
         runtime.install_routing(self, self._hcu_static_cfg)
 
 
-class HcuHY4StaticMTP(_StaticProtocol, mtp.HYV4MTP):
+class HcuHY4StaticMTP(_StaticProtocol, HcuHY4CTMTP):
     def __init__(self, *, vllm_config, prefix=''):
         plan = _preflight(vllm_config, draft=True)
         _MTP_INIT(self, vllm_config=vllm_config, prefix=prefix)

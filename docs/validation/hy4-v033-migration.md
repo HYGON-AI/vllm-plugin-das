@@ -180,11 +180,13 @@ Include `attention_backend` in the speculative configuration as well:
 
 ```bash
 --attention-backend FLASHMLA_SPARSE \
---speculative-config '{"method":"mtp","num_speculative_tokens":3,"use_local_argmax_reduction":true,"attention_backend":"FLASHMLA_SPARSE"}' \
+--speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"FLASHMLA_SPARSE"}' \
 --additional-config '{"hcu_static_eplb":{"expert_map_path":"r16.json","num_redundant_experts":16,"static_dispatch_policy":"nearest"}}'
 ```
 
-This retains natural MTP acceptance. MTP precision follows Core's checkpoint
+The native HY4 MTP has no `get_top_tokens` protocol in this Core revision.
+Do not request `use_local_argmax_reduction`; TP1 has no vocabulary communication
+to remove. This retains natural MTP acceptance. MTP precision follows Core's checkpoint
 configuration rather than forcing a new draft quantization format.
 
 Validation covers map/schema failures, unchanged compile wrappers/Core globals,
@@ -223,3 +225,29 @@ The initial stage used source/CPU checks. Later authorized component validation
 built an isolated Python3.12/DTK2610 stack in a dedicated POD1_CN2 container;
 Core source remains unchanged. Both nodes became occupied by other workloads
 before full-model validation. No other containers or GPU jobs were stopped.
+
+### November 21 startup findings
+
+The ordinary PCP16 startup now passes backbone and MTP checkpoint loading after
+two corrections. Static native mappings emit only logical expert IDs because
+the owned loader already fans each logical key into its R16 physical replicas.
+The original dynamic mapping repeated those keys with physical IDs256–271.
+Physical allocation and routing still use272 experts,17 local slots.
+
+The checkpoint's indexer WK is symmetric channel INT8 with an independent
+FP32 scale. Core's BF16 WK/weights_proj fusion initially recognized FP8 only.
+The owned loader buffers INT8 WK and reuses Core's pairing, scaled dequantization
+and shard loading; BF16/FP8 retain the native path. Native loader loops, compile
+wrapper and module globals remain unchanged. Asymmetric WK is rejected.
+Explicit `hy4-ct-w4a8` publishes lazy CT model subclasses for ordinary D; static
+P includes these loaders and retains sole registry ownership.
+
+The Adapter also reuses Core's decode-row bound for persistent sparse conversion
+tables. At98304 prefill tokens/S256/MTP3, each table has1025 rows instead of98305;
+larger prefills retain Core's temporary conversion fallback. This removed the
+construction-time OOM in the ordinary startup without lowering the batch budget.
+
+The final installed affected CPU suite passed229 tests, including WK admission,
+model registry and wheel ownership. This replaces the overlapping219/18-test
+results. Real startup stopped at the unsupported gfx938 sparse
+indexer path during memory profiling. HumanEval and throughput remain pending.

@@ -14,6 +14,8 @@ def check_health():
     from .quantization.hy4_ct_w4a8 import HcuHY4CTW4A8Config
     if get_quantization_config(NAME) is not HcuHY4CTW4A8Config:
         raise ExtensionCommitError('HY4 W4A8 config registration changed owner')
+    from .hy4_ct_model_activation import check_health as check_models
+    check_models()
 
 
 def activate(context):
@@ -23,6 +25,8 @@ def activate(context):
         raise AdapterContractError(
             'HY4 W4A8 requires Adapter CT set_additional_config_provider')
     check_health()
+    from .hy4_ct_model_activation import activate as activate_models
+    activate_models(context)
 
 
 def extension_spec():

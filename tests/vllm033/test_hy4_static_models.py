@@ -19,6 +19,20 @@ def test_core_forwards_and_compile_wrapper_are_retained():
     assert owned.mtp.HYV4MultiTokenPredictorLayer.__init__.__globals__['HYV4DecoderLayer'] is owned.nvidia.HYV4DecoderLayer
 
 
+def test_native_checkpoint_mapping_emits_only_logical_ids_for_static_fanout():
+    model = owned.HcuHY4StaticBackbone.__new__(owned.HcuHY4StaticBackbone)
+    torch.nn.Module.__init__(model)
+    model.config = NS(num_experts=4)
+    model.num_redundant_experts = 2
+    mappings = model.get_expert_mapping()
+    # Native dynamic EPLB emits physical IDs4/5 for repeated checkpoint keys.
+    # The static loader already fans logical keys into all mapped slots.
+    assert {entry[2] for entry in mappings} == set(range(4))
+    assert len(mappings) == 12
+    assert model.get_expert_mapping() is mappings
+    assert model.num_redundant_experts == 2
+
+
 def test_physical_capacity_is_requested_before_expert_allocation(cfg, monkeypatch):
     from hcu_adapter.bridges import vllm as host
     monkeypatch.setattr(host, 'require_extension_healthy', lambda name: None)
