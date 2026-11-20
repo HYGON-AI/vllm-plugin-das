@@ -50,3 +50,27 @@ Installed-wheel checks, model output/HumanEval, normal exit within the
 original deadline, throughput and TTFT each require their own results bound
 to the final source. In particular, faster dequantization does not establish
 a serving latency improvement or repair a previously observed shutdown error.
+
+## Serving comparison
+
+Keep `VLLM_HCU_USE_CUSTOM_OPS` and the selected RMSNorm policy identical in
+both processes; switch only `VLLM_HCU_USE_LIGHTOP_AWQ`. Toggling the master
+along with AWQ can select different unrelated providers. Retain that older
+experiment under its original protocol, and bind the new comparison to its
+own source, installed wheel, checkpoint and request hashes. Observe the actual
+AWQ methods, RMSNorm classes, attention implementation, Graph and prefix
+configuration in each arm. A fixed switch alone does not establish identical
+execution outside AWQ.
+
+Keep read-only worker inspection modules in a private evidence directory,
+outside the installed packages. When using `PYTHONPATH` for the worker
+extension, launch the real CLI with `-P`, an explicit helper path and a neutral
+working directory; `-I` ignores that path. Hash the helper before and after
+the experiment and independently verify installed payloads and RECORDs.
+Observe cleanup registration from already loaded modules in both canonical
+and legacy Adapter namespaces. Its expected value follows the actual tested
+Adapter source; the normal-exit deadline and diagnostics remain separate gates.
+
+Before each arm, recheck the physical device identity, free memory, other
+clients' activity and listener ports. Resource occupancy delays the experiment;
+it does not qualify the new model pair or change historical failure results.
