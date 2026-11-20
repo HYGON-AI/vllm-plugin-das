@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass
 import functools
 import inspect
@@ -214,6 +215,14 @@ class _BorrowedEpView:
 
 def _load_with_scope(original, target_model, vllm_config):
     from .dspark_agrs import _owned_quant_kind, draft_config
+    from .layer_split_config import KEY, layer_split_enabled
+
+    if layer_split_enabled(vllm_config):
+        # Core validates the PCP1 draft config before constructing the draft
+        # model. Drop the target-only switch on a private loader config first.
+        vllm_config = copy(vllm_config)
+        vllm_config.additional_config = dict(vllm_config.additional_config)
+        del vllm_config.additional_config[KEY]
 
     spec = getattr(vllm_config, "speculative_config", None)
     # CT W4A8 and Channel-FP8 both own a private AG-RS draft scope so Graph
