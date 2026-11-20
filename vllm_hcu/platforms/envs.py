@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
+    VLLM_HCU_USE_AITER_SAMPLER: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
@@ -488,6 +489,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If use AITER MHC impl, please set True
     "VLLM_HCU_USE_AITER_MHC":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MHC", "True").lower() in
+                    ("true", "1")),
+
+    # Use AITER top-k/top-p sampling kernels when vLLM selects its ROCm AITER
+    # sampler (VLLM_ROCM_USE_AITER=1). Also requires VLLM_HCU_USE_CUSTOM_OPS;
+    # either switch off keeps PyTorch-native sampling.
+    "VLLM_HCU_USE_AITER_SAMPLER":
+        lambda: (os.environ.get("VLLM_HCU_USE_AITER_SAMPLER", "True").lower() in
                     ("true", "1")),
 
     # If use TileLang MHC prenorm impl, please set True
