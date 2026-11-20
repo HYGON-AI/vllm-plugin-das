@@ -285,3 +285,13 @@ retain exact eager and changed-input Graph assertions, and cover both position
 index dtypes. This component result does not qualify a model or other builds.
 PCP forward Q shares the native layout but requires separate FP32 products;
 validate both users together rather than changing the shared rounding globally.
+
+## Shared dependency ownership
+
+When a prepared prefix intentionally shares framework dependencies through
+symlinks, resolve RECORD paths from the actual distribution metadata directory.
+Relative console paths belong to that owner, not automatically to the new
+prefix. Keep physical owner seals and shared dependency checks separate; do
+not relocate or repair a shared installation to satisfy the audit. Comparing
+current shared bytes cannot retroactively establish complete dependency seals
+for historical cohorts. Record that limit alongside each pre/post owner seal.

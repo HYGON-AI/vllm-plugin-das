@@ -989,6 +989,69 @@ Repeat details: `evidence/gemma2-softcap-audit-r254/repeat-differences.json`
 (SHA256 `085245e0aed87089b9145aeb50b13a0c0aa627b7158579d8963ad9ec055aa528`). Original raw cohorts and frozen protocol:
 `evidence/gemma2-softcap-pair-r252/`. The original failures are not overwritten.
 
+## Post-layout-integration installed pair (2026-11-20)
+
+Runtime head `551ff16c720415aec3bb19e86e0f0b751e0b1641` incorporates merged
+v0.33.0 `8631a126` (Adapter layout compatibility). A separate installed prefix
+pairs it with merged Adapter152 `d9bb7fa5` and Core0.33 `c440c08`, matching the
+new merged-Plugin863 baseline rather than the older proposed Adapter97 pair.
+This does not qualify current Adaptermain or the separate Adapter140 candidate.
+
+All **252 portable contracts and539 installed native/changed-input Graph cases**
+pass, with zero failures, errors or skips. The native matrix comprises74 Flash,
+113 E4M3,32 E5M2-scale and320 window cases. The18 owned distribution RECORDs
+and source/wheel/installed payloads reconcile before and after these checks.
+FlashAttention source and binaries are unchanged and were not rebuilt.
+
+Qwen3-8B TP1 retains BF16 weights, max length4096, sequences16, batched tokens1024,
+memory utilization0.6, prefix caching and default FULL_AND_PIECEWISE Graph.
+Each arm uses the original fixed HumanEval0–31 replacement protocol: temperature0,
+seed0, thinking disabled,2048 output tokens and concurrency4. The original
+handoff requests remain unrecovered; these are not claimed as recovered data.
+Request bytes match merged863 exactly, SHA256
+`07806883c4f68f51b55811446ad0e70c1192f19c44aaa135b0e4ab1640d716ee`.
+Generated programs are scored only by the existing namespace/chroot/uid65534 scorer.
+
+| KV arm | Merged863 raw / normalized | Candidate551ff raw / normalized | Candidate tokens |
+| --- | --- | --- | --- |
+| BF16 | 20/32 /30/32 | 20/32 /30/32 | 4198 |
+| E4M3 | 20/32 /31/32 | 19/32 /30/32 | 4344 |
+| E5M2 | 21/32 /30/32 | 21/32 /30/32 | 4064 |
+
+E4M3 newly fails HumanEval/17 in both raw and normalized scoring: its generated
+parser ignores a final whole note without trailing whitespace. This is a semantic
+loss, not only formatting. E5M2 retains the normalized HumanEval/19 Enum-sorting
+failure; its equal raw total hides lost task13 and gained task2. BF16 pass sets
+match the first merged863 BF16 arm, while one message changes. Retain every
+original failure and the older independent BF16-repeat scope.
+
+Each arm passes13/13 strict probes and3/3 prefix probes (+1280 hit tokens),
+with36 actual HcuFlashAttention implementations and40 traced HIP graph launches.
+No output is truncated. All three frontends exit0 within the original15s,
+without forced cleanup, surviving owned processes or occupied ports. Nevertheless,
+all complete lifecycle gates **FAIL** because nanobind diagnostics remain;
+shutdown EngineDeadError is recorded separately where present.
+
+The cross-pair audit compares25742 hashed payload files across Core, Adapter,
+native kernel, Torch, Triton, LightOp, FlashAttention and AITER. Torch/Triton/LightOp
+are intentionally shared owners: their current byte comparison cannot supply
+missing historical dependency seals. The18 physical-owner pre/post seals remain
+independently valid. All10 tuning-cache keys match per pair, but two effective
+configurations differ in each arm. This is an attribution lead, not a numerical
+cause or an accuracy waiver. Qwen3's full-attention BF16-query path also does
+not qualify the newly added softcap/window or FP16-writer model behavior.
+
+An independent cold repeat of unchanged merged863 E4M3 completes at raw19/32
+and normalized30/32, with4348 output tokens. Its32 raw and normalized pass flags
+match the failed candidate, including task17. This establishes failure on the
+unchanged control too; it does not establish the numerical cause or erase the
+original candidate loss. The repeat also exits0 within15s without forced cleanup
+or survivors but fails complete lifecycle on nanobind/EngineDeadError diagnostics.
+**Keep Draft** pending original
+accuracy, real softcap/window, complete lifecycle and performance gates.
+Evidence: `evidence/plugin410-551ff-current-pair-20261120/`, including
+`review.json`, `model-results-audit.json` and `cross-pair-audit.json`.
+
 This embedding checkpoint provides no generation/HumanEval qualification;
 FP8 softcap, original generation accuracy, clean lifecycle and serving
 performance remain unqualified. Keep Draft pending numerical attribution and
