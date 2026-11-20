@@ -22,6 +22,7 @@ _FEATURE_FIELDS = (
     "enable_multi_layers_mtp",
     "deepep_auto",
     "hy4_fp8_megamoe",
+    "hy4_w4a8_megamoe",
     "moe_backend",
     "hcu_flash_attn_mode",
     "expert_map_path",
@@ -29,7 +30,7 @@ _FEATURE_FIELDS = (
     "eplb_disable_rearrange",
     "eplb_static_dispatch_policy",
 )
-_BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
+_BOOLEAN_FIELDS = _FEATURE_FIELDS[:7]
 HY4_MEGAMOE_BACKEND = "deep_gemm_mega_moe"
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
@@ -74,6 +75,7 @@ class HcuFeatureConfig:
     enable_multi_layers_mtp: bool = False
     deepep_auto: bool = False
     hy4_fp8_megamoe: bool = False
+    hy4_w4a8_megamoe: bool = False
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
     expert_map_path: str | None = None

@@ -590,6 +590,14 @@ def apply_to_module(module: ModuleType) -> bool:
         config = create_engine_config(self, *args, **kwargs)
         if get_hcu_config(config).hy4_fp8_megamoe:
             feature_config = feature_config.with_updates(hy4_fp8_megamoe=True, moe_backend="deep_gemm")
+        if get_hcu_config(config).hy4_w4a8_megamoe:
+            feature_config = feature_config.with_updates(hy4_w4a8_megamoe=True, moe_backend="deep_gemm")
+        if feature_config.hy4_w4a8_megamoe:
+            model = config.model_config
+            quant = getattr(model.hf_config, "quantization_config", None)
+            if (model.architectures != ["HYV4ForCausalLM"] or model.quantization != "compressed-tensors"
+                    or not isinstance(quant, Mapping) or quant.get("format") != "pack-quantized"):
+                raise ValueError("HY4 W4A8 MegaMoE requires a text HY4 compressed-tensors INT4 checkpoint")
         if feature_config.hy4_fp8_megamoe:
             model = config.model_config
             quant = getattr(model.hf_config, "quantization_config", None)
