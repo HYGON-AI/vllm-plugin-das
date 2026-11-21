@@ -76,6 +76,31 @@ A passing explicit suite on a new stack does not qualify that stack's default
 selection or skipped automatic-admission tests. Extending admission still needs
 its actual eager/Graph/model evidence; do not loosen the table to make skips pass.
 
+## Packed MoE serving performance
+
+Compare expanded INT8 and packed SlimQuant on the same checkpoint, devices,
+TP geometry, Graph policy, PLE placement and KV allocation. A small native
+reload/Graph test does not establish that the full expanded control fits.
+Record all-rank method/storage ownership before and after measurement.
+
+When using the target's official random serving benchmark, inspect its actual
+length-range contract and retain the final requests after server-tokenizer
+alignment. Match all model-input fields across arms; preserve the benchmark's
+unique per-run request IDs separately. A common seed alone is not that evidence.
+Warm each arm, retain prefix-reset/cache-hit state and every
+measured repetition, and collect kernel attribution in a separate profiler
+session. Forced output length is a synthetic performance workload, not model
+accuracy evidence. Keep the original full-model lifecycle gate independent
+of a clean component exit or successful benchmark.
+
+Keep a measured packed-provider regression as a failed performance gate even
+when native math and every request pass. Separate padding preparation from
+vendor GEMM attribution; a missing tuned configuration warning is not proof
+of the cause. Kernel timings from a separate profiler session do not replace
+serving measurements. Record executor-internal worker termination as well as
+controller signals and exit codes. Profiler teardown can affect lifecycle;
+retain that scope instead of claiming a packed-only shutdown root cause.
+
 ## Native JIT and interrupted cold builds
 
 When a vendor builds after a native-module miss, compatibility stubs must not
