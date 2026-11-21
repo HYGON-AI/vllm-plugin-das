@@ -1,0 +1,385 @@
+# v0.33 GDN/FLA leaf migration candidate
+
+The production `adapter_extension` previously provided no replacement for the
+three legacy FLA leaves or two Qwen GDN decode functions. This candidate adds
+an independent, explicitly requested `hcu-gdn-fla` extension. It keeps Core's
+complete algorithm and its constructor's final backend dispatch.
+
+## Ownership and temporary seam
+
+Core v0.33 exposes whole-op/layer OOT registration but no FLA leaf registry.
+The Plugin therefore replaces only three aliases in
+`vllm.third_party.flash_linear_attention.ops.chunk` and two aliases in
+`vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn`. Existing pipeline
+functions and model methods resolve those same module globals. Canonical leaf
+modules and unrelated consumers remain official.
+
+This is a temporary consumer alias seam. Migrate to Core's public leaf-provider
+registry when an interface covers the required metadata, state and output
+contracts. Do not copy the complete pipeline or reactivate the legacy root.
+The Plugin neither registers extra official backend names nor modifies the
+official prefill selector, convolution, recurrent state allocator, weight
+loader, RMSNormGated or fused post-convolution branches.
+
+## Selection and contracts
+
+Request capability `hcu-gdn-fla`. The effective policy is the conjunction of
+`VLLM_HCU_USE_CUSTOM_OPS` (default OFF) and the two stage selections:
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `VLLM_HCU_GDN_PREFILL_BACKEND` | `triton`, `hcu-boltops`, `hcu-aiter` | `triton` |
+| `VLLM_HCU_GDN_DECODE_BACKEND` | `triton`, `hcu-boltops`, `hcu-aiter` | `triton` |
+
+The official `gdn_prefill_backend` remains authoritative. A whole-op backend
+such as `aiter_flydsl` can bypass the prefill aliases. Optional fused decode
+branches can bypass the two decode aliases. Activation is not execution proof;
+qualification must establish the actual route for the selected model.
+
+Before publication, all five Core signatures and selected provider signatures
+are checked, including parameter defaults and synchronous execution kind.
+Missing packages or symbols follow AITER → BoltOPs → official, or
+BoltOPs → official. Missing internal dependencies and incompatible installed
+ABIs are errors. Native execution errors propagate after selection.
+
+BoltOPs chunk-O has two audited exact signatures: the original entry and an
+extended entry with trailing `full_chunks=None`. The latter's default retains
+masked varlen execution and auto-detects only fixed aligned chunks. The Plugin
+does not assert `full_chunks=True`; different defaults or additional parameters
+still refuse before publication.
+
+Adapters retain the official metadata, `[N,H,V,K]` state layout, initial/final
+state, `save_new_value` and output backing. For the BoltOPs ABI exposing an
+explicit sentinel option, indexed decode receives `null_state_index=0`.
+Prefill chunk-H receives dense gathered per-sequence state,
+where row 0 is real data and there are no state indices; it explicitly uses
+`null_state_index=-1`. Treating that dense row as the cache NULL slot discarded
+its initial state in the installed provider and failed native varlen final-state
+parity (max absolute error about 0.012). AITER decode converts indices ≤0 to -1
+without mutating the original index tensor. AITER chunk-H receives int64 offsets. AITER has no
+standalone recompute entry, so that leaf uses BoltOPs or official.
+
+The current public BoltOPs ABI omits `null_state_index` from chunk-H and the
+two decode leaves. It is admitted only when all remaining parameter names,
+defaults and synchronous execution contracts match. The adapter keeps dense
+prefill row0 valid and translates indexed decode slots <=0 to -1 without
+mutating the source indices, accepted-token metadata, sequence offsets, state
+or output backing. This preserves Core's undefined sigmoid padding output and
+packed decode's explicit zero output. It does not initialize unspecified
+outputs or retry another provider after a native failure.
+
+Lazy BoltOPs public shims additionally require the audited internal leaf owners,
+including the intermediate Triton WY facade and `recompute_w_u_fwd_gdn`.
+Their source bytes enter the official compilation factor; replacing an internal
+owner or modifying its source refuses the process. Providers continue to own
+native/JIT caches. This capability check does not pin a complete wheel version.
+
+This ABI follow-up has source-level CPU RED/GREEN coverage and a hidden-device
+preflight against the actual current provider. Its installed-wheel, unchanged
+native numerical/Graph matrices and original HE32 are still pending. Results
+from the separately frozen WY-only diagnostic do not qualify this new source.
+
+Gated AITER chunk-O remains excluded because earlier device evidence showed
+numerical divergence. AITER-incompatible inputs use the next prepared route.
+The recorded exact BF16 chunk-H `(Hk,Hv,K,V)=(4,12,128,128)` retains official
+execution on the BoltOPs route. These constraints do not qualify other shapes
+or promote a provider default.
+
+All prechecks finish before any alias changes. Partial publication, reentry,
+or late policy/owner drift permanently refuses the process. A complete
+inherited publication requires fresh child runtime activation; a fork during
+preparation/publication refuses. Adapter owns runtime admission and the serving
+health boundary, including checks before cached/Graph execution. Python alias
+guards alone do not run inside an already captured device Graph.
+
+Effective routes and adapter/provider source identity enter official normal
+and AOT compile factors. This is a source identity, not an exact native wheel
+pin or a replacement for the providers' native/JIT cache ownership.
+
+## Validation and remaining gates
+
+Source CPU qualification with real Core `98a0985` and Adapter `719e203`:
+**39 passed / 0 skipped** across `test_gdn_leaf_providers.py` and
+`test_package_boundary.py`. This includes real Core aliases and constructor
+dispatch, strict provider call contracts, NULL and speculative metadata,
+output backing/padding, native-error propagation, publication failure,
+owner drift, reentry and actual fork tests. Provider doubles do not prove
+native kernel numerics. Earlier failed test-fixture runs remain in the task
+evidence rather than being relabeled as device failures.
+
+`test_gdn_leaf_hcu.py` provides an opt-in complete official FLA dataflow test:
+legal WY intermediates, real gates, head ratios 4/8 and 4/12, nonaligned varlen,
+initial/final state, padded output backing and three changed-input Graph
+replays. Run each provider selection in a fresh process with
+`HCU_V033_TEST_GDN=1`. The explicit test-only `HCU_V033_TEST_GDN_ALLOCATOR_MIB` budget defaults
+to 512 MiB and requires that budget plus 16 MiB actually free. Cold official
+Triton autotuning itself allocates a 256 MiB benchmark cache; the earlier
+64 MiB cap failed there before native prefill execution. Shapes and official
+autotuning remain intact. Output absolute tolerance is tightened to 1e-4, with
+independent decode state checks at 5e-4. This candidate is still being qualified.
+`HCU_V033_TEST_GDN_PUBLIC_STARTUP=1` calls Core's public
+`vllm.plugins.load_general_plugins()` before requiring the real ACTIVE Adapter
+owner. Plain pytest does not execute the serving engine's startup; setting the
+host and required-capability environment variables alone is insufficient. The
+fixture does not call the extension's private activation in this mode.
+Its official reference always binds canonical Core leaves, even after public
+startup has replaced consumer aliases. Packed decode and sigmoid MTP tests
+additionally compare the official kernels and an independent CPU FP32 recurrence, with NULL state,
+accepted-token metadata and fixed-address changed-input Graph replay.
+
+On gfx938, the installed Core98/Adapter719/Plugin candidate completed all eight
+component cases through real Adapter public startup for BoltOPs (cold Triton
+autotuning, 288 MiB test budget) and AITER (verified genuine warm cache, 64 MiB).
+Each selection includes 24 changed-input Graph replays. AITER chunk-H/decode
+execution is required explicitly; recompute and gated chunk-O still execute
+BoltOPs. Each process exits 0 but retains two known provider weakref cleanup
+errors: this is numerical/Graph component evidence, not clean lifecycle closure.
+An earlier device-6 run failed with `hipErrorNoBinaryForGpu` during comparison;
+the device-7 synchronous/private-cache repeat passes, but its root cause is
+still unattributed. The old 64 MiB cold-autotune and pre-fix numerical failures
+remain recorded separately.
+
+The earlier component cleanup warnings above remain historical evidence. A
+later isolated source-provider installation (AITER `1cb6ed3`, BoltOPs
+`2d71c75`) revalidated both public-startup selections: eight native cases and
+24 changed-input Graph replays each, with zero weakref errors or tracebacks.
+That result does not establish normal model-server teardown.
+
+A separate unchanged-provider qualification adds the real checkpoint geometry
+`(key_heads, value_heads, head_dim)=(16, 32, 128)`. Each provider passes four
+additional cases: packed decode, speculative sigmoid decode and complete gated
+prefill with fixed and variable-length sequences. Each case includes three changed-input Graph
+replays (12 additional replays per provider). Both processes exit 0, all owned
+identities disappear, all six package RECORDs remain unchanged, and neither
+run reports weakref errors, nanobind leaks or tracebacks. The original eight
+cases are not rerun or recounted. These are component results; they do not
+qualify model MTP, performance or server teardown. Evidence:
+`gdn-real-model-geometry-{aiter,boltops}-20261117-r1/receipt.json`.
+
+### Frozen Qwen3.5 INT8 model comparison, 2026-11-17
+
+Three fresh gfx938 TP1 runs use the original `Qwen3.5-35B-A3B-W8A8` checkpoint,
+Core `98a09850`, Adapter `20d18cc6` and installed Plugin `3836b8b3`. Before
+target integration, all 64 production Python files at PR head `94c35088`
+match that installation byte-for-byte. Source-provider package RECORDs and
+the successful native prerequisites are checked before launch and after
+evaluation. These source-built providers are candidates, not a qualified
+published provider release.
+
+All arms retain BF16 activations/CT INT8 weights, text-only mode, context 4096,
+batch tokens 1024, max sequences 16, fixed 2 GiB KV, admission fraction 0.50,
+official FULL_AND_PIECEWISE Graphs, prefix caching and chunked prefill. The
+official GDN prefill selector is explicitly `triton` in all three arms. The
+stock arm verifies policy `(triton, triton)`, no leaf publication and all five
+actual consumer aliases bound to canonical Core functions.
+
+HumanEval/0–31 uses identical saved request bytes across the three arms:
+temperature 0, seed 0, max tokens 2048, concurrency 4 and thinking disabled.
+Request/protocol SHA256 is
+`c3f27a1e28bdb623aaa4a9bd7f38fff7ca287d73dd68d4714c7beea449ce19f3`.
+This is the current fixed protocol; the historical handoff's original request
+bytes were unavailable and are not claimed to have been recovered. Raw and
+fence-normalized completions are scored separately in the isolated scorer.
+
+| Leaf selection | Raw | Normalized | Raw failed task IDs | Completion tokens |
+| --- | --- | --- | --- | --- |
+| Official stock | 31/32 | 32/32 | 13 | 4966 |
+| AITER | 30/32 | 32/32 | 24, 31 | 4773 |
+| BoltOPs | 29/32 | 32/32 | 15, 24, 31 | 4793 |
+
+Every completion ends with `stop`, with no truncation. Both candidates recover
+task 13, but AITER loses previously passing tasks 24/31 and BoltOPs loses
+15/24/31. These raw failures are fenced Python reported as `invalid syntax`;
+stripped completions pass the tests. **The raw score decreases remain open:
+normalized 32/32 does not authorize acceptance or merge.** No prompt, scorer,
+backend or score threshold was changed to hide them.
+
+Each arm passes 13/13 changing arithmetic/concurrency probes and 3/3 prefix
+probes with 4224 additional cache-hit tokens. The effective manager page is
+1056 tokens with four cache groups; the prefix prompt has 2271 tokens. Actual
+worker snapshots report no observer errors or pending submissions. AITER
+submits chunk-H/decode through AITER and chunk-O/recompute through BoltOPs;
+BoltOPs submits all five leaves through BoltOPs. These are Python submission
+and capture observations, not counts of GPU-only Graph replays.
+
+Real GPU traces contain 1939/1939/1945 kernel events for stock/AITER/BoltOPs
+and 44 `hipGraphLaunch` calls in each arm. The AITER trace includes 30 native
+`FLA_NAMESPACE::chunk_gated_delta_rule_fwd_kernel` events. Decode Graph-node
+attribution remains incomplete where replay traces do not expose individual
+kernels; a provider-selection setting alone is not direct native attribution.
+
+All 23 checkpoint assets (37,602,505,378 bytes) match independent pre/post
+dual reads across all arms. Server, evaluator and tracker exit 0; recorded
+owned identities disappear, ports release, and post-run package/asset checks
+pass. Weakref errors are zero, but **nanobind leak reports remain in every
+arm**, including stock. Core's `mode=abort` log records its default
+`shutdown_timeout=0` request-shutdown policy; it does not indicate SIGABRT or
+a process crash. The observed exits are all 0. Process release and the normal
+request-shutdown policy do not resolve the separate nanobind leak reports.
+
+The local evidence index is `qwen35-gdn-tp1-r7-closure.json`, binding original
+requests/results, worker observations, traces, asset seals and package gates.
+No performance, MTP, gfx936 or other topology qualification is claimed. The
+later target integration includes Plugin `030c6849` changes outside GDN, and
+Adapter main has advanced beyond `20d18cc6`; frozen scores do not qualify
+those complete merged combinations. Keep Draft pending raw accuracy,
+lifecycle, remaining feature/architecture/provider delivery and current-head
+CI/review gates. DeepSeek V4.1 model testing remains user-deferred.
+
+
+## Frozen gfx938 TP1 MTP3 comparison, 2026-11-17
+
+Original `Qwen3.5-35B-A3B-W8A8`, Core `98a09850`, Adapter `20d18cc6`
+and installed Plugin `3836b8b3` with the recorded rebuilt source providers;
+this is the previous frozen installation, not the newly merged PR head.
+All three arms retain official FULL_AND_PIECEWISE Graphs, prefix caching,
+chunked prefill and three speculative positions. The actual MRV2 worker uses
+`MTPSpeculator.model` containing `Qwen3_5MoeMTP`, one trained MTP layer reused
+for three positions, exact original BF16 retained-gate weights and a shared
+target/draft embedding. This is not an INT8 retained-gate checkpoint test.
+
+Original HumanEval0–31, identical requests and thinking-off protocol:
+
+| Arm | Raw | Normalized | Completion tokens | Accepted / drafted tokens |
+| --- | --- | --- | --- | --- |
+| stock | 30/32 | 32/32 | 4813 | 3619/3795 (95.36%) |
+| AITER policy | 30/32 | 32/32 | 4840 | 3648/3804 (95.90%) |
+| BoltOPs policy | 32/32 | 32/32 | 4921 | 3705/3861 (95.96%) |
+
+Acceptance counters cover the complete served probe/evaluation cohort.
+All completions stop without token truncation. Stock raw failures are15/16;
+AITER failures15/30, so AITER loses30 and gains16 relative to stock despite
+equal totals. BoltOPs gains15/16 and loses none. Preserve these original raw
+results independently of normalization; no raw-loss tolerance was authorized.
+The earlier non-MTP comparison remains a separate result.
+
+Each arm passes13/13 arithmetic and3/3 prefix probes with4288 cache hits,
+including concurrency1/4/8. GPU profiles record1844/1844/1850 kernel events
+and50 `hipGraphLaunch` events each. The worker's actual policy and completed
+Python provider submissions are saved separately: AITER's chunk-O and
+recompute use prepared BoltOPs fallbacks. These counts do not identify every
+captured decode-node kernel or establish throughput gains.
+
+All23 checkpoint assets/37602505378bytes match six independent pre/post
+dual-read seals; parent/worker raw RECORD checks for six distributions and
+both real-checkpoint head-geometry prerequisites match. Evaluation, server,
+tracker, post-seal and post-RECORD processes exit0; owned process identities
+are gone and ports released. All three retain nanobind leak diagnostics with
+zero weakref unpack errors. Core's `mode=abort` log is its default zero-timeout
+request shutdown policy, not an OS SIGABRT.
+
+Two earlier attempts stopped before HumanEval because the read-only observer
+first used an obsolete runner field and then expected the dense MTP class.
+Both failures and their completed cleanup are retained. The corrected observer
+was checked against all three saved worker responses before this run; no
+production module, numerical assertion, Graph or prefix setting was changed.
+
+Receipt: `evidence/qwen35-gdn-mtp3-source-tp1-closure-20261117-r3.json`.
+Separate configuration-only diagnostics reproduce nanobind messages after
+`gc.freeze()` and no messages after `gc.unfreeze()` before natural process
+exit. This identifies a lifetime interaction, not a validated production fix.
+Core's API lifespan and ROCm exit-freeze paths remain separate owner findings.
+The PR stays Draft: raw per-task differences, normal teardown, gfx936,
+provider publication, performance and current-head remote CI remain open.
+
+### Independent Core exit-lifecycle candidate
+
+Core [!92](https://developer.sourcefind.cn/codes/OpenDAS/vllm/-/merge_requests/92)
+adds an exit-time unfreeze callback to the public GC helper. It is a separate
+Draft candidate, based on Core98a09850 with unchanged native libraries and the
+same frozen Adapter20d18cc6 / Plugin3836b8b3 / source-built providers.
+
+With fresh independent compile caches, the same original checkpoint, TP1,
+MTP3, default Graph/prefix/chunked configuration and HumanEval0–31 requests:
+
+| Provider | Original raw/norm | GC candidate raw/norm | Identical choices |
+| --- | --- | --- | --- |
+| stock | 30/32,32/32 | 30/32,32/32 | 32/32 |
+| AITER | 30/32,32/32 | 32/32,32/32 | 20/32 |
+| BoltOPs | 32/32,32/32 | 32/32,32/32 | 22/32 |
+
+No arm loses a prior raw or normalized pass; provider output differences remain
+recorded and do not establish a model-quality improvement from GC. All candidate
+arms finish without truncation, retain actual MTP acceptance and Graph launches,
+and pass arithmetic13/13 and prefix3/3 with hits. Model seals, package RECORDs,
+exit0, released owned identities and ports are verified. None reports nanobind,
+weakref errors or forced worker cleanup. Public-helper import controls and the
+existing real-server shutdown regression show original failures and candidate
+passes.
+
+Final cyclic collection has a cost: EngineCore-manager log intervals are about
+9/12/10 seconds versus6/8/6 in the original profiled runs, within its unchanged
+15-second grace. Whole-frontend shutdown is14.94/17.70/15.59 seconds. These are
+single-run observations; exit-latency acceptance and broader platform review
+remain open in Core!92. The candidate does not qualify this PR's latest merged
+source, gfx936, performance or remote CI, and is not yet an available merged
+dependency. The earlier frozen-stack leak reports remain valid historical
+results.
+
+Receipt: `evidence/qwen35-gdn-mtp3-gc-exit-tp1-closure-20261117-r2.json`.
+
+## Fresh installed component qualification, 2026-11-17
+
+A separate installation uses the actual Adapter main253989 Nightly artifacts
+from run44024713944, this PR's production payload969294c5, the independently
+unmerged Core!92 candidate8e216c93, and the recorded source-built AITER/BoltOPs
+wheels. All six distributions are physically installed and their raw RECORDs
+match in parent and child processes before and after execution. This is a
+component result for that frozen combination; subsequent Adapter main72484f4
+configuration changes do not inherit it.
+
+| Completed check | Result |
+| --- | --- |
+| Actual Nightly native Adapter contracts | 42 passed, zero skips |
+| Public provider selectors in separate processes | 11 passed |
+| Portable Plugin contracts, corrected fixture | 1132 passed, six HCU cases deselected |
+| AITER GDN leaf and changing-input Graph contracts | 16 passed, zero skips |
+| BoltOPs GDN leaf and changing-input Graph contracts | 16 passed, zero skips |
+
+Both provider suites include four cases with local key/value heads8/16,D128,
+derived from the real checkpoint's16/32 heads and official Core TP2 sharding.
+They cover packed decode, speculative varlen decode, and fixed/varlen prefill;
+the BoltOPs prefill cases also assert the actual chunk-H route. They do not
+exercise TP communication or a TP2 model.
+
+The original portable run's stale test fixture failed once: production freezes
+FP4 profile inputs on the layer, while the fixture patched a removed config
+reader. The corrected fixture supplies those frozen fields and still invokes
+the real execute/reservation path. Production code is unchanged. The original
+AITER cold run timed out after1800seconds; the terminal rerun used only its
+verified real compiler cache and passed in455.35seconds. Neither failed attempt
+is erased, and the cache-assisted result makes no cold-start performance claim.
+
+All terminal component workers exit0, release owned process identities, and
+retain unchanged six-package RECORDs, without observed nanobind, ignored
+exception or forced-cleanup diagnostics. Evidence:
+`evidence/current-v033-candidate-20261117-r1/component-gate.json`.
+
+No new model/HumanEval score, TP2/MTP3, gfx936, provider publication or throughput
+qualification is claimed. Earlier model scores remain bound to their original
+packages. This PR stays Draft pending its remaining model, platform, provider,
+lifecycle-dependency and current-head remote CI/review gates. DeepSeek V4.1
+model tests remain deferred.
+
+## Ordinary pytest public-startup repair, 2026-11-17
+
+Exact-source CI44091275270 for57ad719 passed source8, portable1154 and
+gfx9381, but the first gfx936 component raised16 setup errors because no
+ACTIVE GDN extension owner had been activated. Its plain pytest command did
+not call the public general-plugin loader. The previous local harness called
+that loader before pytest, so those earlier passes did not cover this entry.
+
+An ordinary-pytest local control on the physically installed merged Core98,
+published Adapter253/native pair and Plugin57 reproduced all16 setup errors.
+Calling Core's public loader in the public-startup fixture fixes that entry:
+BoltOPs16/16 and AITER16/16 then pass on gfx938, with no skips. Tests retain
+the ACTIVE-owner health guard, independent canonical Core references, all
+four head geometries, accepted-token/state contracts, numerical tolerances
+and changed-input Graph replay. No production package code changed.
+
+Both runs use verified caches from the same six-owner installation and a
+512MiB Torch allocator limit. Raw RECORDs remain unchanged, test and process
+trackers exit0, no owned process remains, and no weakref/nanobind cleanup
+errors are observed. Fourteen upstream Torch deprecation warnings remain
+per provider. These results qualify this local test-entry repair; current-head
+gfx936/full CI, provider serving/HumanEval and performance gates remain open.
