@@ -66,7 +66,10 @@ class HY4PCPMooncakeWorker(native.MooncakeConnectorWorker):
             self._replica_pending.pop(transfer_id, None)
 
 
-class HY4PCPMooncakeConnector(native.MooncakeConnector):
+class MooncakeConnector(native.MooncakeConnector):
+    # Retain Core's connector identifier so its configuration compatibility
+    # guards (including auxiliary output exclusion) still recognize Mooncake.
+    # The explicit external module path selects this class, not a registry edit.
     # Reuse the complete native constructor and every scheduler/transport
     # method, substituting just this worker class in a private namespace.
     __init__ = bind_native(native.MooncakeConnector.__init__,

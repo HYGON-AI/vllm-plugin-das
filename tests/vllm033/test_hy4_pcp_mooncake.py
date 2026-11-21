@@ -38,7 +38,7 @@ def test_worker_binding_retains_native_constructor_and_globals(monkeypatch):
         lambda self, *args: calls.append(type(self)))
     monkeypatch.setattr(native.MooncakeConnectorWorker, 'shutdown', lambda self: None)
     monkeypatch.setattr(owned, 'get_pcp_group', lambda: NS(world_size=2, rank_in_group=1))
-    connector = owned.HY4PCPMooncakeConnector(config(), base.KVConnectorRole.WORKER, NS())
+    connector = owned.MooncakeConnector(config(), base.KVConnectorRole.WORKER, NS())
     assert type(connector.connector_worker) is owned.HY4PCPMooncakeWorker
     assert calls == [owned.HY4PCPMooncakeWorker]
     assert native.MooncakeConnector.__init__ is original
@@ -110,10 +110,18 @@ def test_failed_prevalidation_has_no_native_resources_to_destroy(monkeypatch):
 
 def test_public_external_connector_resolution_leaves_registry_unchanged():
     registry = KVConnectorFactory._registry.copy()
-    cfg = NS(kv_connector='HY4PCPMooncakeConnector',
+    cfg = NS(kv_connector='MooncakeConnector',
              kv_connector_module_path='hcu_vllm_das.hy4_pcp_mooncake')
-    assert KVConnectorFactory.get_connector_class(cfg) is owned.HY4PCPMooncakeConnector
+    assert KVConnectorFactory.get_connector_class(cfg) is owned.MooncakeConnector
     assert KVConnectorFactory._registry == registry
+
+
+def test_native_connector_name_preserves_core_compatibility_guards():
+    from vllm.config.kv_transfer import KVTransferConfig
+    cfg = KVTransferConfig(kv_connector='MooncakeConnector', kv_role='kv_producer',
+        kv_buffer_device='cuda', kv_connector_module_path='hcu_vllm_das.hy4_pcp_mooncake')
+    assert cfg.has_connector('MooncakeConnector')
+    assert KVConnectorFactory.get_connector_class(cfg) is owned.MooncakeConnector
 
 
 def test_non_pcp_consumer_uses_native_worker_without_pcp_group(monkeypatch):

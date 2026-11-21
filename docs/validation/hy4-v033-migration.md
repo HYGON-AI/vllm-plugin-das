@@ -57,7 +57,7 @@ MR or copy an existing mechanism just to obtain three MRs.
 | H15 | ByteLevel prompt-tail priming | Optional Plugin frontend algorithm; retain Core construction/output/stop handling | Implemented; 63 CPU tests pass with import-isolated real target functions |
 | H16 | P synchronous scheduling and four renderer threads | Reuse Core configuration | Validate target CLI/config and preserve fair load; not a new provider |
 | H17 | Prefix caching and request workload | Reuse Core cache manager and benchmark | 146 then 2920, same seed and service lifetime; prefix-hit counters required |
-| H18 | Mooncake transport and proxy | Plugin selects one canonical PCP sender through Core's external connector seam; native scheduler/cache/RDMA and completion aggregator stay in Core | Nine installed CPU contracts pass; actual RDMA/PD accuracy and timings pending |
+| H18 | Mooncake transport and proxy | Plugin selects one canonical PCP sender through Core's external connector seam; native scheduler/cache/RDMA and completion aggregator stay in Core | Ten installed CPU contracts pass; actual RDMA/PD accuracy and timings pending |
 | H19 | PCP profiling memory budget | Adapter runner factory bounds the local dummy profile using Core's decode-row bound; real scheduling budget unchanged | PCP16 full-model startup passed; whole-model Graph and throughput pending |
 
 ## ByteLevel provider
@@ -278,11 +278,13 @@ PD accuracy and formal146/2920 performance have not passed.
 Select the optional connector on both sides through the existing Core seam:
 
 ```json
-{"kv_connector":"HY4PCPMooncakeConnector","kv_connector_module_path":"hcu_vllm_das.hy4_pcp_mooncake","kv_role":"kv_producer"}
+{"kv_connector":"MooncakeConnector","kv_connector_module_path":"hcu_vllm_das.hy4_pcp_mooncake","kv_role":"kv_producer"}
 ```
 
-Use `kv_consumer` for D. PCP>1 is restricted to an HY4 text producer with
-TP1/PP1/DP1/DCP1. PCP1 consumers retain the native worker behavior, including
+Use `kv_consumer` for D. Retain the original connector name so Core's
+configuration compatibility checks still recognize Mooncake; the external
+module path selects this provider. PCP>1 is restricted to an HY4 text producer
+with TP1/PP1/DP1/DCP1. PCP1 consumers retain the native worker behavior, including
 DP16. Core gathers complete PCP MLA/indexer cache replicas; only PCP rank0 binds
 the native sender listener/bootstrap coordinate. Other ranks report completion
 after finished block metadata arrives. Core's world-size completion aggregator
@@ -295,11 +297,12 @@ registration, transfer implementation or proxy protocol. Leaving this connector
 unselected retains native behavior. The paired Adapter supplies the generic
 `infra.native_namespace.bind_native` helper; no wheel build stamp is required.
 
-Nine installed CPU tests cover public external-module selection, unchanged Core
+Ten installed CPU tests cover public external-module selection, unchanged Core
 bindings, canonical listener ownership, PCP1 consumer delegation, native
 metadata readiness/cancellation, prevalidation cleanup and delayed completion
-aggregation. The complete affected installed CPU run passed 233 tests, including
-these nine cases; this supersedes overlapping earlier counts. No RDMA engine or
+aggregation and the original connector identifier's compatibility predicates.
+The complete affected installed CPU run passed 246 tests, including these ten
+cases; this supersedes overlapping earlier counts. No RDMA engine or
 GPU transfer is instantiated in these tests.
 Actual PCP16→DP16 transport, cancellation under load and full PD HumanEval
 remain required before this connector can be accepted.
