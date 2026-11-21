@@ -230,3 +230,14 @@ configurations are qualified. Existing synthetic boundary smokes do not prove
 long-context accuracy. New performance candidates must be isolated from the
 accuracy snapshot, unit-tested against independent references and re-evaluated
 end to end before default activation.
+
+
+### Video spatial compression alignment
+
+Real-video resizing and `do_resize=False` validation must use
+`patch_size * merge_size * spatial_patch_size`, matching the dummy builder and
+`vision_token_grid`. For example, a two-frame224×224 input with patch16,
+merge2 and spatial compression2 must resize to192×192, not remain224×224.
+The video alignment regressions exercise production preprocessing definitions
+with real CPU Torch frames and isolated resize/result-container shells; they
+do not qualify the installed processor, multimodal dispatcher or model.
