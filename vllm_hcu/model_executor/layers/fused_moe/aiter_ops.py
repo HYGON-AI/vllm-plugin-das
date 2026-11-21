@@ -324,6 +324,15 @@ def _rocm_aiter_topk_sigmoid_fake(
     pass
 
 
+@functools.cache
+def _aiter_biased_grouped_topk_parameters() -> frozenset[str]:
+    from inspect import signature
+
+    from aiter import biased_grouped_topk
+
+    return frozenset(signature(biased_grouped_topk).parameters)
+
+
 def _rocm_aiter_biased_grouped_topk_impl(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -336,16 +345,27 @@ def _rocm_aiter_biased_grouped_topk_impl(
 ) -> None:
     from aiter import biased_grouped_topk
 
-    biased_grouped_topk(
+    args = (
         gating_output,
         correction_bias,
         topk_weights,
         topk_ids,
         num_expert_group,
         topk_group,
-        need_renorm,
-        routed_scaling_factor,
     )
+    if "num_fused_shared_experts" in _aiter_biased_grouped_topk_parameters():
+        biased_grouped_topk(
+            *args,
+            num_fused_shared_experts=0,
+            need_renorm=need_renorm,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+    else:
+        biased_grouped_topk(
+            *args,
+            need_renorm=need_renorm,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
 
 def _rocm_aiter_biased_grouped_topk_fake(
