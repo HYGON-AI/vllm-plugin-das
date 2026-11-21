@@ -89,7 +89,8 @@ verify the public CLI/EngineArgs result and actual worker compilation/Graph
 configuration. Disabling benchmarks can also change fusion/kernel selection,
 not just allocation or timing. Keep diagnostic arms and their accuracy results
 separate from the original default configuration and avoid unique-cause or
-performance claims from this option alone.
+performance claims from this option alone. Do not assume disabling benchmarking
+reduces peak memory: compare actual allocator counters and physical residency.
 
 Before attributing an A/B result to that option, compare actual device total
 memory and UUID/PCI mapping as well as free memory, installed payloads and

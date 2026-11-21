@@ -309,13 +309,38 @@ Server0/tracker0 exit within15 seconds without controller-forced cleanup or
 survivors. Framework worker SIGTERM, EngineDeadError and nanobind diagnostics
 still fail the existing lifecycle gate. All14 RECORDs, control sources and the
 146-file/237,133,280,448-byte checkpoint verify unchanged before/after. Keep
-Draft: raw format, normal lifecycle, default compiler, default CPU PLE and the
-wider accuracy/performance gates are still open. Evidence:
+Draft: raw format, normal lifecycle, default CPU PLE and the wider
+accuracy/performance gates are still open. Evidence:
 `evidence/qwen4-dense-full-checkpoint-20261120-r6-no-combo-bench/audit.json`.
 
-A fresh default-compiler control is prepared for the same physical cards0–3,
-with the same observer and serving settings, independent cold caches and port.
-Other clients occupied those cards immediately after R6 teardown. The control
-must satisfy the unchanged85%+4GiB memory admission before launch; unavailable
-devices provide no default-configuration result. Adapter154 has since merged
-into a newer main; its CI and payload are separate from this frozen runtime.
+After a retained180-second resource refusal, those cards became available.
+R7 runs on the same physical cards0–3 with the same observer,14 package
+identities, exact framework UUID/architecture/total/free-memory admission and
+serving settings. It uses independent cold caches and omits any compilation
+override; all four workers confirm official defaults
+`combo_kernels=true, benchmark_combo_kernel=true`. Adapter154 has since merged
+into a newer main; its CI and payload remain separate from this frozen runtime.
+
+R7 completes all675 observed GEMMs/102 HC calls per rank normally, without
+observed HIPBLAS internal errors or allocator warnings. Arithmetic passes13/13,
+prefix3/3 with3200 hit tokens, and four traces each record59 Graph launches.
+HumanEval is raw0/32, normalized32/32,4810 tokens without truncation. MTP accepts
+3645/3735 drafted tokens (97.59%). The exact32 request bytes match R6;31 response
+contents match, and HumanEval/17 changes without any raw/normalized scoring
+gain or loss. No output equivalence or performance qualification is claimed.
+
+R7 server0/tracker0 exits within15 seconds with no controller cleanup or owned
+survivors. EngineDeadError is absent in this run, but framework worker SIGTERM
+and nanobind still fail normal lifecycle. All14 RECORDs, control sources and
+146 checkpoint assets verify unchanged before/after. First HC allocated memory
+is56.97GiB/rank in both runs, but reserved memory is119.93–120.32GiB with
+benchmarking disabled versus87.87–88.09GiB with defaults. Sampled card0–3 peaks
+are132270/132526/132966/132340MiB versus126302/126686/126686/126110MiB. Disabling
+benchmarking is not established as a memory-saving fix.
+
+Default MTP execution is now observed for this144GiB cohort. Keep official
+defaults; neither current arm reproduces or resolves the earlier96GiB failure.
+Retain Draft for raw format, lifecycle, default CPU PLE, the wider replay/model
+matrix and performance. Evidence:
+`evidence/qwen4-dense-full-checkpoint-20261121-r7-default-matched/audit.json` and
+`evidence/qwen4-dense-compiler-followup-20261120/matched-default-comparison.json`.
