@@ -57,8 +57,8 @@ MR or copy an existing mechanism just to obtain three MRs.
 | H15 | ByteLevel prompt-tail priming | Optional Plugin frontend algorithm; retain Core construction/output/stop handling | Implemented; 63 CPU tests pass with import-isolated real target functions |
 | H16 | P synchronous scheduling and four renderer threads | Reuse Core configuration | Validate target CLI/config and preserve fair load; not a new provider |
 | H17 | Prefix caching and request workload | Reuse Core cache manager and benchmark | 146 then 2920, same seed and service lifetime; prefix-hit counters required |
-| H18 | Mooncake transport and proxy | Reuse Core connector; retain cookbook proxy protocol | HCU RDMA/device-affinity and first-token timings pending |
-| H19 | PCP profiling memory budget | Core profiling first; Plugin only if rank-local accounting still differs | Do not infer available cache from a different model's provider |
+| H18 | Mooncake transport and proxy | Plugin selects one canonical PCP sender through Core's external connector seam; native scheduler/cache/RDMA and completion aggregator stay in Core | Nine installed CPU contracts pass; actual RDMA/PD accuracy and timings pending |
+| H19 | PCP profiling memory budget | Adapter runner factory bounds the local dummy profile using Core's decode-row bound; real scheduling budget unchanged | PCP16 full-model startup passed; whole-model Graph and throughput pending |
 
 ## ByteLevel provider
 
@@ -249,5 +249,57 @@ construction-time OOM in the ordinary startup without lowering the batch budget.
 
 The final installed affected CPU suite passed229 tests, including WK admission,
 model registry and wheel ownership. This replaces the overlapping219/18-test
-results. Real startup stopped at the unsupported gfx938 sparse
-indexer path during memory profiling. HumanEval and throughput remain pending.
+results. Adapter subsequently restored the gfx938 HY4 indexer ABI and bounded
+rank-local PCP profiling. Its ragged decode adaptation packs Q and the matching
+weights through Core's existing pack/unpack kernels. Full-model eager startup
+then passed with the paired Adapter commit
+`4c0b74ce1f211520390d0f1583d7193577be9331`.
+
+The frozen 164-task EvalScope1.9.1 run uses temperature0, seed0, no_think,
+max2048, stream and concurrency16. The unchanged checker runs in isolated CPU
+containers. On the current gfx938/DTK2610 platform:
+
+| Diagnostic deployment | Passed | Syntax failures |
+| --- | --- | --- |
+| P PCP16/EP16, offline R16, natural MTP3 | 151/164 | 6 |
+| Same P, MTP disabled | 158/164 | 0 |
+| D DP16/EP16, natural MTP3 | 157/164 | 0 |
+
+The P no-MTP run isolates the interaction; it is not the target deployment or
+an acceptance workaround. A mixed-batch diagnostic confirms API text exactly
+matches decoding the returned generated token IDs, including malformed code.
+The fault is already in generated IDs; its computation/lifecycle cause is still
+under investigation. The historical 0.25.1 score158/164 came from a different
+hardware/software combination and is not a matched current-platform control.
+PD accuracy and formal146/2920 performance have not passed.
+
+### PCP Mooncake ownership
+
+Select the optional connector on both sides through the existing Core seam:
+
+```json
+{"kv_connector":"HY4PCPMooncakeConnector","kv_connector_module_path":"hcu_vllm_das.hy4_pcp_mooncake","kv_role":"kv_producer"}
+```
+
+Use `kv_consumer` for D. PCP>1 is restricted to an HY4 text producer with
+TP1/PP1/DP1/DCP1. PCP1 consumers retain the native worker behavior, including
+DP16. Core gathers complete PCP MLA/indexer cache replicas; only PCP rank0 binds
+the native sender listener/bootstrap coordinate. Other ranks report completion
+after finished block metadata arrives. Core's world-size completion aggregator
+still waits for the real sender's acknowledgement before freeing KV. Aborted
+requests retain Core's immediate-free path and emit no replica-only completion.
+
+The Plugin privately binds Core's constructor to an owned worker subclass.
+It changes neither Core globals nor its connector registry, scheduler, cache
+registration, transfer implementation or proxy protocol. Leaving this connector
+unselected retains native behavior. The paired Adapter supplies the generic
+`infra.native_namespace.bind_native` helper; no wheel build stamp is required.
+
+Nine installed CPU tests cover public external-module selection, unchanged Core
+bindings, canonical listener ownership, PCP1 consumer delegation, native
+metadata readiness/cancellation, prevalidation cleanup and delayed completion
+aggregation. The complete affected installed CPU run passed 233 tests, including
+these nine cases; this supersedes overlapping earlier counts. No RDMA engine or
+GPU transfer is instantiated in these tests.
+Actual PCP16→DP16 transport, cancellation under load and full PD HumanEval
+remain required before this connector can be accepted.
