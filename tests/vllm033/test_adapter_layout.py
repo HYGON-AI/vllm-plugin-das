@@ -114,3 +114,64 @@ owner = api.adapter_module('extensions')
 assert owner is importlib.import_module('hcu_adapter.extensions')
 assert 'hcu_adapter.infra' not in sys.modules
 """)
+
+
+@pytest.mark.parametrize("layout", ("root", "canonical", "broken-canonical"))
+def test_rms_extension_discovery_uses_the_shared_lifecycle_owner(tmp_path, layout):
+    """Import the real extension, including its lifecycle construction."""
+    import packaging
+
+    write_module(tmp_path, "hcu_adapter.extensions", """
+class ExtensionContext:
+    pass
+class ExtensionSpec:
+    def __init__(self, **values):
+        self.__dict__.update(values)
+""")
+    lifecycle = """
+class ProcessLocalLifecycle:
+    def __init__(self, **values):
+        self.options = values
+"""
+    if layout == "root":
+        write_module(tmp_path, "hcu_adapter.runtime_lifecycle", lifecycle)
+    else:
+        (tmp_path / "hcu_adapter/infra").mkdir()
+        (tmp_path / "hcu_adapter/infra/__init__.py").touch()
+        write_module(tmp_path, "hcu_adapter.runtime_lifecycle",
+                     "raise AssertionError('legacy lifecycle was imported')\n")
+        if layout == "canonical":
+            write_module(tmp_path, "hcu_adapter.infra.runtime_lifecycle", lifecycle)
+    script = """
+import importlib, importlib.abc, pathlib, sys
+root, plugin_source, packaging_source, layout = sys.argv[1:]
+sys.path[:0] = [root, plugin_source, packaging_source]
+class NoFramework(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'torch','vllm','sglang','aiter','lightop','triton'}:
+            raise AssertionError('framework imported during extension discovery: ' + fullname)
+sys.meta_path.insert(0, NoFramework())
+try:
+    from hcu_vllm_das import extension
+except ModuleNotFoundError as error:
+    assert layout == 'broken-canonical', error
+    assert error.name == 'hcu_adapter.infra.runtime_lifecycle', error.name
+else:
+    assert layout != 'broken-canonical'
+    owner = importlib.import_module('hcu_adapter.' + (
+        'runtime_lifecycle' if layout == 'root' else 'infra.runtime_lifecycle'))
+    assert extension.ProcessLocalLifecycle is owner.ProcessLocalLifecycle
+    assert type(extension._activation_lifecycle) is owner.ProcessLocalLifecycle
+    spec = extension.extension_spec()
+    assert spec.activate is extension.activate_extension
+    assert spec.check_health is extension.check_health
+    if layout == 'canonical':
+        assert 'hcu_adapter.runtime_lifecycle' not in sys.modules
+assert not any(n in sys.modules for n in ('torch','vllm','sglang','aiter','lightop','triton'))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-B", "-c", script, str(tmp_path),
+         str(HELPER.parent.parent), str(Path(packaging.__file__).parent.parent), layout],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

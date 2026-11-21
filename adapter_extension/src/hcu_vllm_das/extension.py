@@ -5,9 +5,10 @@ from __future__ import annotations
 from importlib import import_module as _import_module
 import ast
 import inspect
-import threading
 
 from packaging.version import InvalidVersion, Version
+
+from .adapter_api import adapter_module as _adapter_module
 
 from hcu_adapter.extensions import (
     ExtensionContext,
@@ -18,15 +19,23 @@ from .environment import register_compile_factors, rms_norm_enabled
 from .version import TARGET_VLLM_RELEASE
 
 
+ProcessLocalLifecycle = _adapter_module("runtime_lifecycle").ProcessLocalLifecycle
+
+
 _CAPABILITIES = frozenset({"lightop-rms-norm"})
 _IMPLEMENTED_EXTENSION_API_VERSION = 1
-_activation_lock = threading.Lock()
 _activated = False
 _provider_health = None
 
 
 class DasExtensionError(RuntimeError):
     """Raised before an incompatible optimization can be activated."""
+
+
+_ACTIVATION_ACTION = "das-rms-extension"
+_activation_lifecycle = ProcessLocalLifecycle(
+    runtime_action=_ACTIVATION_ACTION, error_type=DasExtensionError,
+)
 
 
 def _require_vllm_033_release_line(raw_version: str | None) -> None:
@@ -109,6 +118,7 @@ def _validate_lightop_norm(lightop_norm: object) -> None:
 
 def get_lightop_norm():
     """Resolve and validate the vendor only when its capability is requested."""
+    _activation_lifecycle.require_runtime_healthy()
     from .rms_provider import get_provider, check_provider_health
 
     global _provider_health
@@ -117,60 +127,72 @@ def get_lightop_norm():
 
 
 def check_health() -> None:
+    _activation_lifecycle.require_runtime_healthy()
     if not _activated:
         raise DasExtensionError("DAS RMS extension has not activated")
     if _provider_health is not None:
         _provider_health()
 
 
-def activate_extension(context: ExtensionContext) -> None:
-    """Validate and register the migrated optimization capability once."""
-
+def _activate_once(context: ExtensionContext) -> None:
     global _activated
+    provider_required = (
+        rms_norm_enabled()
+        or "das_hcu" in context.requested_extensions
+        or "lightop-rms-norm" in context.requested_capabilities
+    )
+    if provider_required:
+        get_lightop_norm()
+    if _activated:
+        check_health()
+        return
+
+    try:
+        vllm_layernorm = _import_module(
+            "vllm.model_executor.layers.layernorm"
+        )
+        torch_utils = _import_module("vllm.utils.torch_utils")
+    except Exception as error:
+        raise DasExtensionError(
+            f"cannot import required vLLM 0.33 operator API: {error}"
+        ) from error
+    rms_norm = getattr(vllm_layernorm, "RMSNorm", None)
+    _require_callable(
+        rms_norm,
+        "register_oot",
+        "vllm.model_executor.layers.layernorm.RMSNorm.register_oot",
+    )
+    _require_callable(
+        torch_utils,
+        "direct_register_custom_op",
+        "vllm.utils.torch_utils.direct_register_custom_op",
+    )
+
+    try:
+        register_compile_factors(_import_module("vllm.envs"))
+        _import_module("hcu_vllm_das.rms_norm")
+    except Exception as error:
+        if isinstance(error, DasExtensionError):
+            raise
+        raise DasExtensionError(
+            f"cannot register DAS operator capabilities: {error}"
+        ) from error
+    _activated = True
+
+
+def activate_extension(context: ExtensionContext) -> None:
+    """Serialize publication per PID and reject inherited incomplete activation."""
     _require_vllm_033_release_line(context.vllm_version)
-    with _activation_lock:
-        provider_required = (
-            rms_norm_enabled()
+    _activation_lifecycle.run_once(
+        _ACTIVATION_ACTION, lambda: _activate_once(context),
+    )
+    # A later explicit requirement must still preflight the optional provider.
+    # This happens only after the publication lifecycle has admitted this PID.
+    if (rms_norm_enabled()
             or "das_hcu" in context.requested_extensions
-            or "lightop-rms-norm" in context.requested_capabilities
-        )
-        if provider_required:
-            get_lightop_norm()
-        if _activated:
-            check_health()
-            return
-
-        try:
-            vllm_layernorm = _import_module(
-                "vllm.model_executor.layers.layernorm"
-            )
-            torch_utils = _import_module("vllm.utils.torch_utils")
-        except Exception as error:
-            raise DasExtensionError(
-                f"cannot import required vLLM 0.33 operator API: {error}"
-            ) from error
-        rms_norm = getattr(vllm_layernorm, "RMSNorm", None)
-        _require_callable(
-            rms_norm,
-            "register_oot",
-            "vllm.model_executor.layers.layernorm.RMSNorm.register_oot",
-        )
-        _require_callable(
-            torch_utils,
-            "direct_register_custom_op",
-            "vllm.utils.torch_utils.direct_register_custom_op",
-        )
-
-        try:
-            register_compile_factors(_import_module("vllm.envs"))
-            _import_module("hcu_vllm_das.rms_norm")
-        except Exception as error:
-            if isinstance(error, DasExtensionError):
-                raise
-            raise DasExtensionError(
-                f"cannot register DAS operator capabilities: {error}"
-            ) from error
-        _activated = True
+            or "lightop-rms-norm" in context.requested_capabilities):
+        get_lightop_norm()
+    check_health()
 
 
 def extension_spec() -> ExtensionSpec:

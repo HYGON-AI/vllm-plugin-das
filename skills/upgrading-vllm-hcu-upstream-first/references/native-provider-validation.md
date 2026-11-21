@@ -40,7 +40,14 @@ provider. Required extensions use published entry-point names, which can differ
 from declared spec names; exercise the real host activation with that metadata.
 Reuse Adapter's process-local lifecycle for serialized first-use ABI checks
 and fork refusal; a health checker reports failures without initializing
-or repairing the provider. Verify enabled ordinary/fused execution and changing
+or repairing the provider. Guard the outer publication transaction as well:
+a separate module lock acquired before provider resolution can be inherited
+locked and prevent the child from reaching the provider's fork guard. Exercise
+the published entrypoint through real host activation while the parent is in
+both provider loading and registration, plus direct provider access during
+incomplete publication. Require prompt refusal before another import, parent
+completion and owned-child cleanup; resetting a lock alone must not permit
+publication over inherited partial state. Verify enabled ordinary/fused execution and changing
 input Graph replay after an installed-wheel binding check. Count shutdown leaks
 and the original cleanup deadline separately: fewer imports do not establish a
 clean exit or a speedup. The Plugin RMS example is documented in
@@ -171,3 +178,25 @@ retain exact eager and changed-input Graph assertions, and cover both position
 index dtypes. This component result does not qualify a model or other builds.
 PCP forward Q shares the native layout but requires separate FP32 products;
 validate both users together rather than changing the shared rounding globally.
+
+## RMS execution under default compilation
+
+Inspect the OOT implementation's compiling branch before attributing a model
+result to LightOp. The current RMS provider deliberately delegates compiled
+execution to official Core IR to preserve fusion and residual precision.
+An enabled switch, ACTIVE owner, OOT class and `forward_hip` binding therefore
+do not establish vendor execution. Bind generated code and native traces to
+the actual serving run; qualify eager LightOp separately with native and
+changed-input Graph components. Keep default compilation for model acceptance.
+Record process exit within its original grace separately from native leak or
+shutdown exceptions, even when the frontend returns zero.
+
+For separate-prefix model A/B, verify every original RECORD against its actual
+files before comparing distribution payloads. Console-script hashes may differ
+only because the interpreter shebang names a different prefix; normalize that
+exact first line for comparison only, retaining both original RECORDs and script
+bytes. Do not normalize package/native bytes or silently admit other changed
+dependencies. Compare task-level raw responses, finish reasons and pass sets:
+equal or improved totals need not mean identical outputs or a causal accuracy
+gain. A shutdown failure shared by both arms remains a failed lifecycle gate;
+record it separately from newly introduced failures and keep the original grace.

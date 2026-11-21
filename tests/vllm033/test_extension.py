@@ -37,6 +37,9 @@ def reset_activation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "1")
     from hcu_vllm_das import rms_provider
     ProcessLocalLifecycle = _adapter_module('runtime_lifecycle').ProcessLocalLifecycle
+    if hasattr(extension, "_activation_lifecycle"):
+        monkeypatch.setattr(extension, "_activation_lifecycle", ProcessLocalLifecycle(
+            runtime_action=extension._ACTIVATION_ACTION, error_type=extension.DasExtensionError))
     monkeypatch.setattr(rms_provider, "_lifecycle", ProcessLocalLifecycle(
         runtime_action=rms_provider._ACTION, error_type=extension.DasExtensionError))
     monkeypatch.setattr(rms_provider, "_provider", None)
@@ -165,6 +168,9 @@ def test_factory_does_not_claim_a_future_adapter_api() -> None:
     code = f"""
 import sys
 from types import ModuleType
+sys.path.insert(0, {os.fspath(PLUGIN_SOURCE_ROOT)!r})
+from hcu_vllm_das.adapter_api import adapter_module
+ProcessLocalLifecycle = adapter_module("runtime_lifecycle").ProcessLocalLifecycle
 
 adapter = ModuleType("hcu_adapter")
 adapter.__path__ = []
@@ -564,8 +570,10 @@ def test_uninspectable_python_rms_is_not_treated_as_a_native_binding(
     assert extension._activated is False
     assert "hcu_vllm_das.rms_norm" not in calls
 
-    # The common process lifecycle latches and wraps the original ABI error.
-    admission_error = caught.value.__cause__
+    # Publication and provider lifecycles each retain their original cause.
+    provider_error = caught.value.__cause__
+    assert isinstance(provider_error, extension.DasExtensionError)
+    admission_error = provider_error.__cause__
     assert isinstance(admission_error, extension.DasExtensionError)
     assert isinstance(admission_error.__cause__, TypeError)
     assert "__signature__" in str(admission_error.__cause__)
@@ -732,6 +740,98 @@ def test_required_rms_is_preflighted_even_when_switches_are_off(
         extension.activate_extension(required)
     assert calls.count("lightop.norm") == 1
     assert extension._activated is after_disabled_activation
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires real fork")
+@pytest.mark.parametrize("phase,route", (
+    ("provider", "public"), ("registration", "public"), ("registration", "direct")),
+    ids=("provider", "registration", "direct-registration"))
+def test_public_required_activation_refuses_forked_incomplete_publication(monkeypatch, phase, route):
+    """Exercise the outer activation boundary, not only provider resolution."""
+    from importlib.metadata import EntryPoint
+    import select
+    import signal
+    import threading
+    from hcu_adapter.extensions import RequiredExtensionError, activate_extensions
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "0")
+    project = PLUGIN_SOURCE_ROOT.parent / "pyproject.toml"
+    group = "hcu_adapter.extensions"
+    points = [EntryPoint(name=name, value=value, group=group)
+              for name, value in tomllib.loads(project.read_text())["project"]["entry-points"][group].items()
+              if value == "hcu_vllm_das.extension:extension_spec"]
+    assert len(points) == 1
+    required = ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0",
+                                requested_extensions={points[0].name})
+    parent_context = required if phase == "provider" else context()
+    entered, release = threading.Event(), threading.Event()
+    parent_errors = []
+    base = successful_importer([])
+    blocked_module = "lightop.norm" if phase == "provider" else "vllm.model_executor.layers.layernorm"
+    parent_pid = os.getpid()
+
+    def importer(name):
+        if os.getpid() != parent_pid:
+            raise AssertionError("CHILD_VENDOR_IMPORT_FORBIDDEN")
+        if name == blocked_module:
+            entered.set()
+            assert release.wait(10), "parent release expired"
+        return base(name)
+
+    monkeypatch.setattr(extension, "_import_module", importer)
+
+    def activate_parent():
+        try:
+            activate_extensions(parent_context, entry_points=points)
+        except BaseException as error:
+            parent_errors.append(error)
+
+    thread = threading.Thread(target=activate_parent)
+    thread.start()
+    child = None
+    reader, writer = os.pipe()
+    try:
+        assert entered.wait(5), "parent never reached the selected activation phase"
+        child = os.fork()
+        if child == 0:
+            os.close(reader)
+            def alarm(signum, frame):
+                os.write(writer, b"ACTIVATION_TIMEOUT")
+                os._exit(124)
+            signal.signal(signal.SIGALRM, alarm)
+            signal.alarm(3)
+            expected_error = RequiredExtensionError if route == "public" else extension.DasExtensionError
+            try:
+                if route == "public":
+                    activate_extensions(required, entry_points=points)
+                else:
+                    extension.get_lightop_norm()
+            except expected_error as error:
+                os.write(writer, str(error).encode())
+                os._exit(0)
+            except BaseException as error:
+                os.write(writer, (type(error).__name__ + ":" + str(error)).encode())
+                os._exit(2)
+            os._exit(3)
+        os.close(writer)
+        assert select.select([reader], [], [], 5)[0], "child activation did not finish"
+        message = os.read(reader, 65536)
+        _, status = os.waitpid(child, 0)
+        child = None
+        assert os.waitstatus_to_exitcode(status) == 0, message.decode()
+        assert b"CHILD_VENDOR_IMPORT_FORBIDDEN" not in message
+        assert b"inherited incomplete" in message
+    finally:
+        release.set()
+        os.close(reader)
+        if child:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        thread.join(5)
+    assert not thread.is_alive()
+    assert not parent_errors
+    assert extension._activated
 
 
 def test_health_does_not_load_vendor_after_policy_change(monkeypatch):
