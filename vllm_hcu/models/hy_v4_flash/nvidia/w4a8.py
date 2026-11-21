@@ -111,6 +111,9 @@ class HYV4FlashW4A8Config(CompressedTensorsConfig):
     def get_quant_method(self, layer, prefix):
         if not isinstance(layer, RoutedExperts):
             return super().get_quant_method(layer, prefix)
+        # Match Core CT's Linear target after expert projections are fused.
+        # The inherited helper preserves an explicit RoutedExperts scheme.
+        self._add_fused_moe_to_target_scheme_map()
         schemes = [
             self.get_scheme_dict(layer, f"{prefix}.0.{projection}")
             for projection in (

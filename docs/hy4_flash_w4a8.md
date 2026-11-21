@@ -21,6 +21,10 @@ PR. It is separate from the FP8 greedy-head and router performance experiments.
   no full-model BF16 unpack is made.
 * Dispatch keeps original token order within each expert; combine keeps the
   original router-slot order. Core owns shared experts and TP reduction.
+* CT target matching also follows Core: expand `Linear` to `RoutedExperts`
+  with the inherited helper before resolving individual projections. Explicit
+  `RoutedExperts` schemes retain precedence, and ignore rules still apply.
+  Expansion happens on the model-local config, preserving the source config.
 
 ## Admission / limitations
 
@@ -56,6 +60,13 @@ CPU contract tests:
 python -m pytest -q tests/models/hy_v4/test_flash_w4a8.py \
   tests/models/hy_v4/test_flash_runtime_contracts.py
 ```
+
+With the target Core installed, also run
+`tests/models/hy_v4/test_flash_w4a8_selector.py`. It imports the complete W4A8
+module and uses real Core CT target matching for class and regex targets,
+explicit fused-layer precedence, ignore rules and repeated selection. Only
+the legacy package namespaces and routed-layer construction are isolated;
+this CPU check does not qualify standard package startup or model execution.
 
 GPU qualification must use an otherwise idle, exclusively allocated device set.
 Record the checkpoint/config/index hashes, source snapshot, actual Core method,
