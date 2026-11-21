@@ -319,3 +319,82 @@ See `diagnostic-audit.json`, raw `model-r1/*/*.request-body` and response
 files, `controller-closeout-failure.json`, the recovery source and all-rank
 storage/launch/process receipts. No production fix or new acceptance is
 claimed; PR367 remains Draft.
+
+### Official scheduler-step observation and order controls
+
+A separate logged diagnostic keeps the same installed old/fused pair, checkpoint,
+physical devices 0/1, TP2/BF16, device PLE and default Graph/prefix policies.
+Only Core's official `--enable-logging-iteration-details` observation is added.
+Each arm receives single-before, grouped4, single-after with prefix reset before
+each phase; all completions contain eight tokens with actual token IDs and top-5
+logprobs retained. The 12 new completions are diagnostic, not a benchmark or a
+regeneration of HumanEval. Cross-arm request bytes and before/after single bodies
+match. Raw log byte windows are independently reparsed and account for every
+context token (256 per prompt).
+
+| Comparison | Matching eight-token sequences | Aggregate step signatures equal | First divergent token (zero based) |
+| --- | ---: | --- | --- |
+| Old/fused single-before | 1/1 | True | [None] |
+| Old/fused batch4 | 0/4 | False | [2, 1, 0, 2] |
+| Old/fused single-after | 1/1 | True | [None] |
+| old single-before/after | 1/1 | True | None |
+| new single-before/after | 1/1 | True | None |
+
+Per-phase signatures below are ordered
+`[context requests, context tokens, generation requests, generation tokens]`:
+
+- old single-before: `[[1, 256, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]]`.
+- old batch4: `[[3, 768, 0, 0], [1, 256, 3, 3], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 1, 1]]`.
+- old single-after: `[[1, 256, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]]`.
+- new single-before: `[[1, 256, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]]`.
+- new batch4: `[[1, 256, 0, 0], [1, 256, 1, 1], [2, 512, 2, 2], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 3, 3], [0, 0, 2, 2]]`.
+- new single-after: `[[1, 256, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]]`.
+
+Grouped4 context admissions are old `[3, 1]` and fused `[1, 1, 2]`.
+A grouped HTTP prompt list is not a fixed execution batch. Equal aggregate
+signatures also do not establish matching per-request identities, actual GPU
+padding, routes or layer values. Differences under unequal steps cannot isolate
+a preparation-kernel defect; matching steps alone cannot clear that defect.
+The original strict-output failure remains open.
+
+The immutable Core `c440c089` reproducibility documentation does not guarantee
+default online reproducibility. Its beta `VLLM_BATCH_INVARIANT=1` is separate,
+defaults off, and lists AMD gfx90a/gfx942/gfx950; this does not establish support
+for gfx938 or this checkpoint. That mode is not enabled here and the original
+validation criteria are not relaxed.
+
+| Compiled-cache comparison | Exact Python multiset | JIT-body AST multiset | Cached launch-option multiset |
+| --- | --- | --- | --- |
+| previous_old / previous_new | False | True | False |
+| logged_old / logged_new | False | True | False |
+| previous_old / logged_old | False | True | False |
+| previous_new / logged_new | False | True | False |
+
+Generated files are parsed without importing or executing them. JIT-body AST
+comparison excludes decorators while preserving function names, arguments,
+annotations and bodies. Cached launch options exclude cache-identity/timing
+metadata, whose originals remain in evidence. Caches can contain benchmark
+candidates; this comparison does not identify the native binary executed or a
+numerical root cause.
+
+The old server exits 0 with controller signals `['SIGINT']` and no owned descendants. The original process-exit deadline passes: True. Clean lifecycle: False; teardown findings `{"engine_dead": true, "internal_worker_sigterm": true, "nanobind": true, "weakref": false}`. Immediate bare bind passes: False; 73 total refusals are retained before bounded release. task-port TCP/TCP6 state snapshots contain `['06']`.
+
+The new server exits 0 with controller signals `['SIGINT']` and no owned descendants. The original process-exit deadline passes: True. Clean lifecycle: False; teardown findings `{"engine_dead": true, "internal_worker_sigterm": true, "nanobind": true, "weakref": false}`. Immediate bare bind passes: False; 83 total refusals are retained before bounded release. task-port TCP/TCP6 state snapshots contain `['06']`.
+
+TCP state `06` means TIME_WAIT, while `0A` means LISTEN. These snapshots describe
+the observed socket state and do not turn the first refusal into an immediate
+bind pass. Child exit/identity receipts are saved before the port check. Earlier
+controller exit 1 and its unsaved/unknown old child exit code remain historical
+failures; this new controller does not retroactively repair them.
+
+The checkpoint double-read seals still match 144 assets / 127135690592 bytes.
+Both arms retain pre/post installed-payload verification and all-rank storage
+checks. Production/tests/tools/CI remain the previously tested `b53f900` trees;
+no Core, Adapter, vendor or FlashAttention modification/rebuild is made.
+Original throughput -31.60%, strict-output and full-model lifecycle failures,
+submitted-head device CI and remaining quality/topology/PLE/update gates stay
+open. Model qualification remains false and PR367 stays Draft.
+
+Evidence: `evidence/pr367-step-layout-20261122/step-layout-audit.json`,
+`compiled-cache-comparison.json`, official source hashes, raw requests/responses,
+log windows, package/checkpoint attestations and process/port receipts.

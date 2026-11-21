@@ -129,10 +129,30 @@ save the actual HTTP bytes and token IDs/top logprobs, and distinguish single
 from explicitly grouped requests. Label short diagnostic requests separately
 from the original performance or accuracy cohort and preserve its failed gate.
 
+Equal HTTP bytes, temperature zero and a fixed seed do not establish equal
+execution batches. Use Core's `--enable-logging-iteration-details` where
+available; preserve raw log windows and context/generation request and token
+counts for single/grouped/single order controls. These are aggregate scheduler
+counts, not per-request layer inputs or actual padded GPU geometry. If counts
+differ, control enqueue-before-step through a supported execution interface
+before attributing decoded-text differences to a kernel.
+
+Check the target's reproducibility contract separately. Core v0.33 does not
+guarantee default online reproducibility; its beta `VLLM_BATCH_INVARIANT` mode
+is a separate capability requiring architecture/provider validation. Do not
+enable it in one arm or assume that documented AMD support covers HCU gfx938.
+Retain original failed gates while qualifying this capability independently.
+Generated Triton AST and cached launch-option comparisons can narrow a
+compilation hypothesis, but cache entries may include benchmark candidates;
+their presence does not identify the binary actually executed or its cause.
+
 Persist each child exit code and identity-bound descendant state before port
 or attestation checks that can raise. If the controller loses an unsaved exit
 code, record it as unknown. A later successful bind does not establish immediate
 port release or exit0; retain the first refusal and resume only missing work.
+For bind refusals, capture the task port's TCP/TCP6 state at the time of failure:
+TIME_WAIT and a live listener are different observations. Keep immediate bind,
+bounded later release, process exit and teardown diagnostics as separate results.
 
 ## Native JIT and interrupted cold builds
 
