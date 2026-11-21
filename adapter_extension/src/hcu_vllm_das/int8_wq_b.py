@@ -302,6 +302,10 @@ def _run_direct_gemm(gemm, layer, payload, scale, k, n, dtype):
     rows = payload.shape[0]
     status, out = gemm(payload, layer.weight.t(), scale, layer.weight_scale,
                        rows, n, k, 'NT', dtype)
+    if status is False:
+        _LOG.warning_once('INT8 direct GEMM has no solution for M=%d K=%d N=%d; '
+                          'using the native projection', rows, k, n)
+        return None
     if (status is not True or not isinstance(out, torch.Tensor)
             or out.shape != (rows, n) or out.dtype != dtype or out.device != payload.device):
         raise RuntimeError('INT8 direct GEMM returned an invalid result')
@@ -347,7 +351,9 @@ def _apply_decoder_direct(original, binding, k, n, owner, layer, x, bias=None):
                 and scale.shape in ((n,), (n, 1)) and scale.is_contiguous()
                 and layer.input_scale is None and layer.input_zero_point is None
                 and layer.azp_adj is None):
-            return _direct_gemm(gemm, layer, x, k, n)
+            out = _direct_gemm(gemm, layer, x, k, n)
+            if out is not None:
+                return out
     return original(layer, x, bias)
 
 

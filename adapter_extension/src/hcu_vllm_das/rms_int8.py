@@ -3,6 +3,7 @@
 """Owned decoder attention RMS and native CT input-quantization handoff."""
 import logging
 import math
+from functools import cache
 
 import torch
 from hcu_adapter import rms_int8_scope as scope
@@ -45,6 +46,24 @@ class PairedAttentionRMSNorm(HcuRMSNorm):
         return super().forward(x, residual)
 
 
+@cache
+def _load_fused():
+    # Load once before graph capture, including caching an unavailable provider.
+    try:
+        from hcu_adapter.kernels.rms_int8_cpp import module
+
+        fused = getattr(module(), 'apply', None)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (ImportError, OSError, RuntimeError) as error:
+        _LOG.warning('HCU RMS INT8 extension unavailable, using native RMS: %s', error)
+        return None
+    if not callable(fused):
+        _LOG.warning('HCU RMS INT8 extension has no apply entrypoint, using native RMS')
+        return None
+    return fused
+
+
 def install_owned_decoder(decoder):
     """Only this FP4 decoder's contiguous, separate attention norm is paired."""
     original = decoder.attn_norm
@@ -74,9 +93,9 @@ def install_owned_decoder(decoder):
     props = torch.cuda.get_device_properties(original.weight.device)
     if props.gcnArchName.split(':')[0] != 'gfx938':
         return False
-    # Compile/load once while constructing the model, outside CUDA graph capture.
-    from hcu_adapter.kernels.rms_int8_cpp import module
-    fused = module().apply
+    fused = _load_fused()
+    if fused is None:
+        return False
     decoder.attn_norm = PairedAttentionRMSNorm(original, fused)
     _LOG.info('HCU W4A8 paired native RMS/dynamic INT8 enabled: %s', decoder.attn.prefix)
     return True
