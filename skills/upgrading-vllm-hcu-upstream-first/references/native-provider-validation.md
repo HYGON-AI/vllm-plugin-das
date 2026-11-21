@@ -101,6 +101,23 @@ serving measurements. Record executor-internal worker termination as well as
 controller signals and exit codes. Profiler teardown can affect lifecycle;
 retain that scope instead of claiming a packed-only shutdown root cause.
 
+If fusing padding preparation, preserve active IDs/weights and assign distinct
+unused experts to padding; clamping every negative ID to zero can collide in
+the vendor sorter. Select zero for wholly padded NaN/Inf hidden rows rather
+than multiplying by zero. Bound any K-by-K candidate tile and whole-row hidden
+tile, preserving the original path outside that geometry. Validate non-power-
+of-two top-k, strided route metadata, empty batches, fallback shapes and Graph
+replay that changes a padded row into an active row and back. A preparation-only
+speedup does not qualify full serving performance.
+
+Do not assume a vendor is invariant to different zero-weight padding-ID
+permutations. Compare the original and fused payloads separately, retaining
+which fields differ, and qualify the real provider at the relevant geometry.
+Audit existing benchmark outputs as a separate functional diagnostic: preserve
+every differing round even if previous rounds match. Keep a failed exact-output
+gate failed while completing independent provenance/performance audits; neither
+algebraic zero contribution nor successful HTTP responses resolve its cause.
+
 ## Native JIT and interrupted cold builds
 
 When a vendor builds after a native-module miss, compatibility stubs must not

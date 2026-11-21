@@ -1,4 +1,10 @@
-# Native packed integration validation, 2026-11-14
+# Native packed integration validation
+
+Latest review (2026-11-21): the experimental fused-padding candidate improves
+packed serving throughput but still fails performance, full-model output
+equivalence and clean-lifecycle gates. PR367 remains Draft; see the
+[fused follow-up](#fused-padding-preparation-follow-up). Earlier results below
+retain their original dependencies and scope.
 
 The native packed candidate was merged normally with current v0.33.0
 `2cdc04242cee17fb24f7e758e62cb5c5ea0a3222`, producing runtime source
@@ -132,3 +138,90 @@ All-rank inspection confirms 48 routed layers per rank, stable storage and
 the expected expanded versus packed dimensions. No HumanEval requests were
 generated. Local evidence: `evidence/pr367-current-performance-20261121/`
 (`performance-audit.json`, original results, requests, traces and exit logs).
+
+### Fused padding preparation follow-up
+
+Production tree `b53f900a553cf3165b6f377ece81592dbcbdf48b` replaces packed
+padding preparation with one HCU launch for contiguous hidden rows of width
+1–8192 and top-k 1–32. CPU, larger geometry and other layouts retain the
+original Torch implementation. Active route IDs/weights are preserved; each
+padding slot receives a distinct unused expert, zero weight, and wholly
+padded NaN/Inf hidden rows become zero. The derived-weight, reload, admission,
+Core routing/shared-expert/reduction and vendor GEMM owners are unchanged.
+
+A new physical installed development prefix uses the same Core c440 and
+Adapter main9c20 with the new Plugin Python wheel. Full owned RECORD/wheel/
+source and shared dependency checks pass. The default expanded provider is
+unchanged. No FlashAttention or vendor source/package rebuild is included;
+ordinary private-cache AITER/Triton runtime JIT is recorded separately.
+
+Installed CPU contracts pass 98 cases, zero failures/errors/skips, with ten
+HCU cases intentionally deselected. Official source CI passes eight cases,
+including packaging boundaries; selector contracts pass 15 tests plus 14
+subtests. On real gfx938/BW1100, all 26 HCU cases pass: the four original
+full-MoE numerical/reload/Graph test bodies are unchanged and rerun, plus
+22 preparation cases for BF16/FP16, non-power-of-two top-k, strided route
+metadata, empty batches, bounded/fallback shapes and independent CPU route
+oracles. Changed-input Graph replay alternates padding/NaN rows and live
+rows while retaining output pointers. The component process exits without
+nanobind, weakref or traceback diagnostics. These are component results;
+full serving performance and lifecycle are assessed separately below.
+
+The follow-up retains the same benchmark protocol and sealed checkpoint. The
+three earlier expanded-control and old-packed rounds are reused with their
+original receipts, not regenerated. The new candidate runs its own warmup and
+three repetitions; all 96 measured requests succeed with 4096 output tokens
+per round. All aligned model-input fields match the controls; opaque request
+IDs remain separate.
+
+| Measurement | Expanded control | Old packed | Fused-padding packed |
+| --- | ---: | ---: | ---: |
+| Median output token/s | 151.681 | 87.958 | 103.756 |
+| Median mean TTFT, ms | 338.649 | 382.525 | 359.885 |
+| Median mean TPOT, ms | 23.901 | 42.800 | 36.002 |
+| Median mean E2E, ms | 3373.949 | 5818.064 | 4932.158 |
+
+New candidate output token/s by round: 103.756413, 103.289037, 103.830901.
+
+Packed throughput improves 17.96% relative to old packed, but remains
+31.60% below expanded; mean TPOT remains
+50.63% higher. **Performance acceptance remains false.**
+Independent traces show the actual fused preparation on both ranks (96 visible
+calls/rank in this observation), with 14773 kernel events/rank versus 19573
+for old packed and 14485 for expanded. These profiler totals are diagnostic
+and do not measure the timed concurrent workload's critical path.
+
+**A separate exact-output diagnostic fails:** decoded text matches old packed
+32/32 in round1, 32/32 in round2 and 0/32 in round3, despite equal model inputs.
+The original strict audit script and failure are retained. A separate auditor
+completes provenance/performance checks while explicitly preserving the failed
+output gate and false functional acceptance; it does not convert this finding
+into a pass. These are synthetic decoded-text comparisons, not token-ID/logit
+comparisons or a new HumanEval score. No request was regenerated for a better
+result. Baseline-versus-packed texts already differ under the original pair;
+that does not explain or waive this new within-packed observation.
+
+A read-only preparation probe covers all1024 candidate-occupancy patterns for
+top-k10 at hidden2560, BF16/FP16, low/high expert IDs and reversed slots. Hidden
+and route-weight payloads match exactly. Padding-ID ordering differs in968/1024
+low-expert and1012/1024 high-expert rows per dtype. Distinct zero-weight padding
+IDs are mathematically valid, but actual vendor invariance is not established;
+this is a possible mechanism, not a proven cause of generation divergence.
+Do not mark this experimental candidate Ready without resolving the finding.
+
+The profiled server exits0 after one controller SIGINT within15seconds; no
+external forced kill is required, owned processes are gone, ports are bindable
+and VRAM returns to baseline. Its executor still sends internal worker SIGTERM,
+and the server and every benchmark client report nanobind leaks. No EngineDead
+message is observed in this follow-up, but the prior occurrence remains open;
+this is not a lifecycle fix. **Clean lifecycle remains false.**
+
+Checkpoint pre/post double-read seals match all144 assets/127135690592bytes.
+Owned/shared attestations, identical common Core/Adapter/AITER/sgl-kernel payloads,
+all-rank storage/pointers and all912 BoltOps RECORD files pass verification.
+This does not waive the failed functional, performance or lifecycle gates.
+Evidence: `evidence/pr367-fused-padding-20261121/`, including
+`performance-audit.json`, `synthetic-text-divergence.json`,
+`prepare-exhaustive-comparison.json`, `trace-comparison.json` and the original
+strict audit failure. Submitted-head project CI, original topology/PLE/update
+and release-quality qualification remain separate. PR367 stays Draft.
