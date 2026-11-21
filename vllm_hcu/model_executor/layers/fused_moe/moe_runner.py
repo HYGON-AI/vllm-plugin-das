@@ -843,7 +843,12 @@ class MoERunner(MoERunnerInterface):
             x_and_scale_quanted=shared_experts_x_and_scale_quanted,
         )
 
-        if self.routed_experts.quant_method.is_monolithic:
+        static_route = getattr(self._quant_method, "_hy4_static_route", None)
+        if (static_route is not None and topk_ids is None and 64 <= hidden_states.shape[0] <= 2048
+                and self.router.eplb_state is not None
+                and self.router._routing_replay_out is None):
+            fused_out = static_route(self.router, hidden_states, router_logits, input_ids)
+        elif self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
                 x=hidden_states,

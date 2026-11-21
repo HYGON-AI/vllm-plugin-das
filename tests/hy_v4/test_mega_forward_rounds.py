@@ -75,6 +75,32 @@ def _worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+def test_static_routing_preserves_logical_capture_and_chunk_offsets():
+    impl = _load_megamoe()
+    group = SimpleNamespace(cpu_group=None)
+    kernel = impl["Hy4MegaKernel"](None, None, SimpleNamespace(num_max_tokens_per_rank=2), group, 10)
+    hidden = torch.zeros(5, 8)
+    ids = torch.arange(40).view(5, 8)
+    weights = torch.ones(5, 8)
+    router = Mock()
+    router._compute_routing.return_value = weights, ids
+    calls = []
+
+    def launch(provider, values, logical, scores, packed, buffer, clamp, *, eplb, offset):
+        assert eplb is router.eplb_state
+        assert torch.equal(logical, ids[offset:offset + len(values)])
+        calls.append(offset)
+        return values.clone()
+
+    with patch.dict(kernel.apply.__globals__, run_hy4_mega_experts=launch,
+                    _chunk_rounds=lambda *args: 3):
+        output = kernel.route_static(router, hidden, hidden, None)
+    router._validate_eplb_state.assert_called_once_with()
+    router.capture_fn.assert_called_once_with(ids)
+    assert torch.equal(output, hidden)
+    assert calls == [0, 2, 4]
+
+
 def test_ep16_rounds_once_per_backbone_forward(tmp_path):
     mp.start_processes(_worker, args=((tmp_path / "gloo").as_uri(),),
                        nprocs=16, join=True, start_method="fork")
