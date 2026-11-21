@@ -15,6 +15,7 @@ from .. import static_eplb_runtime as runtime
 from ..hy4_constructor import bind_constructor
 from ..hy4_static_plan import load_hy4_plan
 from ..hy4_prefill_workspace import make_attention
+from .. import hy4_ihc_launch as ihc_launch
 from .hy4_ct import HcuHY4CTBackbone, HcuHY4CTMTP
 
 
@@ -51,6 +52,18 @@ class HcuHY4StaticDecoder(native.HYV4DecoderLayer):
         {'HYV4MoEFused': HcuHY4StaticMoE, 'HYV4MLAAttention': HcuHY4StaticAttention})
 
 
+class HcuHY4StaticLaunchDecoder(HcuHY4StaticDecoder):
+    __init__ = bind_constructor(HcuHY4StaticDecoder.__init__,
+                               {'HYV4HCLayer': ihc_launch.TunedHCLayer})
+    _forward_ihc = ihc_launch.TunedDecoder._forward_ihc
+
+
+def _static_decoder(*args, **kwargs):
+    cfg = kwargs.get('vllm_config') if 'vllm_config' in kwargs else args[1]
+    cls = HcuHY4StaticLaunchDecoder if ihc_launch.selected(cfg) else HcuHY4StaticDecoder
+    return cls(*args, **kwargs)
+
+
 def _logical_expert_mapping(*args, **kwargs):
     # The static loader owns replica fan-out. Core's dynamic mapping would
     # emit a second set of physical IDs for repeated logical checkpoint keys.
@@ -60,7 +73,7 @@ def _logical_expert_mapping(*args, **kwargs):
 
 class HcuHY4StaticBackbone(HcuHY4CTBackbone):
     __init__ = bind_constructor(native.HYV4Model.__init__,
-        {'HYV4DecoderLayer': HcuHY4StaticDecoder, 'HYV4MoEFused': HcuHY4StaticMoE})
+        {'HYV4DecoderLayer': _static_decoder, 'HYV4MoEFused': HcuHY4StaticMoE})
     get_expert_mapping = bind_constructor(native.HYV4Model.get_expert_mapping,
         {'fused_moe_make_expert_params_mapping': _logical_expert_mapping})
 

@@ -105,6 +105,14 @@ Require `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hy4-ct-w4a8` for HY4 validation.
 This is a source candidate: offline-R16 model binding, native ABI, checkpoint
 accuracy and performance remain open in the ledger.
 
+The owned HY4 CT/static backbone can opt into native iHC launch tuning with
+`VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_IHC_LAUNCH=1`. It uses the original
+Core kernels with stage-1/stage-2 warps 4/4 on gfx938, BF16, hidden size 6144,
+HC multiplier 4, MRV2 and compilation mode 0. Other configurations retain the
+native launch. MTP is unchanged. This defaults off; unset the child or disable
+the master and restart to roll back. Reduction ordering can change slightly;
+component tests do not replace checkpoint accuracy or serving measurements.
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
