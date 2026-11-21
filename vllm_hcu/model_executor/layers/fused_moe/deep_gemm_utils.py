@@ -374,6 +374,9 @@ def ep_scatter(
     if (
         current_platform.is_rocm()
         and not pack_ue8m0
+        # LightOp's fused scatter accepts quantized byte activations only.
+        # BF16 DeepGEMM uses the dtype-generic Triton scatter below.
+        and recv_x.element_size() == 1
         and henvs.VLLM_HCU_USE_CUSTOM_OPS
         and henvs.VLLM_HCU_USE_LIGHTOP_EP_SCATTER
     ):

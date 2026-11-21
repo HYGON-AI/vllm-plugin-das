@@ -166,6 +166,11 @@ class HcuGPUWorker(Worker):
 
         refresh_glm53_router_gates(self.model_runner.model)
         refresh_compressor_nt_weights(self.model_runner.model)
+        from vllm_hcu.model_executor.layers.fused_moe.experts.deepep_bf16_moe import (
+            refresh_bf16_deepep_weights,
+        )
+
+        refresh_bf16_deepep_weights(self.model_runner.model)
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import refresh_kimi_kda_fused_qkv
         refresh_kimi_kda_fused_qkv(self.model_runner.model)
 
@@ -210,6 +215,11 @@ class HcuGPUWorker(Worker):
         )
 
         refresh_compressor_nt_weights(model)
+        from vllm_hcu.model_executor.layers.fused_moe.experts.deepep_bf16_moe import (
+            refresh_bf16_deepep_weights,
+        )
+
+        refresh_bf16_deepep_weights(model)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (
             refresh_wo_a_bf16_caches,
         )

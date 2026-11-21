@@ -770,6 +770,8 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
     """Select a per-forward or role-fixed DeepGEMM expert layout."""
 
     SHARED_LAYOUT = "contiguous=masked"
+    HT_EXPERTS_CLS = DeepEPDeepGemmContiguousExperts
+    LL_EXPERTS_CLS = DeepEPDeepGemmMaskedExperts
 
     def __init__(
         self,
@@ -791,12 +793,12 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         self._global_ht_token_bound = global_ht_token_bound
         self._use_low_latency_snapshot = False
         if fixed_use_low_latency is not True:
-            self.ht_experts = DeepEPDeepGemmContiguousExperts(
+            self.ht_experts = self.HT_EXPERTS_CLS(
                 moe_config=moe_config,
                 quant_config=quant_config,
             )
         if fixed_use_low_latency is not False:
-            self.ll_experts = DeepEPDeepGemmMaskedExperts(
+            self.ll_experts = self.LL_EXPERTS_CLS(
                 moe_config=moe_config,
                 quant_config=quant_config,
                 max_num_tokens=max_num_tokens,
