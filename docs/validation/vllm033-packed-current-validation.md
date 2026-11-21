@@ -398,3 +398,92 @@ open. Model qualification remains false and PR367 stays Draft.
 Evidence: `evidence/pr367-step-layout-20261122/step-layout-audit.json`,
 `compiled-cache-comparison.json`, official source hashes, raw requests/responses,
 log windows, package/checkpoint attestations and process/port receipts.
+
+### Fixed-enqueue offline diagnostic and retained harness failure
+
+This diagnostic switches both arms to official offline `LLM.enqueue()` then
+`wait_for_completion()` with `VLLM_ENABLE_V1_MULTIPROCESSING=0`. It verifies
+the actual installed `InprocClient` source against Core `c440c089`. TP2/BF16,
+devices 0/1, device PLE, default FULL_AND_PIECEWISE Graph/prefix and all model
+budgets remain the previous pair. The changed frontend/engine mode is diagnostic;
+it does not qualify the original online service.
+
+The first controller fails after saving one valid eight-token single completion:
+its harness incorrectly compares the opaque internal ID returned by enqueue
+with `RequestOutput`'s external ID. Core intentionally maps those IDs. The
+old child and controller exit1; raw output, input, source and failure remain.
+The child uses ordinary explicit client shutdown, exits within15seconds without
+external signals, and leaves no owned descendants. This is a harness failure,
+not a demonstrated model precision failure, and is not counted as a passed run.
+
+Recovery records Core's real internal-to-external mapping. It does not resend
+the completed old single. Both fresh arms now execute **grouped4 → single-after**
+(5 completions per arm). The original new single-before is not sent. Thus there
+are **11 new short completions total**, including the failed attempt's one;
+the original12-completion before/grouped/after protocol is **incomplete**.
+The old original single and recovered single occur in different processes and
+cannot establish a same-process before/after order control.
+
+| Paired recovery comparison | Matching eight-token sequences | Aggregate step signatures equal | First divergent token (zero based) |
+| --- | ---: | --- | --- |
+| Old/fused batch4 | 4/4 | True | [None, None, None, None] |
+| Old/fused single-after | 1/1 | True | [None] |
+
+All 40 reported token positions across these five pairs also have identical
+complete reported token-to-logprob/rank/decoded-token maps and cumulative
+logprobs. This covers the returned maps, not full-vocabulary logits or every
+model-layer value; see `reported-logprob-audit.json`.
+
+All expected fixed batches observed: **True**; all context tokens accounted for: **True**.
+Before stepping, each grouped phase has4 waiting requests and0 running;
+no official iteration is logged during enqueue. Rendered prompt IDs match
+across arms (256 tokens per prompt), and the same prompt's IDs match between
+grouped and single phases. Raw queue receipts, response IDs and log byte slices
+are independently verified. Aggregate counts still do not expose every layer
+input, actual padded GPU layout or execution configuration.
+
+- old batch4: `[[4, 1024, 0, 0], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4]]`.
+- old single-after: `[[1, 256, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]]`.
+- old grouped first / single-after token match: **False**, first divergent token `2`.
+- new batch4: `[[4, 1024, 0, 0], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4], [0, 0, 4, 4]]`.
+- new single-after: `[[1, 256, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]]`.
+- new grouped first / single-after token match: **False**, first divergent token `2`.
+
+Recovery process receipts:
+
+- old: exit `0`, controller signals `[]`, original15s ordinary shutdown gate `True`, clean lifecycle `False`; teardown `{'nanobind': False, 'weakref': False, 'engine_dead': False, 'internal_worker_termination': True}`.
+- new: exit `0`, controller signals `[]`, original15s ordinary shutdown gate `True`, clean lifecycle `False`; teardown `{'nanobind': False, 'weakref': False, 'engine_dead': False, 'internal_worker_termination': True}`.
+
+The checkpoint seals, including the seal before the failed attempt, match
+144 assets /127135690592 bytes. Recovery pre/post installed-payload attestations
+and all-rank packed expert/storage checks pass. The failed attempt has no
+completed post-attestation step; recovery pre-attestation checks the same
+unchanged old prefix afterward. Neither failure nor missing evidence is
+retroactively marked successful.
+
+A separate read-only reparse of the existing profiler traces (1545 prompt
+tokens/16 output tokens) retains these selected kernel-event duration sums:
+
+| Prior profile arm | Named GEMM events per rank | Sum per rank (ms) | Fused preparation per rank (ms) |
+| --- | ---: | --- | --- |
+| expanded | 192 | [130.57, 130.916] | [0.0, 0.0] |
+| previous_packed | 192 | [171.88, 171.889] | [0.0, 0.0] |
+| fused_packed | 192 | [171.889, 171.905] | [1.017, 1.032] |
+
+These are selected named events, not all MoE work, critical-path latency or
+a causal decomposition of the96-request benchmark. The installed provider logs
+missing E512/N320/K2560/top-k10 gfx938 INT4 W4A8 optimized configs for both
+GEMMs and selects defaults. Its public experts signature exposes no launch
+config override. This motivates provider-owned tuning investigation; no config
+is injected, no vendor source is changed and no performance gain is claimed.
+
+Original online strict-output0/32 in the failing round, -31.60% throughput,
+teardown, submitted-head device CI and remaining quality/topology/PLE/update
+gates remain open. The earlier unsaved/unknown child exit remains unknown.
+No benchmark or HumanEval cohort is regenerated, no FlashAttention is modified
+or rebuilt, and no DeepSeek V4.1 checkpoint is tested. PR367 remains Draft.
+
+Evidence: `evidence/pr367-fixed-enqueue-20261122/recovery-audit.json`,
+`recovery-protocol.json`, `model-r1` failed attempt, `model-r2` raw paired
+requests/outputs/queues/step windows/process receipts,
+`existing-profile-cost-review.json` and `provider-config-source-review.json`.

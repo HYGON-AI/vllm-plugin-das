@@ -137,6 +137,16 @@ counts, not per-request layer inputs or actual padded GPU geometry. If counts
 differ, control enqueue-before-step through a supported execution interface
 before attributing decoded-text differences to a kernel.
 
+For an offline enqueue control, verify the actual Core client. The inspected
+v0.33 `InprocClient` (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) adds requests without
+stepping; a background client can process them before the enqueue loop finishes.
+Record waiting/running counts, rendered prompt token IDs and subsequent steps.
+Keep this changed engine mode separate from online serving acceptance.
+Enqueue IDs can be internal while `RequestOutput.request_id` is external.
+Observe Core's real mapping; do not compare opaque IDs directly or strip a
+suffix by guesswork. Preserve a harness failure and its completed requests when
+repairing diagnostics, and disclose any changed phase order or lost controls.
+
 Check the target's reproducibility contract separately. Core v0.33 does not
 guarantee default online reproducibility; its beta `VLLM_BATCH_INVARIANT` mode
 is a separate capability requiring architecture/provider validation. Do not
@@ -145,6 +155,10 @@ Retain original failed gates while qualifying this capability independently.
 Generated Triton AST and cached launch-option comparisons can narrow a
 compilation hypothesis, but cache entries may include benchmark candidates;
 their presence does not identify the binary actually executed or its cause.
+Separate selected profiler-event duration sums from benchmark throughput and
+critical-path latency. If the real shape uses a provider's default launch
+configuration, investigate that provider's supported tuning path; a missing
+shape file proves neither a correctness defect nor a performance improvement.
 
 Persist each child exit code and identity-bound descendant state before port
 or attestation checks that can raise. If the controller loses an unsaved exit
