@@ -61,8 +61,9 @@ For DBO, verify per-request phase flags through actual microbatch slicing;
 query length alone cannot distinguish a short prefill from decode. At v0.33,
 DP1 does not cover this path and hybrid DBO uses MRV1. See
 [DBO metadata and workspace validation](references/dbo-metadata.md) for the
-algorithm owner, upstream fixes, split/unsplit profiling and device admission
-boundaries. Preserved phase flags do not establish sufficient MoE workspace.
+algorithm owner, upstream fixes, microbatch-scoped metadata reuse,
+split/unsplit profiling and device admission boundaries. Preserved phase flags
+and sufficient MoE workspace do not establish correct metadata-cache reuse.
 
 Before retaining a pre-fork block-size hook, trace worker KV specs back into
 EngineCore. A target that derives the parent's cache block size from those specs
