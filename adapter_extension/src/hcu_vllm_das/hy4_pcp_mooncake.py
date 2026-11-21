@@ -25,6 +25,21 @@ def _validate(config):
             raise ValueError('HY4 PCP Mooncake supports a PCP producer and non-PCP consumer')
 
 
+def _should_launch_bootstrap_server(config):
+    if not native.should_launch_bootstrap_server(config):
+        return False
+    return (config.parallel_config.prefill_context_parallel_size == 1
+            or get_pcp_group().rank_in_group == 0)
+
+
+def _init_native(worker, config, engine_id, cache_config):
+    # Bootstrap starts in Core's constructor, before the sender listener.
+    # Keep its full body and all TP/PP/DP/external-bootstrap ownership rules.
+    initialize = bind_native(native.MooncakeConnectorWorker.__init__,
+        {'should_launch_bootstrap_server': _should_launch_bootstrap_server})
+    initialize(worker, config, engine_id, cache_config)
+
+
 class HY4PCPMooncakeWorker(native.MooncakeConnectorWorker):
     def __init__(self, vllm_config, engine_id, kv_cache_config):
         self._native_entered = False
@@ -37,8 +52,41 @@ class HY4PCPMooncakeWorker(native.MooncakeConnectorWorker):
             if group.world_size != parallel.prefill_context_parallel_size:
                 raise ValueError('HY4 PCP Mooncake group size disagrees with configuration')
             self._canonical_pcp_sender = group.rank_in_group == 0
+        try:
+            _init_native(self, vllm_config, engine_id, kv_cache_config)
+        except BaseException:
+            self._cleanup_partial_init()
+            raise
         self._native_entered = True
-        super().__init__(vllm_config, engine_id, kv_cache_config)
+
+    def _cleanup_partial_init(self):
+        # Core shutdown assumes its constructor reached async_zmq_ctx. A bind
+        # or transport error may occur after threads started but before that.
+        actions = []
+        context = getattr(self, 'async_zmq_ctx', None)
+        if context is not None:
+            actions.append(context.term)
+        executor = getattr(self, '_sender_executor', None)
+        if executor is not None:
+            actions.append(lambda: executor.shutdown(wait=False))
+        for loop_name, thread_name in (('sender_loop', '_sender_listener_t'),
+                                       ('receiver_loop', '_mooncake_receiver_t')):
+            loop = getattr(self, loop_name, None)
+            thread = getattr(self, thread_name, None)
+            if loop is not None:
+                # Queue the stop even when the new thread has not entered
+                # run_forever yet; checking is_running alone races its start.
+                actions.append(lambda loop=loop: loop.call_soon_threadsafe(loop.stop))
+            if thread is not None:
+                actions.append(lambda thread=thread: thread.join(timeout=5))
+        bootstrap = getattr(self, 'bootstrap_server', None)
+        if bootstrap is not None:
+            actions.append(bootstrap.shutdown)
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                native.logger.exception('HY4 PCP Mooncake partial initialization cleanup failed')
 
     def __del__(self):
         # Validation may reject before Core creates any engine resources.

@@ -34,7 +34,7 @@ def test_worker_binding_retains_native_constructor_and_globals(monkeypatch):
     original = native.MooncakeConnector.__init__
     calls = []
     monkeypatch.setattr(base.KVConnectorBase_V1, '__init__', lambda *args: None)
-    monkeypatch.setattr(native.MooncakeConnectorWorker, '__init__',
+    monkeypatch.setattr(owned, '_init_native',
         lambda self, *args: calls.append(type(self)))
     monkeypatch.setattr(native.MooncakeConnectorWorker, 'shutdown', lambda self: None)
     monkeypatch.setattr(owned, 'get_pcp_group', lambda: NS(world_size=2, rank_in_group=1))
@@ -88,7 +88,7 @@ def test_native_aggregator_keeps_kv_lease_until_primary_ack():
 
 
 def test_unsupported_pcp_topology_fails_before_native_engine(monkeypatch):
-    monkeypatch.setattr(native.MooncakeConnectorWorker, '__init__',
+    monkeypatch.setattr(owned, '_init_native',
         lambda *args: pytest.fail('native engine initialized'))
     cfg = config()
     cfg.parallel_config.tensor_parallel_size = 2
@@ -128,7 +128,7 @@ def test_non_pcp_consumer_uses_native_worker_without_pcp_group(monkeypatch):
     calls = []
     monkeypatch.setattr(owned, 'get_pcp_group',
         lambda: pytest.fail('non-PCP consumer queried the PCP group'))
-    monkeypatch.setattr(native.MooncakeConnectorWorker, '__init__',
+    monkeypatch.setattr(owned, '_init_native',
         lambda self, *args: calls.append(args))
     monkeypatch.setattr(native.MooncakeConnectorWorker, 'shutdown', lambda self: None)
     cfg = config(pcp=1)
@@ -152,3 +152,121 @@ def test_primary_records_ready_and_cancel_with_native_metadata():
         assert 'u' not in obj.reqs_need_send
         assert 't' in obj.reqs_need_send
     asyncio.run(replay())
+
+
+@pytest.fixture
+def native_constructor(monkeypatch):
+    """Execute Core's complete constructor; stub device/transport/thread leaves."""
+    calls = []
+    class Engine:
+        def initialize(self, *args):
+            return 0
+        def get_rpc_port(self):
+            return 19000
+    class Loop:
+        def is_running(self):
+            return False
+        def stop(self):
+            pass
+        def call_soon_threadsafe(self, function):
+            calls.append('loop stop')
+    class Thread:
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            pass
+        def join(self, **kwargs):
+            calls.append('thread join')
+    class Executor:
+        def __init__(self, **kwargs):
+            pass
+        def shutdown(self, **kwargs):
+            calls.append('executor shutdown')
+    class Bootstrap:
+        def __init__(self, *args):
+            pass
+        def start(self):
+            calls.append('bootstrap start')
+        def shutdown(self):
+            calls.append('bootstrap shutdown')
+    monkeypatch.setattr(native, 'TransferEngine', Engine)
+    monkeypatch.setattr(native.torch.accelerator, 'current_device_index', lambda: 0)
+    monkeypatch.setattr(native, 'current_platform', NS(set_device=lambda x: None))
+    monkeypatch.setattr(native, 'get_ip', lambda: '127.0.0.1')
+    monkeypatch.setattr(native, 'get_tensor_model_parallel_rank', lambda: 0)
+    monkeypatch.setattr(native, 'get_tensor_model_parallel_world_size', lambda: 1)
+    monkeypatch.setattr(native, 'get_pp_group', lambda: NS(rank_in_group=0))
+    monkeypatch.setattr(native.asyncio, 'new_event_loop', Loop)
+    monkeypatch.setattr(native.threading, 'Thread', Thread)
+    monkeypatch.setattr(native, 'ThreadPoolExecutor', Executor)
+    monkeypatch.setattr(native, 'MooncakeBootstrapServer', Bootstrap)
+    monkeypatch.setattr(native, 'get_mooncake_bootstrap_addr', lambda cfg: ('localhost', 19033))
+    monkeypatch.setattr(native.MooncakeConnectorWorker, '_sync_block_size_with_kernel', lambda self: None)
+    monkeypatch.setattr(native, 'get_current_attn_backends', lambda cfg: [])
+    monkeypatch.setattr(native, 'TransferTopology', lambda **kwargs: NS(**kwargs))
+    monkeypatch.setattr(native.zmq.asyncio, 'Context', lambda: NS(term=lambda: None))
+    cfg = config(pcp=16)
+    cfg.parallel_config.data_parallel_index = 0
+    cfg.parallel_config.data_parallel_rank_local = 0
+    cfg.parallel_config.local_engines_only = False
+    cfg.kv_transfer_config.kv_connector_extra_config = {}
+    cfg.kv_transfer_config.get_from_extra_config = lambda name, default: cfg.kv_transfer_config.kv_connector_extra_config.get(name, default)
+    cfg.cache_config = NS(block_size=64)
+    cfg.model_config.use_mla = True
+    cfg.model_config.get_total_num_kv_heads = lambda: 1
+    cache = NS(kv_cache_groups=[], transfer_groups=[], has_mamba_layers=False)
+    return cfg, cache, calls
+
+
+def test_real_native_constructor_starts_one_bootstrap_for_sixteen_pcp_ranks(monkeypatch, native_constructor):
+    cfg, cache, calls = native_constructor
+    original = native.MooncakeConnectorWorker.__init__
+    workers = []
+    try:
+        for rank in range(16):
+            monkeypatch.setattr(owned, 'get_pcp_group', lambda rank=rank: NS(world_size=16, rank_in_group=rank))
+            workers.append(owned.HY4PCPMooncakeWorker(cfg, 'probe', cache))
+        assert calls.count('bootstrap start') == 1
+        assert native.MooncakeConnectorWorker.__init__ is original
+        assert original.__globals__['should_launch_bootstrap_server'] is native.should_launch_bootstrap_server
+    finally:
+        for obj in workers:
+            obj.__del__()
+            obj._native_entered = False
+
+
+def test_partial_native_constructor_cleans_sender_without_masking_error(monkeypatch, native_constructor):
+    cfg, cache, calls = native_constructor
+    monkeypatch.setattr(owned, 'get_pcp_group', lambda: NS(world_size=16, rank_in_group=0))
+    def fail(self):
+        raise OSError('bootstrap bind failed')
+    monkeypatch.setattr(native.MooncakeBootstrapServer, 'start', fail)
+    obj = object.__new__(owned.HY4PCPMooncakeWorker)
+    with pytest.raises(OSError, match='bootstrap bind failed'):
+        obj.__init__(cfg, 'probe', cache)
+    obj.__del__()
+    assert calls.count('executor shutdown') == 1
+    assert calls.count('bootstrap shutdown') == 1
+    assert calls.count('loop stop') == calls.count('thread join') == 1
+
+
+def test_external_bootstrap_remains_external_with_pcp(monkeypatch, native_constructor):
+    cfg, cache, calls = native_constructor
+    cfg.kv_transfer_config.kv_connector_extra_config['bootstrap_server_address'] = 'localhost:19100'
+    monkeypatch.setattr(owned, 'get_pcp_group', lambda: NS(world_size=16, rank_in_group=0))
+    obj = owned.HY4PCPMooncakeWorker(cfg, 'probe', cache)
+    obj.__del__()
+    obj._native_entered = False
+    assert 'bootstrap start' not in calls
+
+
+def test_real_non_pcp_consumer_retains_receiver_constructor(monkeypatch, native_constructor):
+    cfg, cache, calls = native_constructor
+    cfg.parallel_config.prefill_context_parallel_size = 1
+    cfg.kv_transfer_config.kv_role = 'kv_consumer'
+    monkeypatch.setattr(owned, 'get_pcp_group', lambda: pytest.fail('PCP queried'))
+    obj = owned.HY4PCPMooncakeWorker(cfg, 'consumer', cache)
+    assert obj.is_kv_consumer and hasattr(obj, 'receiver_loop')
+    obj.__del__()
+    obj._native_entered = False
+    assert 'bootstrap start' not in calls

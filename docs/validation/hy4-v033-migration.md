@@ -344,3 +344,26 @@ as the candidate, on the same D node and read-only model mount. The metadata
 probe hashes config, checkpoint index and tokenizer; it does not recompute all
 checkpoint shard hashes. This is a single-D control, not the full historical PD
 stack or a performance-parity result.
+
+## PD startup follow-up (2026-11-21)
+
+Packaged Plugin d7e5cff with Adapter4c0b74c completed the full single-P
+HumanEval164 run:158 passed, no syntax failures or API errors, all responses
+stopped normally. This used batch32768; the earlier151 result used98304, so
+neither the score difference nor throughput can be attributed to one patch.
+
+The first real-PD startup exposed an earlier bootstrap branch in Core's worker
+constructor: its TP/PP/DP predicate started a server on all16 PCP ranks. The
+owned constructor now privately binds that predicate to also require PCP rank0;
+all native configuration checks and transport code remain unchanged. Constructor
+failure cleans the resources already created without invoking Core shutdown on
+missing fields or masking the original exception. The full native constructor
+replay reproduced16 launches before the fix and one after it; external bootstrap
+and non-PCP consumer behavior are also covered.
+
+The D startup failed while Dynamo traced the Adapter indexer's lazy-init lock.
+The paired Adapter fix publishes the opaque operator before compilation, with
+health checks inside its execution boundary. Source-snapshot CPU checks passed202
+tests; gfx938 tests passed32/64 heads, including actual indexer compilation and
+changed-input Graph replay. These are component checks, not a full-model Graph
+or RDMA acceptance result. Both MRs remain Draft pending PD accuracy/performance.
