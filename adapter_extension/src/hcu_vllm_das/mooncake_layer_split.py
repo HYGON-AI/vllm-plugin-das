@@ -336,6 +336,9 @@ class OwnerWorker(core.MooncakeConnectorWorker):
             asyncio.create_task(self.receive_kv_from_single_worker(peer, pull_metas))
 
     def _validate_destination_ids(self, block_ids):
+        # Core uses [] for a release notification with no destination pages.
+        if len(block_ids) == 0:
+            return
         groups = self.kv_cache_config.transfer_groups
         if len(block_ids) != len(groups):
             raise ValueError('Destination KV group count mismatch')
@@ -393,6 +396,12 @@ class OwnerWorker(core.MooncakeConnectorWorker):
         remote_group_count = remote_regions.group_count
         for req_id, send in ready_reqs:
             transfer_id, remote_ids = agent_meta.req_blocks[req_id]
+            if len(remote_ids) == 0:
+                # Preserve the signal so Core can ACK the request and release
+                # the producer's blocks without building RDMA descriptors.
+                prepared.append((req_id, send))
+                projected[req_id] = (transfer_id, remote_ids)
+                continue
             local_ids = send.local_block_ids
             if (len(local_ids) != len(self.kv_cache_config.transfer_groups)
                     or len(remote_ids) != remote_group_count

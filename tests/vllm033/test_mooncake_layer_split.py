@@ -199,6 +199,17 @@ def test_consumer_rejects_missing_peer_or_schema_before_any_write():
         m.validate_peers(data, wrong)
 
 
+@pytest.mark.parametrize('blocks,error', [
+    ([[1]], 'group count'),
+    ([[2], [3], [7]], 'exceeds its pool'),
+])
+def test_consumer_rejects_nonempty_invalid_destination_block_tables(blocks, error):
+    worker = bare_worker()
+    worker.kv_cache_config, _ = allocated(0, False)
+    with pytest.raises(ValueError, match=error):
+        worker._validate_destination_ids(blocks)
+
+
 def test_guard_requires_explicit_plugin_connector_and_producer():
     cfg = config()
     for transfer in (object(), NS(kv_connector='MooncakeConnector'),
@@ -269,9 +280,12 @@ def test_compressor_handoff_stops_before_decoder_recomputed_token(length):
         assert request.max_tokens == 1
 
 
-@pytest.mark.parametrize('fail_rank', [None, 2])
-def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank):
+@pytest.mark.parametrize('fail_rank,with_releases', [(None, False), (2, False), (None, True)])
+def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank, with_releases):
     """Exercise Core's actual serialized pull/send/ACK path, no RDMA or GPU."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request, RequestStatus
+
     async def run():
         ctx = zmq.asyncio.Context()
         pool = ThreadPoolExecutor(max_workers=4)
@@ -283,6 +297,7 @@ def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank):
         decoder._acked_layout_peers = set()
         decoder._kv_layout_id = 77
         plan, dest = allocated(0, False)
+        decoder.kv_cache_config = plan
         regions, _ = m.describe_caches(plan, dest)
         for attr, field in [('kv_caches_base_addr','base_addr'), ('block_len_per_layer','block_len'),
                             ('kv_block_len_per_layer','kv_block_len'), ('registered_layer_names','layer_name'),
@@ -290,14 +305,55 @@ def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank):
             setattr(decoder, attr, [getattr(r, field) for r in regions])
         decoder.region_shared_groups = [() for _ in regions]
         decoder.region_row_offsets = [-1 for _ in regions]
+        scheduler = m.OwnerScheduler.__new__(m.OwnerScheduler)
+        scheduler.is_kv_producer, scheduler.is_kv_consumer = False, True
+        scheduler._has_compressor_state = True
+        scheduler._is_hma_required = True
+        scheduler.kv_cache_config = plan
+        scheduler.blocks_per_sw = [0] * len(plan.transfer_groups)
+        scheduler._reqs_need_recv = {}
+
+        def request(request_id, transfer_id):
+            req = Request(request_id, list(range(8)), SamplingParams(max_tokens=4), None)
+            req.kv_transfer_params = dict(do_remote_prefill=True, transfer_id=transfer_id,
+                remote_engine_id='p', remote_bootstrap_addr='http://unused')
+            return req
+
+        scheduler.update_state_after_alloc(request('d', 'x'),
+            NS(get_unhashed_block_ids_all_groups=lambda: ([4], [5], [6])), 7)
+        senders = {'x': 'p-request'}
+        if with_releases:
+            abort = request('d-abort', 'x-abort')
+            abort.status = RequestStatus.FINISHED_ABORTED
+            assert scheduler.request_finished(abort, ()) == (False, None)
+            scheduler.update_state_after_alloc(request('d-prefix', 'x-prefix'), None, 0)
+            senders.update({'x-abort': 'p-abort', 'x-prefix': 'p-prefix'})
+        metadata = scheduler.build_connector_meta(None)
+        pulls = metadata.reqs_to_recv['p']
+        assert pulls['d'].local_block_ids == [[4], [5], [6]]
+        assert all(pull.local_block_ids == [] for req_id, pull in pulls.items() if req_id != 'd')
+        counts = [0] * 8
         producers, sockets, tasks, addresses, keepalive = [], [], [], [], []
         last_release = asyncio.Event()
+
         async def serve(worker, sock, rank):
             identity, encoded = await sock.recv_multipart()
             if rank == 7:
                 await last_release.wait()
             meta = msgspec.msgpack.decode(encoded, type=m.core.MooncakeXferMetadata)
+            assert meta.req_blocks == {req_id: (pull.transfer_id, pull.local_block_ids)
+                                       for req_id, pull in pulls.items()}
             await worker.send_kv_to_decode(identity, sock, meta)
+
+        receive = decoder.receive_kv_from_single_worker
+        receivers = {}
+
+        async def track_receive(addr, metas):
+            receivers[addr] = asyncio.current_task()
+            tasks.append(receivers[addr])
+            await receive(addr, metas)
+
+        decoder.receive_kv_from_single_worker = track_receive
         try:
             for rank in range(8):
                 worker = bare_worker()
@@ -309,6 +365,7 @@ def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank):
                     block = [1,2,3][region.group_index]
                     caches[region.layer_name][block].fill_(rank + 21)
                 def transfer(remote, srcs, dsts, sizes, rank=rank):
+                    counts[rank] += len(sizes)
                     if rank == fail_rank:
                         return 1
                     for src, dst, size in zip(srcs, dsts, sizes):
@@ -322,23 +379,31 @@ def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank):
                 worker._sender_executor = pool
                 worker.finished_sending_reqs = set()
                 ready = asyncio.Event(); ready.set()
-                worker.reqs_need_send = {'x': m.core.SendBlockMeta('p-request', 'x', [[1],[2],[3]], ready)}
+                worker.reqs_need_send = {tid: m.core.SendBlockMeta(pid, tid, [[1], [2], [3]], ready)
+                                         for tid, pid in senders.items()}
                 sock = ctx.socket(zmq.ROUTER)
                 port = sock.bind_to_random_port('tcp://127.0.0.1')
                 addresses.append(f'tcp://127.0.0.1:{port}')
                 producers.append(worker); sockets.append(sock)
                 tasks.append(asyncio.create_task(serve(worker, sock, rank)))
-            pull = m.core.PullReqMeta('d', 'x', [[4],[5],[6]], 'p', 'http://unused', pull_tasks_count=8)
-            receivers = [asyncio.create_task(decoder.receive_kv_from_single_worker(addr, {'d': pull})) for addr in addresses]
-            tasks.extend(receivers)
-            await asyncio.wait_for(asyncio.gather(*receivers[:-1]), timeout=15)
-            assert pull.pull_tasks_count == 1 and not decoder.finished_recving_reqs
+            decoder._owner_peers = {'p': addresses}
+            decoder._remote_agents = {'p': {}}
+            await decoder._start_load_kv(metadata.reqs_to_recv)
+            assert all(pull.pull_tasks_count == 8 for pull in pulls.values())
+            await asyncio.sleep(0)  # Register the tasks created by OwnerWorker.receive_kv.
+            await asyncio.wait_for(asyncio.gather(*(receivers[addr] for addr in addresses[:-1])), timeout=15)
+            assert all(pull.pull_tasks_count == 1 for pull in pulls.values())
+            assert not decoder.finished_recving_reqs
             last_release.set()
             await asyncio.wait_for(asyncio.gather(*tasks), timeout=15)
-            assert decoder.finished_recving_reqs == {'d'} and pull.failed == (fail_rank is not None)
+            assert decoder.finished_recving_reqs == {'d'}
+            assert all(pull.pull_tasks_count == 0 for pull in pulls.values())
+            assert pulls['d'].failed == (fail_rank is not None)
+            assert not any(pull.failed for req_id, pull in pulls.items() if req_id != 'd')
             for rank, worker in enumerate(producers):
+                assert counts[rank] == len(worker._regions)
                 if rank != fail_rank:
-                    assert worker.finished_sending_reqs == {'p-request'}
+                    assert worker.finished_sending_reqs == set(senders.values())
                     assert not worker.reqs_need_send
                     for region in worker._regions:
                         assert torch.all(dest[region.layer_name][[4,5,6][region.group_index]] == rank+21)
