@@ -10,11 +10,24 @@ from torch import nn
 from vllm.forward_context import get_forward_context
 from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseBackend
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadata,
     FlashMLASparseMetadataBuilder,
 )
 from vllm_hcu.models.hy_v4_flash.runtime import is_hcu_platform
+
+
+class FlashWindowIndexGroupBuilder(SparseMLAIndexGroupBuilder):
+    """Keep window-owned KV out of HiSparse without patching shared Core.
+
+    The window manager owns these pages. Passing HiSparse's config here would
+    attach a host/hot cache handle which the window manager never binds. This
+    is the model-scoped equivalent of upstream vLLM #69026's SWA exclusion.
+    """
+
+    def register_layer(self, is_index_producing_layer, vllm_config=None, **kwargs):
+        return super().register_layer(is_index_producing_layer, None, **kwargs)
 
 
 class FlashSparseMetadataBuilder(FlashMLASparseMetadataBuilder):

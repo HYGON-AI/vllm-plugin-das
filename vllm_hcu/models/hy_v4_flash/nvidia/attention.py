@@ -23,7 +23,12 @@ from vllm_hcu.models.hy_v4_flash.configs import SLIDING_ATTENTION
 from vllm_hcu.models.hy_v4_flash.runtime import validate_flash_platform
 
 from .compressed_indexer import FlashCompressedIndexer
-from .swa import FlashSparseBackend, FlashSWABackend, FlashWindowIndexer
+from .swa import (
+    FlashSparseBackend,
+    FlashSWABackend,
+    FlashWindowIndexer,
+    FlashWindowIndexGroupBuilder,
+)
 
 
 class HYV4FlashAttention(HYV4MLAAttention):
@@ -172,6 +177,10 @@ class HYV4FlashAttention(HYV4MLAAttention):
             use_sparse=True,
             indexer=self.indexer,
             topk_indices_buffer=topk_indices_buffer,
+            index_group_builder=(
+                FlashWindowIndexGroupBuilder(topk_indices_buffer)
+                if self.is_window_layer else None
+            ),
             attn_backend=FlashSWABackend
             if self.is_window_layer
             else FlashSparseBackend,

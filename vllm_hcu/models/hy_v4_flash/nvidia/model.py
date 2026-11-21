@@ -55,11 +55,11 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
         raise ValueError("HYV4 Flash requires bfloat16 compute")
     if not vllm_config.use_v2_model_runner:
         raise ValueError("HYV4 Flash requires the V2 model runner")
-    if (
-        vllm_config.kv_transfer_config is not None
-        or vllm_config.lora_config is not None
-    ):
-        raise ValueError("HYV4 Flash does not support KV transfer or LoRA")
+    if vllm_config.lora_config is not None:
+        raise ValueError("HYV4 Flash does not support LoRA")
+    from vllm_hcu.models.hy_v4_flash.hisparse import validate_flash_hisparse
+
+    validate_flash_hisparse(vllm_config)
     spec = vllm_config.speculative_config
     if spec is not None:
         method = getattr(spec, "method", None)
