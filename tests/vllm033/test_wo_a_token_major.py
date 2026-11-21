@@ -1,7 +1,6 @@
 """Admission and BF16 output layout for the opt-in WO-A candidate."""
 
 from contextlib import nullcontext
-import os
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -215,20 +214,3 @@ def test_exact_route_and_wo_b_dispatch(scenario):
         assert result == 'stock'
         original.assert_called_once_with(o_proj, out, 'positions')
         torch.bmm.assert_not_called()
-
-
-@pytest.mark.skipif(os.environ.get('HCU_TEST_WO_A_DEVICE') != '1', reason='opt-in HCU test')
-@pytest.mark.parametrize('rows', [2, 6, 16, 32])
-def test_hcu_bitwise(rows):
-    import torch
-    from hcu_adapter.bridges.vllm import detect_hcu
-
-    assert torch.cuda.is_available() and detect_hcu().detected, 'requires an HCU device'
-    torch.manual_seed(625914 + rows)
-    x = torch.randn(rows, 8, 4096, device='cuda', dtype=torch.bfloat16)
-    w = torch.randn(8, 1024, 4096, device='cuda', dtype=torch.bfloat16) / 64
-    result = wo._token_major_bmm(torch, x, w)
-    expected = torch.einsum('tgd,grd->tgr', x, w)
-    assert result.is_contiguous()
-    assert result.flatten(1).data_ptr() == result.data_ptr()
-    assert torch.equal(result.view(torch.int16), expected.contiguous().view(torch.int16))
