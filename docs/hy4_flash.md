@@ -1,8 +1,51 @@
 # HYV4 Flash on vLLM 0.33 (candidate)
 
-The plugin registers `HYV4FlashForCausalLM` and
-`HYV4FlashVLForConditionalGeneration`. Model registration and static import
-closure are not evidence that a checkpoint can be served on HCU.
+The legacy source registration declares `HYV4FlashForCausalLM` and
+`HYV4FlashVLForConditionalGeneration`. These declarations are not delivered by
+the active v0.33 plugin wheel; the packaging integration blocker below must be
+fixed before claiming installed model registration or HCU serving support.
+
+## v0.33 package integration blocker
+
+The prospective integration of PR #493 head `acab29bb2228` with release target
+`32a1a6c05d6d` merges without conflicts, but its actual
+`hcu-vllm-das-plugin==0.33.0` wheel contains neither `vllm_hcu` nor HYV4 Flash
+model modules. The active `adapter_extension/pyproject.toml` includes only
+`hcu_vllm_das` packages and Adapter extension entry points. The target also
+explicitly disables the repository-root legacy build. Adding the repository
+to `PYTHONPATH` or rebuilding the retired root project cannot qualify this
+release artifact.
+
+An isolated, repository-free probe used that built wheel with the actual
+Core `0.33.0+das.c440c08.dtk2610.torch2130.gfx936gfx938.r211.rocm72` and
+Adapter `0.5.22+hcu.1`. It found no `vllm_hcu` import spec and no registry entries
+for either Flash architecture. Ordinary `HYV4ForCausalLM` and `HYV4MTPModel`
+remain registered to official Core `vllm.models.hy_v4`; those names do not
+establish Flash support. The probe used `HCU_ADAPTER_HOST=none`, inspected real
+distribution metadata and Core registry objects, and did not activate HCU or
+instantiate a checkpoint.
+
+The prospective merged tree passes all eight existing source-tier tests.
+Its source, portable, device and gfx938 CI selectors select no
+`tests/models/hy_v4` cases. That green source tier verifies its existing package
+boundary; it does not exercise delivery of this MR's feature. Earlier AST-body
+and source-overlay model results retain their original scope.
+
+Before this MR is merge-ready, port only the missing model behavior into the
+active plugin package after comparing it with Core's current implementations;
+connect registration through the Adapter extension lifecycle; and add wheel,
+installed discovery and applicable runtime coverage to the v0.33 CI matrix.
+Keep official HYV4 registrations and platform ownership intact. Packaging and
+registration checks must pass outside the source tree before device/model,
+accuracy, Graph and lifecycle qualification. Do not restore the retired root
+platform/general entry points to conceal this gap.
+
+Reproducible local evidence: `evidence/pr493-v033-integration-20261122/`
+in the upgrade handoff workspace, including the merge parents/tree, wheel
+inventory/hash, `registry-probe-r2.json`, `source-ci.xml` and `ci-selection.json`.
+The original probe-generation syntax error is retained separately; its corrected
+registry probe exits zero. No FlashAttention modification/rebuild or DeepSeek
+V4.1 checkpoint test was performed.
 
 ## Repository boundary and dependency
 
