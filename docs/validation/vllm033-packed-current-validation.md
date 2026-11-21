@@ -641,3 +641,60 @@ benchmark-recovery-r1,continuation-validation-recovered-r1,
 native-tuned-small-recovered-r1,native-tuned-vendor-recovered-r1}/ and
 recovered-tuning-gates-r1.json; evidence/pr367-benchmark-recovery-20261122/
 contains this summary, external skill archive and publication receipts.
+
+
+## Tuned versus untuned online diagnostic (2026-11-22, terminal)
+
+The recovered model supervisor16677 is terminal0; its driver and auditor both
+exit0. Qwen3.8-Flash-Next-Channel-INT4-w4a8 ran on one gfx938 node, TP2/BF16,
+device PLE, prefix caching and default FULL_AND_PIECEWISE Graph. The control and
+tuned arms both use the fused packing runtime b53f900a; this compares public
+tuning configurations, not fused packing against the original expanded path.
+
+Both arms completed single-before/batch4/single-after:12 total short completions,
+8 tokens each. Raw paired request bytes and actual official context/decode step
+signatures match. Token-by-token comparisons across the two arms are:
+
+| Phase | Exact token sequences | Exact returned logprobs |
+| --- | --- | --- |
+| single-before | 0/1 | 0/1 |
+| batch4 | 2/4 | 0/4 |
+| single-after | 0/1 | 0/1 |
+
+The single-request control repeats exactly within each arm; its grouped result
+differs within each arm. Default serving is not batch invariant. Equal aggregate
+scheduler counts do not establish equal layer inputs or full-vocabulary logits,
+and this comparison does not identify a defective kernel or a quality direction.
+The6 paired completions expose48 returned positions; only2/6 token sequences
+match and none has identical returned logprobs. Keep this observed difference.
+
+Each frontend exits0 within the original15-second SIGINT bound without controller
+escalation or owned survivors. Both still log internal worker SIGTERM after the
+worker grace period and nanobind leaks; the tuned arm also logs EngineDeadError.
+Consequently both clean_lifecycle values are false. Immediate bare bind fails;
+69 control and77 tuned bind refusals show TIME_WAIT only (TCP state06), followed
+by successful bare bind with no remaining socket entries. These observations
+are separate from process exit and do not establish a clean lifecycle.
+
+Checkpoint pre/post double reads match144 assets/127135690592bytes. Per-arm
+provider/config seals and all package/shared-dependency attestations pass before
+and after serving; the tuned arm additionally seals the six benchmark packages.
+No FlashAttention modification/rebuild or DeepSeek V4.1 checkpoint test occurred.
+
+The earlier36+24 native cases compare packing implementations inside the tuned
+environment. They do not compare untuned/tuned arithmetic. In inspected provider
+source, the default channel-wise INT4 path uses Ktile64 for these small batches,
+while the top tuned M1/4 configs use256 and M32/256 use128; channel-wise GEMM
+applies scales to each Ktile dot before FP32 accumulation. Changed floating-point
+grouping is a hypothesis for component investigation, not demonstrated causality
+for this model difference. Do not change attention or inject runtime tile overrides.
+
+This is a diagnostic, not HumanEval or a throughput qualification. No completed
+HE cohort was regenerated. Original96-request0/32 agreement,103.756 versus
+151.681token/s(-31.60%), model quality, normal lifecycle, submitted-head device CI,
+independent review and remaining feature/topology/PLE/update gates stay open.
+Keep Plugin367 Draft and last_good=false. Production/tests/tools/CI remain
+b53f900a553cf3165b6f377ece81592dbcbdf48b.
+
+Evidence: evidence/pr367-tuned-model-recovery-20261122/{terminal-summary.json,
+online-keep-audit.json,model-continuation-r1/receipt.json,model-r1/}.

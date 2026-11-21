@@ -204,6 +204,15 @@ before model/performance acceptance. Retain any existing unmerged provider
 repairs in an explicitly recorded validation combination; replacing that
 combination with the provider's default branch can silently remove a fix.
 
+
+After tuning, distinguish packing parity within one configuration from numerical
+comparisons between untuned and tuned configurations. Keep weights, inputs and
+routes identical in a separate component comparison before attributing changed
+model outputs to a particular tile or reduction. Even matching aggregate online
+steps and passing component references do not close observed model differences.
+Inspect whether a changed K tile also changes where scales enter accumulation;
+that source hypothesis is not proof of the first model divergence.
+
 Persist each child exit code and identity-bound descendant state before port
 or attestation checks that can raise. If the controller loses an unsaved exit
 code, record it as unknown. A later successful bind does not establish immediate
