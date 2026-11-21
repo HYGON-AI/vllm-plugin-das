@@ -39,7 +39,7 @@ def _quantize_draft_ll_live_rows(X, Q, S, COUNTS, CAPACITY: tl.constexpr,
 
 @lru_cache(maxsize=None)
 def _live_rows_enabled(device):
-    if os.environ.get(_LIVE_ROWS_ENV) != '1' or not torch.version.hip:
+    if os.environ.get(_LIVE_ROWS_ENV, '1') != '1' or not torch.version.hip:
         return False
     props = torch.cuda.get_device_properties(device)
     if getattr(props, 'gcnArchName', '').split(':')[0] != 'gfx938':

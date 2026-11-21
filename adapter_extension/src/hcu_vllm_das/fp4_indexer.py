@@ -206,7 +206,7 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
         self._hcu_wo_a_layout = wo_a_layout.configured(cfg, self.wo_a.weight.device)
         self._int8_wq_b_device = None
         self._int8_wq_b_direct = None
-        if type(self) is Fp4Attention and _flag('HCU_DSV41_WQ_B_INT8_DIRECT', default=False):
+        if type(self) is Fp4Attention and _flag('HCU_DSV41_WQ_B_INT8_DIRECT', default=True):
             from .int8_wq_b import configure_direct_gemm
 
             self._int8_wq_b_direct = configure_direct_gemm(cfg)

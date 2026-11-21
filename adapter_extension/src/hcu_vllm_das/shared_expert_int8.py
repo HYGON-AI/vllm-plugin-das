@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in SwiGLU prequantization for V4.1 CT INT8 shared experts."""
+"""SwiGLU prequantization for eligible V4.1 CT INT8 shared experts."""
 from functools import partial
 import os
 
@@ -17,7 +17,7 @@ _ENV = 'HCU_DSV41_SHARED_EXPERT_INT8_FUSION'
 
 
 def bind_shared_expert(config, moe):
-    if os.getenv(_ENV) != '1':
+    if os.getenv(_ENV, '1') != '1':
         return
     _LOG.warning_once('HCU DSV4.1 shared expert INT8 fusion requested')
     parallel = config.parallel_config

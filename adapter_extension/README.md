@@ -53,13 +53,11 @@ before candidate selection and top-k, including during CUDA Graph replay.
 
 ## V4.1 W4A8 masked MoE scheduling hint
 
-Set `HCU_DSV41_W4A8_MOE_EXPECTED_M=1` before starting the service to enable
-this opt-in on the DeepEP low-latency `gfx938` 64-CU path with 256 tokens of
-capacity per dispatcher, 8 dispatchers, 384 global experts, 48 local experts,
-top-k 6, hidden width 5120, gate/up width 4608, and clamp limit 10. The hint
-uses the local token extent for both masked GEMMs and clamp/quantization.
-Workspace capacity and device-side per-expert row counts retain their existing
-roles. Other configurations use the capacity as the hint.
+The small-batch masked GEMM hint defaults on for eligible DeepEP low-latency
+`gfx938` 64-CU W4A8 paths. It uses the local token extent for both masked GEMMs
+and clamp/quantization. Workspace capacity and device-side per-expert row
+counts retain their roles. Set `HCU_DSV41_W4A8_MOE_EXPECTED_M=0` before startup
+to use the capacity hint for all configurations.
 
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
@@ -127,6 +125,14 @@ accuracy or performance. See the [configuration validation boundary](
 ../docs/validation/vllm033-step5-config.md).
 
 ## DSV4.1 HCU decode defaults
+
+Eligible DSpark draft LL receive quantization, INT8 direct GEMM, and Shared
+Expert INT8 fusion default on. Set `HCU_DSV41_DRAFT_LL_LIVE_QUANT=0`,
+`HCU_DSV41_WQ_B_INT8_DIRECT=0`, or `HCU_DSV41_SHARED_EXPERT_INT8_FUSION=0`
+respectively before startup to restore the corresponding fallback. The Adapter
+uses LightOp in eligible INT8 and FP8 graph capture by default. Set
+`HCU_LIGHTOP_PER_TOKEN_INT8_GRAPH=0` or `HCU_LIGHTOP_PER_TOKEN_FP8_GRAPH=0`
+to restore upstream quantization for that capture path.
 
 On the validated gfx938 vLLM 0.33 build (`g7364da`),
 `HCU_VLLM_WO_A_TOKEN_MAJOR` defaults to enabled. It applies to eligible
