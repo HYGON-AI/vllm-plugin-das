@@ -11,10 +11,11 @@ import pytest
 MODEL = Path(__file__).resolve().parents[3] / "vllm_hcu/models/hy_v4"
 
 
-def _profile_shape(minimum, maximum, overrides=None):
+def _profile_shape(minimum, maximum, overrides=None, *, newline=True):
     processor = NS(patch_size=16, merge_size=2,
                    size={"shortest_edge": minimum, "longest_edge": maximum})
     info = NS(get_hf_processor=lambda: NS(image_processor=processor),
+              get_hf_config=lambda: NS(vision_config=NS(use_image_newline_token=newline)),
               _merge_and_resolve_mm_processor_kwargs=lambda _: {
                   "images_kwargs": overrides or {}})
     nodes = []
@@ -51,6 +52,22 @@ def test_tight_budget_still_maximizes_image_and_newline_tokens():
     # 128 rows of two merge cells use the exact budget and yield 384 tokens
     # including row newlines, versus 272 tokens for the feasible square.
     assert (size.height, size.width) == (4096, 64)
+
+
+@pytest.mark.parametrize("newline", [False, True])
+@pytest.mark.parametrize("maximum", [512**2, 2048**2])
+def test_maximum_matches_all_feasible_grids_with_configured_newlines(newline, maximum):
+    minimum = 512**2
+    size, _ = _profile_shape(minimum, maximum, newline=newline)
+    actual = (size.height // 32) * (size.width // 32 + int(newline))
+    cells = maximum // 32**2
+    # Independent exhaustive oracle, including every smaller column count.
+    expected = max(rows * (cols + int(newline))
+                   for rows in range(1, cells + 1)
+                   for cols in range(1, cells // rows + 1)
+                   if rows * cols * 32**2 >= minimum
+                   and max(rows, cols) <= 200 * min(rows, cols))
+    assert actual == expected
 
 
 @pytest.mark.parametrize("minimum,maximum", [(1000, 1000), (1025, 1025)])

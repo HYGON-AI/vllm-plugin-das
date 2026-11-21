@@ -57,7 +57,7 @@ def routed_reference(
     if experts < 1 or ids.shape[1] < 1:
         raise ValueError("W4A8 needs nonempty experts and router slots")
     torch._assert_async(
-        torch.all((ids >= 0) & (ids < experts)), "W4A8 expert ID out of range"
+        torch.all((ids >= -1) & (ids < experts)), "W4A8 expert ID out of range"
     )
     if expert_impl is None:
         from hcu_adapter.kernels.w4a8_int8_native_triton import (
@@ -84,7 +84,13 @@ def routed_reference(
         active = torch.arange(rows, device=x.device)[None, :] < counts[:, None]
         result = torch.where(active[:, :, None], result, 0)
         token = torch.arange(rows, device=x.device)[:, None]
-        slot_output = result[local_ids.long(), inverse[local_ids.long(), token]]
+        valid_routes = local_ids >= 0
+        safe_ids = local_ids.clamp_min(0).long()
+        slot_output = result[safe_ids, inverse[safe_ids, token]]
+        # The router uses -1 for skipped padding. Mask both operands before
+        # multiplication: zero times a NaN padding value is still NaN.
+        slot_output = torch.where(valid_routes[:, :, None], slot_output, 0)
+        local_weights = torch.where(valid_routes, local_weights, 0)
         combined = (slot_output.float() * local_weights[:, :, None]).sum(1)
         output[begin:end].copy_(combined.to(x.dtype))
     return output

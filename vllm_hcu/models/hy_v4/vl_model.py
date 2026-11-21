@@ -3,6 +3,7 @@
 # Copyright 2025 The HunYuan team.
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Annotated
 
 import torch
@@ -242,7 +243,12 @@ class HYV4VLForConditionalGeneration(
             self,
             ignore_unexpected_prefixes=["visual."] if self.visual is None else None,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        session = (
+            self.visual.weight_loading_session()
+            if self.visual is not None else nullcontext()
+        )
+        with session:
+            return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mrope_input_positions(
         self,

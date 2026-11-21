@@ -3,6 +3,7 @@
 # Copyright 2025 The HunYuan team.
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -472,22 +473,49 @@ class HYV4VisionTransformer(nn.Module):
             )
         return hidden
 
+    @contextmanager
+    def weight_loading_session(self):
+        depth = getattr(self, "_vision_loading_depth", 0)
+        if depth == 0:
+            self._vision_qkv_shards = {}
+        self._vision_loading_depth = depth + 1
+        try:
+            yield
+            if depth == 0:
+                missing = {
+                    name: sorted({"q", "k", "v"} - shards)
+                    for name, shards in self._vision_qkv_shards.items()
+                    if shards != {"q", "k", "v"}
+                }
+                if missing:
+                    raise ValueError(f"Incomplete vision QKV shards: {missing}")
+        finally:
+            self._vision_loading_depth = depth
+            if depth == 0:
+                self._vision_qkv_shards.clear()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded = set()
-        for name, weight in weights:
-            for projection, shard in (
-                ("q_proj", "q"),
-                ("k_proj", "k"),
-                ("v_proj", "v"),
-            ):
-                if f".{projection}." in name:
-                    name = name.replace(f".{projection}.", ".qkv.")
+        # AutoWeightsLoader can call this repeatedly for interleaved visual/text
+        # chunks. The parent keeps the audit open until the whole stream ends.
+        with self.weight_loading_session():
+            params = dict(self.named_parameters())
+            loaded = set()
+            for name, weight in weights:
+                for projection, shard in (
+                    ("q_proj", "q"),
+                    ("k_proj", "k"),
+                    ("v_proj", "v"),
+                ):
+                    if f".{projection}." in name:
+                        name = name.replace(f".{projection}.", ".qkv.")
+                        param = params[name]
+                        param.weight_loader(param, weight, shard)
+                        self._vision_qkv_shards.setdefault(name, set()).add(shard)
+                        break
+                else:
                     param = params[name]
-                    param.weight_loader(param, weight, shard)
-                    break
-            else:
-                param = params[name]
-                getattr(param, "weight_loader", default_weight_loader)(param, weight)
-            loaded.add(name)
-        return loaded
+                    getattr(param, "weight_loader", default_weight_loader)(param, weight)
+                    if ".qkv." in name:
+                        self._vision_qkv_shards[name] = {"q", "k", "v"}
+                loaded.add(name)
+            return loaded
