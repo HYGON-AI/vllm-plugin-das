@@ -225,3 +225,97 @@ Evidence: `evidence/pr367-fused-padding-20261121/`, including
 `prepare-exhaustive-comparison.json`, `trace-comparison.json` and the original
 strict audit failure. Submitted-head project CI, original topology/PLE/update
 and release-quality qualification remain separate. PR367 stays Draft.
+
+### Output-divergence component diagnosis
+
+The next diagnostic uses the unchanged installed production tree `b53f900`,
+Core `c440c089` and Adapter `9c20b33d` on a real gfx938 device. The public
+`boltops.fused_moe.fused_experts` receives **the same** packed weights and
+FP32 kernel scales through the original Torch preparation and fused preparation.
+Geometry matches the measured checkpoint's TP2 experts:
+E512/H2560/I320/top-k10. This is a vendor component diagnostic, without
+checkpoint loading, TP collectives or model-generation acceptance.
+
+| Diagnostic | Cases | Dtypes | Batch sizes | Result |
+| --- | ---: | --- | --- | --- |
+| Decode geometry | 36 | BF16/FP16 | 1/2/4/8/16/32 | All eight comparisons/case exact and finite |
+| Larger batches and CPU oracle | 24 | BF16/FP16 | 64/128/256/1024 | All eight comparisons/case exact and finite; independent INT4 oracle passes |
+
+The eight comparisons cover old/old and new/new eager repeats, old/new eager,
+old/new Graph, each Graph's repeat, and eager/Graph for each arm. Replay changes
+hidden values, active IDs and padding. Mixed/all-padding rows include NaN/Inf
+hidden values and NaN padding weights. The 1024-row low-ID input covers every
+candidate-occupancy bit pattern. Padding-ID order differs in 40/60 cases, yet
+all 480 output comparisons are exact. The 24 independently checked nonzero
+valid rows pass the signed-INT4 CPU reference at rtol 0.015 / atol 0.001; maximum
+absolute discrepancy is 0.00048828125. These references are sampled rows,
+not an independent oracle for every output element in the matrix.
+
+All packed weight/scale hashes remain unchanged. Both diagnostic processes
+exit 0 without nanobind/weakref/traceback diagnostics, owned descendants are
+gone and GPU7 returns to 2 MiB. Native JIT compilation uses private caches;
+owned vendor payloads stay unchanged. FlashAttention is unchanged and is not
+rebuilt.
+
+This matrix does **not** reproduce an output change caused by padding-ID
+permutation. It narrows that hypothesis for the tested weights/shapes; it does
+not prove full-model invariance or explain the original third-round divergence across all 32
+texts. The original strict output, serving-performance and model
+lifecycle gates stay failed. Do not copy an unspecified Torch argsort tie
+order into production to conceal the unresolved observation.
+
+Evidence: `evidence/pr367-output-diagnosis-20261121/`, including both
+`vendor-r*/results.json`, launch/process/exit receipts and
+`production-binding.json`. Existing CPU98/HCU26/source-CI8/selector15+14
+subtest results retain their original source and scope; this diagnostic adds
+no HumanEval generation and does not qualify submitted-head project CI.
+
+### Short model token/logprob diagnosis
+
+The same installed old/fused packed pair is then exercised on the original
+failing round's first four random prompts. Each arm receives one single-prompt
+request and one explicitly grouped list of four prompts, with temperature 0,
+ignore_eos, eight output tokens, top 5 logprobs and token-ID reporting. The
+actual serialized HTTP bodies match across arms and raw responses are kept.
+There are 10 new short diagnostic completions; the 96-request benchmark and
+HumanEval cohorts are not regenerated. The diagnostics use TP2/BF16, device
+PLE and the original configured FULL_AND_PIECEWISE Graph/prefix policies.
+They omit the original separate profiler session and measure no serving
+performance. Actual per-step scheduler grouping is not instrumented.
+
+| Comparison | Matching eight-token sequences | First divergent token (zero based) |
+| --- | ---: | --- |
+| Old/fused single | 1/1 | None |
+| Old/fused grouped4 | 0/4 | [2, 1, 7, 1] |
+| Old single/grouped4, first prompt | 0/1 | 2 |
+| Fused single/grouped4, first prompt | 1/1 | None |
+
+The old packed source itself produces a different third token between its
+single and grouped requests. This establishes a full-model difference
+without the fusion change; it does not isolate grouping, warmup/order,
+Graph shape, state/cache behavior or a particular operator as the cause.
+The short requests do not recreate the original concurrent 32-request round.
+Preserve the failed original exact-output gate and investigate step inputs
+and logits under controlled execution rather than changing a sort order.
+
+The first controller exits 1 at its immediate post-old-service bare port bind
+with EADDRINUSE. It had not persisted the old child exit code, which remains
+**unknown**, not 0. Completed old requests/storage receipts are reused;
+recovery sends only the missing five fused completions. A later bare bind
+succeeds, owned processes are gone and VRAM is released; the port refusal's
+cause is not established. The original controller failure is retained.
+The recovery saves child shutdown receipts before port checks.
+The recovered fused arm also has initial bare-bind refusals before its
+bounded later bind succeeds. This is separate from the saved process-exit
+deadline; the refusal does not establish a remaining listener or worker.
+Server nanobind and internal termination findings remain failed gates.
+**Controller, full-model lifecycle and release qualification remain false.**
+
+Both arms' pre/post installed payload attestations pass. Checkpoint
+pre/post double-read seals match all 144 assets / 127135690592 bytes. Both ranks
+each retain the 48 expected packed expert methods and storage addresses. All
+observed owned processes are terminal and the allocated cards are released.
+See `diagnostic-audit.json`, raw `model-r1/*/*.request-body` and response
+files, `controller-closeout-failure.json`, the recovery source and all-rank
+storage/launch/process receipts. No production fix or new acceptance is
+claimed; PR367 remains Draft.

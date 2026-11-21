@@ -118,6 +118,22 @@ every differing round even if previous rounds match. Keep a failed exact-output
 gate failed while completing independent provenance/performance audits; neither
 algebraic zero contribution nor successful HTTP responses resolve its cause.
 
+When investigating that permutation, use the actual expert count, hidden and
+intermediate widths and top-k with the same packed weights/scales in both arms.
+Include repeated eager execution, changing-input Graph replay, mixed/all-padding
+rows and an independent signed-INT4 reference for nonzero valid outputs. A
+matching vendor component matrix narrows the hypothesis; it does not explain
+a prior model divergence. Do not reproduce an unspecified Torch sort tie order
+as a production fix without causal evidence. For the next model diagnostic,
+save the actual HTTP bytes and token IDs/top logprobs, and distinguish single
+from explicitly grouped requests. Label short diagnostic requests separately
+from the original performance or accuracy cohort and preserve its failed gate.
+
+Persist each child exit code and identity-bound descendant state before port
+or attestation checks that can raise. If the controller loses an unsaved exit
+code, record it as unknown. A later successful bind does not establish immediate
+port release or exit0; retain the first refusal and resume only missing work.
+
 ## Native JIT and interrupted cold builds
 
 When a vendor builds after a native-module miss, compatibility stubs must not
