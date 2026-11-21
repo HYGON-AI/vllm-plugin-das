@@ -27,6 +27,12 @@ under a distinct model type, preserve foreign registrations and verify real
 references/standalone-draft-config.md); config support does not qualify MTP
 execution.
 
+For model-family ports, trace the actual wheel payload, current extension
+entry point and selected CI cases before reusing source-tree results. A clean
+merge can leave all feature code in an unshipped legacy namespace. Keep config
+parsing capability distinct from model implementation/registration; see the
+[installed delivery checks](references/standalone-draft-config.md#model-family-delivery).
+
 Compare the actual baseline and target implementations before retaining,
 rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names

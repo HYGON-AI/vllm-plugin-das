@@ -113,6 +113,26 @@ loading, tokenizer, sparse attention, Graph, drafted/accepted tokens, model
 accuracy or performance. See the [configuration validation boundary](
 ../docs/validation/vllm033-step5-config.md).
 
+## HYV4 Flash configuration metadata
+
+`das_hcu_hyv4_flash_config` provides `hyv4-flash-config`. It registers the two
+distinct `hy_v4_flash` and `hy_v4_flash_vl` config types through public
+`AutoConfig.register()` during Adapter extension activation. The text config
+inherits official Core `HYV4Config`; ordinary HYV4 configs and model registry
+entries retain their official owners. Flash-specific IndexPool, SWA, Engram
+and vision fields use the existing candidate's validation and serialization.
+
+Both names are checked for foreign ownership before publication. A partial
+commit or later ownership drift latches a fatal failure; health checks never
+repair the mapping. Discovery imports no framework. Forked children must
+activate their inherited mapping, and spawned children discover the installed
+entry point. The capability can be required using the existing Adapter
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
+
+This is configuration parsing support only. The active wheel still lacks
+Flash model execution and model registration; PR #493 remains Draft until
+the [model integration and runtime gates](../docs/hy4_flash.md) are closed.
+
 ## DSV4.1 Channel-FP8 configuration routing
 
 The independent `das_hcu_dsv41` Adapter extension advertises only

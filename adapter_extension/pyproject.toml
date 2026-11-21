@@ -26,6 +26,7 @@ das_hcu_v41_indexer = "hcu_vllm_das.v41_indexer_activation:extension_spec"
 das_hcu_v41_pcp = "hcu_vllm_das.v41_pcp_activation:extension_spec"
 das_hcu_fp4_packer = "hcu_vllm_das.fp4_packer:extension_spec"
 das_hcu_step5_config = "hcu_vllm_das.step5_activation:extension_spec"
+das_hcu_hyv4_flash_config = "hcu_vllm_das.hyv4_flash_config_activation:extension_spec"
 minimax31_slimquant = "hcu_vllm_das.quantization.minimax31_activation:extension_spec"
 minimax31_pcp_ep = "hcu_vllm_das.parallel.minimax31_pcp_activation:extension_spec"
 

@@ -31,7 +31,14 @@ def test_hcu_hyv4_registration_uses_plugin_models(monkeypatch):
         "HYV4MTPModel",
         "vllm_hcu.models.hy_v4:HYV4MTP",
     ) in registrations
-
+    assert (
+        "HYV4FlashForCausalLM",
+        "vllm_hcu.models.hy_v4_flash:HYV4FlashForCausalLM",
+    ) in registrations
+    assert (
+        "HYV4FlashVLForConditionalGeneration",
+        "vllm_hcu.models.hy_v4_flash:HYV4FlashVLForConditionalGeneration",
+    ) in registrations
 
 def test_hcu_hyv4_reuses_target_config_owner():
     from vllm_hcu.models.hy_v4 import HYV4Config as PluginHYV4Config
@@ -39,7 +46,15 @@ def test_hcu_hyv4_reuses_target_config_owner():
     assert PluginHYV4Config is HYV4Config
 
 
-@pytest.mark.parametrize("architecture", ["HYV4ForCausalLM", "HYV4MTPModel"])
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "HYV4ForCausalLM",
+        "HYV4MTPModel",
+        "HYV4FlashForCausalLM",
+        "HYV4FlashVLForConditionalGeneration",
+    ],
+)
 def test_hyv4_enables_breakable_cuda_graph_by_default(
     monkeypatch, architecture
 ):
