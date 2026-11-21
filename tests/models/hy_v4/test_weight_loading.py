@@ -24,6 +24,22 @@ def test_target_auto_loader_uses_ignore_unexpected_prefixes():
     assert "ignore_unexpected_prefixes" in parameters
     assert "skip_prefixes" not in parameters
 
+
+def test_flash_construction_seams_do_not_replace_hyv4_defaults() -> None:
+    from vllm_hcu.models.hy_v4_flash.nvidia.model import (
+        HYV4FlashDecoderLayer,
+        HYV4FlashForCausalLM,
+        HYV4FlashModel,
+    )
+
+    assert HYV4ForCausalLM.model_cls is HYV4Model
+    assert HYV4Model.decoder_layer_cls is hy_v4_model.HYV4DecoderLayer
+    assert HYV4FlashForCausalLM.model_cls is HYV4FlashModel
+    assert HYV4FlashModel.decoder_layer_cls is HYV4FlashDecoderLayer
+    assert issubclass(HYV4FlashForCausalLM, HYV4ForCausalLM)
+    assert issubclass(HYV4FlashModel, HYV4Model)
+
+
 def _add_fake_moe_metadata(model: torch.nn.Module) -> None:
     model.expert_weights = []
     model.num_moe_layers = 1
@@ -60,7 +76,7 @@ def test_excluded_quant_config_is_not_forwarded_to_lm_head(
             super().__init__()
             captured.update(kwargs)
 
-    monkeypatch.setattr(hy_v4_model, "HYV4Model", FakeInnerModel)
+    monkeypatch.setattr(HYV4ForCausalLM, "model_cls", FakeInnerModel)
     monkeypatch.setattr(hy_v4_model, "ParallelLMHead", FakeLMHead)
     monkeypatch.setattr(hy_v4_model, "LogitsProcessor", lambda *args: object())
     monkeypatch.setattr(
@@ -106,7 +122,7 @@ def test_non_modelopt_quant_config_is_forwarded_to_lm_head(
             super().__init__()
             captured.update(kwargs)
 
-    monkeypatch.setattr(hy_v4_model, "HYV4Model", FakeInnerModel)
+    monkeypatch.setattr(HYV4ForCausalLM, "model_cls", FakeInnerModel)
     monkeypatch.setattr(hy_v4_model, "ParallelLMHead", FakeLMHead)
     monkeypatch.setattr(hy_v4_model, "LogitsProcessor", lambda *args: object())
     monkeypatch.setattr(

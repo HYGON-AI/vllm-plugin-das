@@ -190,3 +190,71 @@ def test_hy_v4_pure_tp_keeps_all_experts_in_local_metadata(monkeypatch, backend)
     assert layer.n_local_physical_experts == 16
     assert layer.physical_expert_start == 0
     assert layer.physical_expert_end == 16
+
+
+def test_hy_v4_latent_moe_preserves_full_width_router_and_weight_names(monkeypatch):
+    captured = {}
+    shared_kwargs = {}
+    group = SimpleNamespace(size=lambda: 8)
+    monkeypatch.setattr(moe, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(moe, "get_ep_group", lambda: SimpleNamespace(
+        device_group=group, rank_in_group=0))
+    monkeypatch.setattr(moe, "GateLinear", lambda *a, **kw: _FakeGate())
+
+    def shared(**kwargs):
+        shared_kwargs.update(kwargs)
+        return _FakeSharedExperts()
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        runner = _FakeExperts()
+        runner.routed_input_transform = kwargs["routed_input_transform"]
+        runner.routed_output_transform = kwargs["routed_output_transform"]
+        return runner
+
+    monkeypatch.setattr(moe, "HYV4FeedForward", shared)
+    monkeypatch.setattr(moe, "FusedMoEFactory", factory)
+    gate_inputs = []
+
+    class FullWidthGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(16, 32))
+
+        def forward(self, hidden):
+            gate_inputs.append(hidden)
+            return torch.nn.functional.linear(hidden, self.weight), None
+
+    monkeypatch.setattr(moe, "GateLinear", lambda *a, **kw: FullWidthGate())
+    down, up = nn.Linear(32, 8, bias=False), nn.Linear(8, 32, bias=False)
+    layer = moe.HYV4MoEFused(
+        config=_hf_config(), vllm_config=_vllm_config("auto"),
+        routed_hidden_size=8, routed_input_transform=down,
+        routed_output_transform=up, prefix="model.layers.1.mlp")
+    assert captured["hidden_size"] == 8
+    assert captured["routed_input_transform"] is down
+    assert captured["routed_output_transform"] is up
+    assert shared_kwargs["hidden_size"] == 32
+    parameters = dict(layer.named_parameters())
+    assert parameters["routed_expert_down_proj.weight"] is down.weight
+    assert parameters["routed_expert_up_proj.weight"] is up.weight
+    assert "experts.routed_input_transform.weight" not in parameters
+    assert "experts.routed_output_transform.weight" not in parameters
+
+    assert captured["gate"] is None
+    hidden = torch.randn(2, 32)
+    expected_logits = torch.nn.functional.linear(hidden, layer.gate.weight)
+
+    def latent_runner(*, hidden_states, router_logits):
+        # Match Core ordering: transform first, then its optional owned gate.
+        latent = layer.experts.routed_input_transform(hidden_states)
+        assert latent.shape == (2, 8)
+        assert captured["gate"] is None
+        torch.testing.assert_close(router_logits, expected_logits)
+        return layer.experts.routed_output_transform(latent)
+
+    layer.experts.forward = latent_runner
+    actual = layer(hidden)
+    torch.testing.assert_close(actual, up(down(hidden)))
+    assert len(gate_inputs) == 1
+    assert gate_inputs[0].shape == (2, 32)
