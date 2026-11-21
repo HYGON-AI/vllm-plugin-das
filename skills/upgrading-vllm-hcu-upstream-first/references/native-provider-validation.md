@@ -25,6 +25,12 @@ the installed extension even when PYTHONPATH points at source, invalidating that
 negative control. Use a separate installed-wheel environment for native tests;
 retain initial environment failures and bind each result to its actual source.
 
+Pure metadata CI fixtures also need isolation from real installed distributions
+and a preloaded Torch. Clear inherited `PYTHONPATH`/`PYTHONHOME` for their child
+processes: the parent's `-I` does not carry over to a child started with `-S`.
+A new venv alone does not remove that inherited search path. Keep this CPU
+fixture environment separate from installed native qualification.
+
 Use existing transfer tests where possible. Native TCP read/write, async/scatter
 and GIL tests establish host transport behavior only. HIP IPC, device registration,
 RDMA, P/D model output, Graph, accuracy, lifecycle and performance retain their

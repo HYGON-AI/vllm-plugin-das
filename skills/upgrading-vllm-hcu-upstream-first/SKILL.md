@@ -32,6 +32,11 @@ rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names
 does not establish equivalent behavior or performance.
 
+For custom runtime SP communication, read
+[the communicator construction contract](references/runtime-sp-communication.md).
+Manager admission must precede construction; communication qualification alone
+does not migrate the model's token/head layouts or MoE factory policy.
+
 Inspect the old callback's body before calling it an optimization: a
 nonmutating audit callback need not become a replacement for an official
 verifier. Verify the registered target implementation and its observable

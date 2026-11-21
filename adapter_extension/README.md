@@ -88,6 +88,53 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Runtime SP components under development
+
+`das_hcu_runtime_sp_communication` supplies the explicitly requested
+`runtime-sp-communication` capability. It requires Adapter's public
+communicator-selector seam and an exact process-local capability health binding.
+It also requires Adapter's required-owner boundary before cached FULL Graph
+replay. A selector-only Adapter does not supply that boundary and is refused.
+With the existing `additional_config['hcu']['enable_custom_sp']` boolean, the
+Plugin subclass passes EP admission before the official communicator constructs
+its manager. Backend selection, dispatch/combine and destruction stay official.
+Public Torch all-to-all uses the borrowed device group.
+
+The attention projection helpers retain official GLM4/HY3 modules and Linear
+loaders/GEMM, with explicit scoped construction and concrete public OOT owners.
+They adapt local tokens/full heads to global tokens/local heads and invert the
+exchange before the output projection. Replicated GQA uses contiguous replica
+groups. These helpers have no automatic model registration or serving enablement.
+
+Explicit model-boundary candidates compose full vocabulary-TP embedding before
+token sharding, local hidden/residual streams, global attention positions,
+device padding masks and gather/trim at stage exits. Ordinary dense MLPs gather
+tokens, retain official TP weights and reduce-scatter down-projection partials;
+shared experts select replicated weights before allocation. A model-local bridge
+passes early SP policy and a narrow MoE padding runner. Official inner loops,
+loading, routing and logits remain inherited. No ModelRegistry entry enables
+these candidates automatically.
+
+Projection layout/mask and collective operations use Core's public custom-op
+registration, with ownership checks before official GEMM. Enabled model
+boundaries bind model/projection health into the required capability so Adapter
+checks it before replay, which does not execute Python custom-op bodies.
+Device masks are explicit tensor arguments so compiled graphs track them across
+batch changes rather than retaining a hidden capture-time context tensor.
+CPU compiler coverage and remaining gates are recorded in the
+[fullgraph follow-up](../docs/validation/vllm033-runtime-sp-fullgraph.md).
+
+These are **components and model-boundary candidates**. Complete synthetic
+models retain an ordinary-TP numerical gate failure; trained checkpoint,
+target/draft batching, real PP/DP/PCP, default compilation, model accuracy,
+performance and lifecycle remain unqualified. The paired Adapter seam is an
+unpublished dependency; no released combination is qualified. See
+[component validation and standalone probes](
+../docs/validation/vllm033-runtime-sp-components.md) and
+[model boundaries and preserved failures](
+../docs/validation/vllm033-runtime-sp-boundaries.md), plus the subsequent
+[dense TP policy correction](../docs/validation/vllm033-runtime-sp-dense-tp.md).
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
