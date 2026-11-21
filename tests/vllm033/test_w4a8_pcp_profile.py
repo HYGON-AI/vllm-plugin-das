@@ -1,6 +1,7 @@
 from collections import namedtuple
 from dataclasses import dataclass
-from types import SimpleNamespace as NS
+import sys
+from types import ModuleType, SimpleNamespace as NS
 
 import numpy as np
 import pytest
@@ -84,13 +85,27 @@ def test_selects_only_native_eager_w4a8_with_padding_support(monkeypatch):
     assert profile_worker._select("default", config) == "default"
 
 
-def test_worker_constructs_profile_runner_without_additional_plugins(monkeypatch):
+@pytest.mark.parametrize("layer_split_available", [False, True])
+def test_worker_uses_prefill_wrapper_when_available(monkeypatch, layer_split_available):
+    module_name = "hcu_vllm_das.dsa_prefill_runner"
+    companion = None
+    calls = []
+    if layer_split_available:
+        companion = ModuleType(module_name)
+
+        def wrap(base, config, device):
+            calls.append(base)
+            return base(config, device)
+
+        companion.wrap_profile_runner = wrap
+    monkeypatch.setitem(sys.modules, module_name, companion)
     worker = object.__new__(profile.W4A8PcpProfileWorker)
     worker.vllm_config = object()
     worker.device = torch.device("cpu")
     expected = (worker.vllm_config, worker.device)
     monkeypatch.setattr(profile, "W4A8PcpProfileRunner", lambda config, device: (config, device))
     assert worker._make_model_runner() == expected
+    assert calls == ([profile.W4A8PcpProfileRunner] if layer_split_available else [])
 
 
 def test_reserves_workspace_before_core_measures_forward(monkeypatch):

@@ -156,4 +156,10 @@ class W4A8PcpProfileRunner(GPUModelRunner):
 
 class W4A8PcpProfileWorker(Worker):
     def _make_model_runner(self):
-        return W4A8PcpProfileRunner(self.vllm_config, self.device)
+        try:
+            from ..dsa_prefill_runner import wrap_profile_runner
+        except ModuleNotFoundError as error:
+            if error.name != "hcu_vllm_das.dsa_prefill_runner":
+                raise
+            return W4A8PcpProfileRunner(self.vllm_config, self.device)
+        return wrap_profile_runner(W4A8PcpProfileRunner, self.vllm_config, self.device)
