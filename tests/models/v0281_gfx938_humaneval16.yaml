@@ -265,7 +265,7 @@ profiles:
             enable_thinking: false
 
   hy4_preview_channel_fp8_tp8:
-    model: /models/Hy4-preview-Channel-FP8-w8a8
+    model: /models/Hy4-preview-Channel-FP8-w8a8-v2
     server:
       port: 10205
       served_model_name: Hy4-preview-Channel-FP8-w8a8
@@ -281,7 +281,7 @@ profiles:
             reasoning_effort: no_think
 
   hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_calibration:
-    model: /models/Hy4-preview-Channel-FP8-w8a8
+    model: /models/Hy4-preview-Channel-FP8-w8a8-v2
     server:
       port: 10227
       served_model_name: Hy4-preview-Channel-FP8-w8a8
@@ -304,7 +304,7 @@ profiles:
             reasoning_effort: no_think
 
   hy4_preview_channel_fp8_dp8_ep8_mtp3_kvfp8_eplb_static:
-    model: /models/Hy4-preview-Channel-FP8-w8a8
+    model: /models/Hy4-preview-Channel-FP8-w8a8-v2
     server:
       port: 10228
       served_model_name: Hy4-preview-Channel-FP8-w8a8
@@ -441,7 +441,9 @@ profiles:
       port: 10211
       served_model_name: Qwen3.5-35B-A3B-W8A8
       environment: *flash_environment
-      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, aiter, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "8192", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
+      # AITER's per-channel INT8 Marlin kernels VM-fault while profiling this
+      # checkpoint on gfx938/DTK 26.10. The Triton path serves it reliably.
+      args: [--trust-remote-code, --language-model-only, --tensor-parallel-size, "2", --attention-backend, FLASH_ATTN, --moe-backend, triton, --speculative-config, '{"method":"mtp","num_speculative_tokens":3}', --kv-cache-dtype, fp8_e4m3, --enable-prefix-caching, --max-model-len, "8192", --max-num-batched-tokens, "1024", --max-num-seqs, "8", --generation-config, vllm, --default-chat-template-kwargs, '{"enable_thinking":false}']
       prefix_probe:
         content_repeat: 64
     evalscope:
