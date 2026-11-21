@@ -40,6 +40,18 @@ nonpersistent extension when needed. CPU tests cover real admitted profiling
 grids, repeated growth without a construction config context, and unchanged
 small-grid values. Encoder Graph and installed VL model validation remain open.
 
+Image profiling follows the processor's input aspect check before rounding.
+For example, legal `8192x41` input becomes `8192x32`, with 512 tokens when
+row newlines are enabled. A dummy image can therefore have unaligned raw
+dimensions; token budgets use its actual resized grid. The search also covers
+downscale floor grids below `min_pixels`, both closed input-aspect endpoints,
+and the separate alignment/max-pixel contract when resizing is disabled.
+It does not tighten request admissibility or change image preprocessing.
+Regression coverage includes real resize/profile/token-count function bodies,
+an exhaustive finite raw-input family and independent sampled raw inputs.
+This CPU coverage does not qualify the installed multimodal dispatcher,
+checkpoint loading, encoder Graphs or model quality.
+
 CPU-only seam tests:
 
 ```sh

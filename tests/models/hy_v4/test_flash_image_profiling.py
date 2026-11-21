@@ -2,6 +2,7 @@
 """Exercise real profiling/resize functions without framework or model imports."""
 import ast
 from copy import deepcopy
+from fractions import Fraction
 import math
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -24,7 +25,7 @@ def _profile_shape(minimum, maximum, overrides=None, *, newline=True):
         tree = ast.parse((MODEL / filename).read_text())
         nodes.append(deepcopy(next(n for n in ast.walk(tree)
                                    if isinstance(n, ast.FunctionDef) and n.name == name)))
-    namespace = {"math": math, "ImageSize": NS}
+    namespace = {"math": math, "Fraction": Fraction, "ImageSize": NS}
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  "<production-image-profile>", "exec"), namespace)
     return namespace["get_image_size_with_most_features"](info), namespace["smart_resize"]
@@ -41,36 +42,46 @@ def test_profile_shape_obeys_pixel_bounds_and_real_resize(minimum, maximum, over
     size, resize = _profile_shape(minimum, maximum, overrides)
     limits = overrides or {}
     minimum, maximum = limits.get("min_pixels", minimum), limits.get("max_pixels", maximum)
-    assert size.height % 32 == size.width % 32 == 0
-    assert minimum <= size.height * size.width <= maximum
     assert max(size.height, size.width) / min(size.height, size.width) <= 200
-    assert resize(size.height, size.width, 32, minimum, maximum) == (size.height, size.width)
+    height, width = resize(size.height, size.width, 32, minimum, maximum)
+    assert height % 32 == width % 32 == 0
+    assert height * width <= maximum
 
 
 def test_tight_budget_still_maximizes_image_and_newline_tokens():
-    size, _ = _profile_shape(512**2, 512**2)
-    # 128 rows of two merge cells use the exact budget and yield 384 tokens
-    # including row newlines, versus 272 tokens for the feasible square.
-    assert (size.height, size.width) == (4096, 64)
+    size, resize = _profile_shape(512**2, 512**2)
+    # The raw aspect is legal; rounding reaches 256 one-cell rows and adds
+    # a newline to each. A post-round 200:1 constraint misses this shape.
+    assert resize(size.height, size.width, 32, 512**2, 512**2) == (8192, 32)
 
 
 @pytest.mark.parametrize("newline", [False, True])
 @pytest.mark.parametrize("maximum", [512**2, 2048**2])
-def test_maximum_matches_all_feasible_grids_with_configured_newlines(newline, maximum):
+def test_maximum_matches_independent_raw_input_family(newline, maximum):
     minimum = 512**2
-    size, _ = _profile_shape(minimum, maximum, newline=newline)
-    actual = (size.height // 32) * (size.width // 32 + int(newline))
+    size, resize = _profile_shape(minimum, maximum, newline=newline)
+    height, width = resize(size.height, size.width, 32, minimum, maximum)
+    actual = (height // 32) * (width // 32 + int(newline))
     cells = maximum // 32**2
-    # Independent exhaustive oracle, including every smaller column count.
-    expected = max(rows * (cols + int(newline))
-                   for rows in range(1, cells + 1)
-                   for cols in range(1, cells // rows + 1)
-                   if rows * cols * 32**2 >= minimum
-                   and max(rows, cols) <= 200 * min(rows, cols))
+    # Exhaust the aligned RAW inputs up to four times the pixel budget,
+    # including downscales, and add independently known rounded panoramas.
+    # Acceptance and output sizes come from the real preprocessing function;
+    # this is not a claim that aligned output grids preserve the input ratio.
+    shapes = ((rows * 32, cols * 32)
+              for rows in range(1, 4 * cells + 1)
+              for cols in range(1, 4 * cells // rows + 1)
+              if max(rows, cols) <= 200 * min(rows, cols))
+    expected = 0
+    for h, w in (*shapes, (8192, 41), (41, 8192), (21824, 192)):
+        try:
+            h, w = resize(h, w, 32, minimum, maximum)
+        except ValueError:
+            continue
+        expected = max(expected, (h // 32) * (w // 32 + int(newline)))
     assert actual == expected
 
 
-@pytest.mark.parametrize("minimum,maximum", [(1000, 1000), (1025, 1025)])
+@pytest.mark.parametrize("minimum,maximum", [(1000, 1000), (1, 1023)])
 def test_impossible_aligned_pixel_budget_reports_no_shape(minimum, maximum):
     with pytest.raises(ValueError):
         _profile_shape(minimum, maximum)
@@ -124,8 +135,8 @@ def _check_rope_values(actual, grid):
 @pytest.mark.parametrize("maximum", [512**2, 2048**2])
 def test_profile_image_grid_has_complete_vision_rope(newline, maximum, vision_rope_context):
     size, resize = _profile_shape(512**2, maximum, newline=newline)
-    assert resize(size.height, size.width, 32, 512**2, maximum) == (size.height, size.width)
-    grid = [[1, size.height // 16, size.width // 16]]
+    height, width = resize(size.height, size.width, 32, 512**2, maximum)
+    grid = [[1, height // 16, width // 16]]
     shell, rope = _vision_rope()
     _check_rope_values(rope(shell, grid), grid)
 
