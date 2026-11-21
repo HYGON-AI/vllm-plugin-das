@@ -79,3 +79,23 @@ code-event monitoring against the installed Python/runtime: preserve existing
 tools, original returns/exceptions and callable identity, and release the
 observer on success, exception and observer failure. Keep such instrumentation
 in diagnostic worker hooks, separate from production model/attention code.
+
+
+For a compiler-option A/B, inspect the target's default-injection conditions
+before selecting an override. Some releases add both `combo_kernels` and
+`benchmark_combo_kernel` only when neither key is present. To vary benchmarking
+alone, explicitly retain the effective combination and change only that flag;
+verify the public CLI/EngineArgs result and actual worker compilation/Graph
+configuration. Disabling benchmarks can also change fusion/kernel selection,
+not just allocation or timing. Keep diagnostic arms and their accuracy results
+separate from the original default configuration and avoid unique-cause or
+performance claims from this option alone.
+
+Before attributing an A/B result to that option, compare actual device total
+memory and UUID/PCI mapping as well as free memory, installed payloads and
+runtime settings. A successful run on a larger-memory allocation does not
+isolate an option from a previous smaller-memory failure. Prepare a fresh
+default-config control on the same devices and preserve both original results.
+If another client occupies those cards after teardown, record the unavailable
+control and wait for the unchanged memory admission; do not lower its budget
+or terminate foreign jobs to manufacture a matched comparison.

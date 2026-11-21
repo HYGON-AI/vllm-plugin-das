@@ -278,3 +278,44 @@ assets pass full before/after verification. This reproduces the startup error
 with measured loaded-memory/layout evidence; it does not fix it. Keep Draft and
 retain the default CPU-offload, raw-format/lifecycle and wider model gates.
 Evidence: `evidence/qwen4-dense-full-checkpoint-20261120-r5-local-events/audit.json`.
+
+## Compiler-option diagnostic and device-memory change (2026-11-21)
+
+The R6 diagnostic uses the public CLI compilation configuration with explicit
+`combo_kernels=true, benchmark_combo_kernel=false`. Explicitly preserving the
+first flag matters: this Core injects both defaults only when neither key is
+present. Installed public CLI/EngineArgs parsing and actual four-worker RPC
+configuration confirm the pair. Production payloads remain Core `c440c089`,
+Adapter `d9bb7fa5`, Plugin `1fba2bc1`; no attention or native source was changed.
+
+This allocation reports 147,440 MiB total memory per card (about144 GiB), whereas
+the earlier failed allocation reported about96 GiB. R6 therefore does **not**
+isolate the compiler option as the cause of the earlier HIPBLAS failure. It
+retains TP4, device PLE, trained target/draft, MTP3, default Graph, prefix and
+chunked prefill, the900-second health deadline and15-second exit grace.
+
+All675 observed GEMMs, including102 HC calls per rank, return normally. There
+are no observed allocator warning lines or HIPBLAS internal errors in this run.
+The service becomes healthy, arithmetic passes13/13 and prefix probes3/3 with
+3200 hit tokens. Four worker traces each contain59 Graph-launch events; these
+alone do not qualify changed-input replay or the complete mixed-batch matrix.
+MTP counters record3738 drafted and3645 accepted tokens (97.51%). HumanEval0–31
+passes0/32 raw and32/32 after isolated normalization,4811 completion tokens,
+without truncation. The raw code-fence syntax failures remain failures. Compared
+with the earlier non-MTP run,29/32 contents are identical; both the hardware and
+runtime settings differ, so this is not a matched MTP-only comparison.
+
+Server0/tracker0 exit within15 seconds without controller-forced cleanup or
+survivors. Framework worker SIGTERM, EngineDeadError and nanobind diagnostics
+still fail the existing lifecycle gate. All14 RECORDs, control sources and the
+146-file/237,133,280,448-byte checkpoint verify unchanged before/after. Keep
+Draft: raw format, normal lifecycle, default compiler, default CPU PLE and the
+wider accuracy/performance gates are still open. Evidence:
+`evidence/qwen4-dense-full-checkpoint-20261120-r6-no-combo-bench/audit.json`.
+
+A fresh default-compiler control is prepared for the same physical cards0–3,
+with the same observer and serving settings, independent cold caches and port.
+Other clients occupied those cards immediately after R6 teardown. The control
+must satisfy the unchanged85%+4GiB memory admission before launch; unavailable
+devices provide no default-configuration result. Adapter154 has since merged
+into a newer main; its CI and payload are separate from this frozen runtime.
