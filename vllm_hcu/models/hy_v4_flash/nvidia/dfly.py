@@ -483,10 +483,24 @@ class HYV4DFlyForCausalLM(nn.Module):
                             f"shape={tuple(weight.shape)}"
                         )
                     if (
-                        name.endswith(".weight_scale_inv")
-                        and required[name] == torch.float32
+                        required[name] == torch.float32
                         and weight.dtype == torch.bfloat16
+                        and (
+                            name.endswith(".weight_scale_inv")
+                            or (
+                                name.endswith(".weight_scale")
+                                and isinstance(
+                                    getattr(self.model, "quant_config", None),
+                                    CompressedTensorsConfig,
+                                )
+                                and required.get(name.removesuffix("_scale"))
+                                == torch.int8
+                            )
+                        )
                     ):
+                        # CT can serialize an INT8 linear's channel scales in
+                        # its original BF16 compute dtype. Promote losslessly
+                        # to Core's FP32 scale parameter, not arbitrary tensors.
                         weight = weight.float()
                     if weight.dtype != required[name]:
                         raise ValueError(
