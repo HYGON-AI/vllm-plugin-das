@@ -44,6 +44,13 @@ def _sample_draft(self, hidden_states, sample_src_positions, idx_mapping,
         spec_step_idx=spec_step_idx, num_steps=num_steps)
     # Synchronize here, not at the end of propose(): the next draft step has
     # already consumed this token and written its KV by that later boundary.
+    # Core's device communicator already owns the initialized PyNCCL group.
+    # GroupCoordinator.broadcast uses a separate lazy Torch communicator,
+    # which can allocate RCCL buffers while profiling has filled the allocator.
+    communicator = getattr(state.group, 'device_communicator', None)
+    transport = getattr(communicator, 'pynccl_comm', None)
+    if transport is not None and not transport.disabled:
+        return communicator.broadcast(tokens, src=0)
     return state.group.broadcast(tokens, src=0)
 
 

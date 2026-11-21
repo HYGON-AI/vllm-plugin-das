@@ -189,3 +189,40 @@ def test_prepare_rejects_foreign_worker_before_registering(monkeypatch):
     with pytest.raises(bridge.PostModelLoadError, match='does not provide'):
         owned.prepare(cfg)
     assert not shared._callbacks.callbacks
+
+
+def test_pcp_draw_reuses_native_device_communicator(monkeypatch):
+    from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+    calls = []
+    class NativeTransport:
+        disabled = False
+        def broadcast(self, tensor, src):
+            calls.append((tensor.data_ptr(), src))
+            tensor.fill_(7)
+    communicator = object.__new__(CudaCommunicator)
+    communicator.world_size = 16
+    communicator.pynccl_comm = NativeTransport()
+    group = Group()
+    group.device_communicator = communicator
+    def forbid_lazy_torch_group(*args, **kwargs):
+        pytest.fail('native initialized communicator was bypassed')
+    group.broadcast = forbid_lazy_torch_group
+    monkeypatch.setattr(owned, 'get_pcp_group', lambda: group)
+    obj = speculator()
+    owned.bind_speculator(obj, config())
+    tokens = draw(obj, torch.tensor([[0., 2., 1.]]))
+    assert tokens.tolist() == [7]
+    assert calls == [(tokens.data_ptr(), 0)]
+
+
+@pytest.mark.parametrize('disabled', [True, None])
+def test_pcp_draw_preserves_torch_fallback_without_enabled_pynccl(monkeypatch, disabled):
+    group = Group()
+    communicator = NS(pynccl_comm=None if disabled is None else NS(disabled=True),
+                     broadcast=lambda *a, **k: pytest.fail('disabled native transport'))
+    group.device_communicator = communicator
+    monkeypatch.setattr(owned, 'get_pcp_group', lambda: group)
+    obj = speculator()
+    owned.bind_speculator(obj, config())
+    assert draw(obj, torch.tensor([[0., 2., 1.]])).tolist() == [1]
+    assert group.calls == 1
