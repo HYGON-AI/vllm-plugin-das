@@ -345,6 +345,9 @@ class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
         self._hcu_paired_attention_norm = False
         if use_pcp:
             return
+        from ..shared_expert_int8 import bind_shared_expert
+
+        bind_shared_expert(cfg, self.ffn)
         if not self.use_sequence_parallel and self.attn._int8_wq_b_direct is not None:
             from ..int8_wq_b import bind_decoder_direct_gemm
 
