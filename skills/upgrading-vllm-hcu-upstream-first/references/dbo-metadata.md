@@ -35,6 +35,33 @@ reservation is 64 CUs and the device has 64 CUs, so the SM-control constructor
 asserts before metadata slicing. An explicit `VLLM_DBO_COMM_SMS=0` experiment
 does not qualify the unchanged default or establish a performance policy.
 
+## Bound-device communication budget
+
+Read the installed Core's effective default and the already-bound worker's
+actual CU count. A default that exhausts that device can be an admission
+failure even when the selected communication manager's SM setter is a no-op.
+Do not infer the budget from a frontend's first visible GPU or copy a release
+constant. Adapter owns a narrow configuration adaptation; Plugin should not
+copy `SMControlContextManager` or the model runner to solve this failure.
+
+For an affected implicit default, Core's supported zero-reservation path can
+restore admission without choosing a speculative performance budget. Preserve
+explicit official inputs, including their normal parser failures. Check
+backend-specific caps and ROCm DeepEP HT's existing zero-reservation override
+before adapting another backend. Public upstream
+[PR #68535](https://github.com/vllm-project/vllm/pull/68535) proposes a CUDA AgRs
+rule; verify platform guards and the selected target before treating it as an
+HCU fix. Zero reservation does not disable DBO or establish overlap performance.
+
+If Adapter scopes the official environment input, cover the actual controller
+construction points: this release uses V1 model loading and V2 KV
+initialization. Restore the previous environment on exceptions and between
+models. A cached stale Core value must fail clearly; clearing Core's cache is
+not validation. Test real configuration constructors, the bound-device
+controller and the installed model separately. Compare stock and automatic
+policy with the official variable absent; record an explicit-zero control as
+a different configuration. Retain independent accuracy and normal-exit gates.
+
 For serving validation, bind the actual runner, source/wheel origins, each
 rank's microbatch execution, model bytes and requested attention/Graph/prefix
 configuration. Keep output, HumanEval32, lifecycle and performance results
