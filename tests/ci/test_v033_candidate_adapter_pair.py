@@ -20,10 +20,19 @@ C = fixtures.C
 BUILD = 'dtk2610.torch2130.2611172048.g1c9448'
 HOST_VERSION = '0.5.22+' + BUILD
 KERNEL_VERSION = '0.0.0+' + BUILD
+RELOCATED = {
+    'fp4_indexer.py': 'features/dsv41/fp4_indexer.py',
+    'v41_fp8_indexer.py': 'features/dsv41/v41_fp8_indexer.py',
+    'ct_w4a8_registration.py': 'features/ct_w4a8/ct_w4a8_registration.py',
+    'dsv41_activation.py': 'features/dsv41/dsv41_activation.py',
+    'dsv41_channel_fp8.py': 'features/dsv41/dsv41_channel_fp8.py',
+    'dsv41_dspark_registration.py': 'features/dsv41/dsv41_dspark_registration.py',
+    'hcu_config.py': 'infra/hcu_config.py',
+}
 
 
 def component_wheel(distribution, *, version=None, requirement=None, extra=None,
-                    missing_native=False, metadata_name=None, omit=()):
+                    missing_native=False, metadata_name=None, omit=(), modern=False):
     host = distribution == 'hcu-adapter'
     version = version or (HOST_VERSION if host else KERNEL_VERSION)
     namespace = distribution.replace('-', '_')
@@ -36,6 +45,12 @@ def component_wheel(distribution, *, version=None, requirement=None, extra=None,
             b'BACKEND_CATALOG = {"vllm_pcp_q_rope": {"backends": '
             b'{"hcu": {"status": "candidate"}}}}\n')
         payload['sitecustomize.py'] = b'# reviewed bootstrap\n'
+        payload['hcu_adapter/kernels/pcp_rope_policy.py'] = b'# PCP policy companion\n'
+        payload['hcu_adapter/bridges/vllm_cli.py'] = b'# CLI companion\n'
+        if modern:
+            payload['hcu_adapter/infra/__init__.py'] = b'# must not import\n'
+            for old, new in RELOCATED.items():
+                payload['hcu_adapter/' + new] = payload.pop('hcu_adapter/' + old)
     elif not missing_native:
         payload['sgl_kernel/native_ops.cpython-312-x86_64-linux-gnu.so'] = b'native fixture, not device evidence'
     meta = 'Name: ' + (metadata_name or distribution) + '\nVersion: ' + version + '\n'
@@ -95,6 +110,35 @@ class PairFixture:
 
 
 class PairedPreparationTests(PairFixture, unittest.TestCase):
+    def test_preparation_accepts_current_relocated_adapter_without_importing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = self.prepare(Path(directory), host=component_wheel('hcu-adapter', modern=True))
+            self.assertEqual(len(report['wheels']), 3)
+            host = next(w for w in report['wheels'] if w['distribution'] == 'hcu-adapter')
+            self.assertIn('hcu_adapter/infra/hcu_config.py', host['payload_sha256'])
+            self.assertNotIn('hcu_adapter/hcu_config.py', host['payload_sha256'])
+
+    def test_preparation_requires_policy_and_cli_companions_in_both_layouts(self):
+        for modern in (False, True):
+            for name in ('kernels/pcp_rope_policy.py', 'bridges/vllm_cli.py'):
+                with self.subTest(modern=modern, name=name), tempfile.TemporaryDirectory() as directory, self.assertRaises(C.CandidateError):
+                    self.prepare(Path(directory), host=component_wheel('hcu-adapter', modern=modern, omit=('hcu_adapter/' + name,)))
+
+    def test_partial_new_layout_never_falls_back_to_legacy_seams(self):
+        for old, new in RELOCATED.items():
+            with self.subTest(path=new), tempfile.TemporaryDirectory() as directory, self.assertRaises(C.CandidateError):
+                self.prepare(Path(directory), host=component_wheel('hcu-adapter', modern=True,
+                    omit=('hcu_adapter/' + new,), extra={'hcu_adapter/' + old: b'# stale legacy fallback\n'}))
+
+    def test_namespace_package_selects_new_layout_and_checks_its_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.prepare(Path(directory), host=component_wheel('hcu-adapter', modern=True,
+                omit=('hcu_adapter/infra/__init__.py',)))
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(C.CandidateError):
+            self.prepare(Path(directory), host=component_wheel('hcu-adapter', modern=True, extra={
+                'hcu_adapter/infra/hcu_config.py': b'BACKEND_CATALOG = {}\n',
+                'hcu_adapter/hcu_config.py': b'BACKEND_CATALOG = {"vllm_pcp_q_rope": {"backends": {"hcu": {"status": "candidate"}}}}\n'}))
+
     def test_preparation_rejects_missing_dspark_and_unregistrable_pcp_q(self):
         cases = [
             component_wheel('hcu-adapter', omit=('hcu_adapter/kernels/pcp_dspark.py',)),
@@ -216,6 +260,42 @@ class InstalledPairTests(PairFixture, unittest.TestCase):
             self.assertTrue(result['prepared_payload_verified'])
             self.assertEqual(set(result['installed_records']), set(owners))
             self.assertFalse(result['model_qualified'])
+
+    def test_installed_relocated_pair_retains_record_and_prepared_byte_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site, report, owners = self.installed(Path(directory), host=component_wheel('hcu-adapter', modern=True))
+            self.assertTrue(self.inspect(report, owners)['prepared_payload_verified'])
+            path = site / 'hcu_adapter/infra/hcu_config.py'
+            path.write_bytes(path.read_bytes() + b'# drift\n')
+            with self.assertRaisesRegex(C.CandidateError, 'RECORD differs'):
+                self.inspect(report, owners)
+            self.rewrite_record(site, 'hcu-adapter')
+            with self.assertRaisesRegex(C.CandidateError, 'prepared wheel'):
+                self.inspect(report, owners)
+
+    def test_installed_required_seams_must_belong_to_hashed_record(self):
+        for name in ('kernels/pcp_rope_policy.py', 'bridges/vllm_cli.py'):
+            for unhashed in (False, True):
+                with self.subTest(name=name, unhashed=unhashed), tempfile.TemporaryDirectory() as directory:
+                    site, _, owners = self.installed(Path(directory))
+                    record, = site.glob('hcu_adapter-*.dist-info/RECORD')
+                    rows = list(csv.reader(io.StringIO(record.read_text())))
+                    rows = [([row[0], '', ''] if unhashed else None)
+                            if row[0] == 'hcu_adapter/' + name else row for row in rows]
+                    stream = io.StringIO()
+                    csv.writer(stream, lineterminator='\n').writerows(row for row in rows if row is not None)
+                    record.write_text(stream.getvalue())
+                    with patch.object(metadata, 'distributions', return_value=list(owners.values())), patch.object(metadata, 'distribution', side_effect=owners.__getitem__), patch.object(C, 'architectures') as arch, self.assertRaises(C.CandidateError):
+                        C.inspect_image()
+                    arch.assert_not_called()
+
+    def test_unrecorded_infra_namespace_cannot_redirect_installed_legacy_owners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site, _, owners = self.installed(Path(directory))
+            (site / 'hcu_adapter/infra').mkdir()
+            with patch.object(metadata, 'distributions', return_value=list(owners.values())), patch.object(metadata, 'distribution', side_effect=owners.__getitem__), patch.object(C, 'architectures') as arch, self.assertRaises(C.CandidateError):
+                C.inspect_image()
+            arch.assert_not_called()
 
     def test_installed_legacy_catalog_refuses_before_native_inspection_with_valid_record(self):
         with tempfile.TemporaryDirectory() as directory:
