@@ -63,6 +63,11 @@ class HYV4FlashMoE(HYV4MoEFused):
                 quant_config=quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
+            # Dynamic activation quantization is nonlinear: sum TP partials
+            # before the replicated up projection. The HCU runner also reduces
+            # shared partials into the same domain and skips the final reduce.
+            if is_hcu_platform():
+                up._hcu_fuse_shared_and_routed_tp_all_reduce = True
         if config.flash_w4a8_backend == "adapter_reference":
             from .w4a8 import HYV4FlashW4A8Config
 

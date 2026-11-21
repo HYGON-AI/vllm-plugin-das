@@ -196,6 +196,14 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
                 raise ValueError("DFly heads and FFN widths must be divisible by TP")
         if self.draft_tensor_parallel_size not in (None, parallel.tensor_parallel_size):
             raise ValueError("DFly draft must use target TP")
+        # Draft config and weights must describe the very same target revision.
+        # Core v0.33 does not fill these speculative fields from EngineArgs.
+        for field in ("revision", "code_revision"):
+            target_revision = getattr(target, field, None)
+            requested_revision = getattr(self, field)
+            if requested_revision not in (None, target_revision):
+                raise ValueError(f"DFly {field} must match the target checkpoint")
+            setattr(self, field, target_revision)
         self.model = target.model_weights or target.model
         self.quantization = target.quantization
         self.enforce_eager = True

@@ -96,19 +96,20 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         max_frames = options.get("max_frames", processor.max_frames)
         side = options.get("video_max_image_size", processor.video_max_image_size)
         available = max(1, seq_len // max(1, sum(mm_counts.values())))
-        best = (
-            0,
-            1,
-            config.patch_size * config.spatial_merge_size,
-            config.patch_size * config.spatial_merge_size,
-        )
-        for frames in range(1, min(max_frames, available) + 1):
+        # Spatially compressed video has no single-frame encoding. Search
+        # only legal shapes, including when the available token budget is tiny.
+        min_frames = 2 if config.spatial_patch_size != 1 else 1
+        if max_frames < min_frames:
+            raise ValueError("Video max_frames cannot represent the vision configuration")
+        factor = config.patch_size * config.spatial_merge_size * config.spatial_patch_size
+        best = (0, min_frames, factor, factor)
+        for frames in range(min_frames, min(max_frames, available) + 1):
             height, width = adaptive_resize(
                 side,
                 side,
                 frames,
                 config.patch_size,
-                config.spatial_merge_size,
+                config.spatial_merge_size * config.spatial_patch_size,
                 maximum,
                 side,
                 options.get(
@@ -155,14 +156,16 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
 
     def get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
         size = self.info.get_image_size_with_most_features()
-        frames, height, width = self.info.get_dummy_video_shape(seq_len, mm_counts)
-        videos = self._get_dummy_videos(
-            width=width,
-            height=height,
-            num_frames=frames,
-            num_videos=mm_counts.get("video", 0),
-            overrides=mm_options.get("video"),
-        )
+        videos = []
+        if mm_counts.get("video", 0):
+            frames, height, width = self.info.get_dummy_video_shape(seq_len, mm_counts)
+            videos = self._get_dummy_videos(
+                width=width,
+                height=height,
+                num_frames=frames,
+                num_videos=mm_counts["video"],
+                overrides=mm_options.get("video"),
+            )
         return {
             "image": self._get_dummy_images(
                 width=size.width,
