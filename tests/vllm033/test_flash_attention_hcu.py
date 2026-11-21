@@ -88,12 +88,15 @@ def _reference_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     groups = query.shape[1] // key.shape[1]
     expanded_key = key.repeat_interleave(groups, dim=1).float()
     expanded_value = value.repeat_interleave(groups, dim=1).float()
     scores = torch.einsum("qhd,khd->qhk", query.float(), expanded_key)
     scores *= 1.0 / math.sqrt(query.shape[-1])
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
     query_positions = key.shape[0] - query.shape[0] + torch.arange(
         query.shape[0], device=query.device
     )
@@ -187,6 +190,7 @@ def _e5m2_round_trip(tensor: torch.Tensor) -> torch.Tensor:
     ),
 )
 @pytest.mark.parametrize("explicit_kv_dtype", (False, True))
+@pytest.mark.parametrize("softcap", (0.0, 0.5))
 @torch.inference_mode()
 def test_hcu_writer_to_vendor_varlen_matches_reference(
     layout_name,
@@ -196,6 +200,7 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
     num_kv_heads,
     dtype,
     explicit_kv_dtype,
+    softcap,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
 
@@ -263,12 +268,13 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
         max_seqlen_k=kv_len,
         softmax_scale=1.0 / math.sqrt(head_size),
         causal=True,
+        softcap=softcap,
         block_table=torch.full(
             (1, 1), cache_block, device=device, dtype=torch.int32
         ),
         fa_version=2,
     )
-    expected = _reference_attention(query, key, value)
+    expected = _reference_attention(query, key, value, softcap)
 
     torch.testing.assert_close(output, expected, atol=1.6e-2, rtol=1.6e-2)
 
@@ -276,11 +282,13 @@ def test_hcu_writer_to_vendor_varlen_matches_reference(
 @pytest.mark.parametrize("layout_name", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("explicit_kv_dtype", (False, True))
+@pytest.mark.parametrize("softcap", (0.0, 0.5))
 @torch.inference_mode()
 def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
     layout_name,
     dtype,
     explicit_kv_dtype,
+    softcap,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
 
@@ -342,6 +350,7 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
             max_seqlen_k=kv_len,
             softmax_scale=1.0 / math.sqrt(head_size),
             causal=True,
+            softcap=softcap,
             block_table=block_table,
         )
 
@@ -356,7 +365,7 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
         run()
     torch.cuda.synchronize()
 
-    expected_first = _reference_attention(query, key, value)
+    expected_first = _reference_attention(query, key, value, softcap)
     graph.replay()
     torch.cuda.synchronize()
     first_output = output.clone()
@@ -367,7 +376,7 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
     query.copy_(torch.randn_like(query))
     key.copy_(torch.randn_like(key))
     value.copy_(torch.randn_like(value))
-    expected_second = _reference_attention(query, key, value)
+    expected_second = _reference_attention(query, key, value, softcap)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -394,6 +403,7 @@ def test_hcu_writer_and_vendor_varlen_replay_with_changed_graph_inputs(
         )
     ),
 )
+@pytest.mark.parametrize("softcap", (0.0, 0.5))
 @torch.inference_mode()
 def test_hcu_e5m2_writer_to_vendor_varlen_matches_quantized_reference(
     layout_name,
@@ -401,6 +411,7 @@ def test_hcu_e5m2_writer_to_vendor_varlen_matches_quantized_reference(
     kv_len,
     num_query_heads,
     num_kv_heads,
+    softcap,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
 
@@ -476,6 +487,7 @@ def test_hcu_e5m2_writer_to_vendor_varlen_matches_quantized_reference(
         max_seqlen_k=kv_len,
         softmax_scale=1.0 / math.sqrt(head_size),
         causal=True,
+        softcap=softcap,
         block_table=torch.full(
             (1, 1), cache_block, device=device, dtype=torch.int32
         ),
@@ -483,7 +495,7 @@ def test_hcu_e5m2_writer_to_vendor_varlen_matches_quantized_reference(
         v_descale=descale,
         fa_version=2,
     )
-    expected = _reference_attention(query, quantized_key, quantized_value)
+    expected = _reference_attention(query, quantized_key, quantized_value, softcap)
 
     torch.testing.assert_close(output, expected, atol=3.0e-2, rtol=3.0e-2)
 
@@ -545,8 +557,9 @@ def test_hcu_e5m2_writer_supports_per_head_scales(layout_name):
 
 
 @pytest.mark.parametrize("layout_name", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("softcap", (0.0, 0.5))
 @torch.inference_mode()
-def test_hcu_e5m2_writer_and_vendor_replay_changed_graph_inputs(layout_name):
+def test_hcu_e5m2_writer_and_vendor_replay_changed_graph_inputs(layout_name, softcap):
     import vllm._C_stable_libtorch  # noqa: F401
 
     torch.manual_seed(89)
@@ -609,6 +622,7 @@ def test_hcu_e5m2_writer_and_vendor_replay_changed_graph_inputs(layout_name):
             max_seqlen_k=kv_len,
             softmax_scale=1.0 / math.sqrt(head_size),
             causal=True,
+            softcap=softcap,
             block_table=block_table,
             k_descale=descale,
             v_descale=descale,
@@ -629,6 +643,7 @@ def test_hcu_e5m2_writer_and_vendor_replay_changed_graph_inputs(layout_name):
         query,
         _e5m2_round_trip(key),
         _e5m2_round_trip(value),
+        softcap,
     )
     graph.replay()
     torch.cuda.synchronize()
@@ -647,6 +662,7 @@ def test_hcu_e5m2_writer_and_vendor_replay_changed_graph_inputs(layout_name):
         query,
         _e5m2_round_trip(key),
         _e5m2_round_trip(value),
+        softcap,
     )
     graph.replay()
     torch.cuda.synchronize()

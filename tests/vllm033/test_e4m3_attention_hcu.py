@@ -34,12 +34,13 @@ def poison_allocations():
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("dim", (64, 128, 192, 256))
-@pytest.mark.parametrize("nq,chunked,wants_lse", (
-    ((3, 11), False, True), ((1, 1), False, False),
-    ((1, 1), False, True), ((3, 11), True, True), ((0, 14), True, True)))
+@pytest.mark.parametrize("nq,chunked,wants_lse,softcap", (
+    ((3, 11), False, True, 0.0), ((1, 1), False, False, 0.0),
+    ((1, 1), False, True, 0.0), ((3, 11), True, True, 0.0), ((0, 14), True, True, 0.0),
+    ((3, 11), False, False, 0.5), ((1, 1), False, False, 0.5)))
 @torch.inference_mode()
 def test_native_e4m3_writer_reader_graph(
-    monkeypatch, poison_allocations, layout, dtype, dim, nq, chunked, wants_lse,
+    monkeypatch, poison_allocations, layout, dtype, dim, nq, chunked, wants_lse, softcap,
 ):
     import vllm._C_stable_libtorch  # noqa: F401
     if chunked:
@@ -79,7 +80,7 @@ def test_native_e4m3_writer_reader_graph(
             cu_seqlens_q=cu, seqused_k=lengths, max_seqlen_q=max_q,
             max_seqlen_k=max(nk), softmax_scale=dim ** -.5, causal=True,
             block_table=table, k_descale=ks, v_descale=vs,
-            return_softmax_lse=wants_lse)
+            return_softmax_lse=wants_lse, softcap=softcap)
         assert (result[0] if isinstance(result, tuple) else result) is output
         if wants_lse:
             assert isinstance(result, tuple) and result[1].shape == (h, sum(nq))
@@ -95,7 +96,7 @@ def test_native_e4m3_writer_reader_graph(
                 actual = written[slots[b] // page, slots[b] % page]
                 assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
             expected = _reference(q[start:start+n], quant_k[:used_nk[b]].float() * ks[b, :, None],
-                                  quant_v[:used_nk[b]].float() * vs[b, :, None])
+                                  quant_v[:used_nk[b]].float() * vs[b, :, None], softcap=softcap)
             torch.testing.assert_close(output[start:start+n].float(), expected, atol=.025, rtol=.025)
             if lse:
                 # Independently check returned log-normalizers as well as output.

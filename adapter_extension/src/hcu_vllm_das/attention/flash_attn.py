@@ -39,12 +39,89 @@ def _layout_name(layout: KVCacheLayout) -> str:
     return getattr(layout, "name", str(layout))
 
 
+def _has_core_tensor_descales(kwargs: dict[str, Any]) -> bool:
+    """Recognize scalar storage without reading scale values or synchronizing."""
+    query, key = kwargs["q"], kwargs["k"]
+    batch = kwargs["cu_seqlens_q"].shape[0] - 1
+    kv_heads = key.shape[1] if kwargs["layout"] == "bhsd" else key.shape[2]
+    if batch < 1 or query.shape[1] % kv_heads or query.stride(-1) != 1:
+        return False
+    for name in ("k_descale", "v_descale"):
+        scale = kwargs.get(name)
+        if (not isinstance(scale, torch.Tensor) or scale.device != query.device
+                or scale.dtype != torch.float32):
+            return False
+        if scale.numel() != 1 and not (
+            scale.shape == (batch, kv_heads)
+            and all(size <= 1 or stride == 0 for size, stride in zip(scale.shape, scale.stride()))
+        ):
+            return False
+    return True
+
+
+def _triton_softcap_attention(**kwargs: Any) -> torch.Tensor:
+    """Use Core's softcap/window implementation over existing paged views."""
+    if kwargs.get("return_softmax_lse") or kwargs.get("return_attn_probs"):
+        raise NotImplementedError("Core softcap path does not return attention statistics")
+    if kwargs.get("q_descale") is not None:
+        raise ValueError("Core softcap path requires unquantized queries")
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    key, value = kwargs["k"], kwargs["v"]
+    if kwargs["layout"] == "bhsd":
+        key, value = key.transpose(1, 2), value.transpose(1, 2)
+    quantization = {}
+    if any(kwargs.get(name) is not None for name in ("k_descale", "v_descale")):
+        if not _has_core_tensor_descales(kwargs):
+            raise ValueError("Core softcap path requires scalar or broadcast layer descales")
+        if (kwargs["q"].dtype not in (torch.bfloat16, torch.float16)
+                or key.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                or value.dtype != key.dtype):
+            raise ValueError("Core scaled softcap requires BF16/FP16 queries and typed FP8 KV")
+        from vllm.v1.kv_cache_interface import KVQuantMode
+
+        # Core's per-tensor mode rounds dequantized KV to Q's dtype before
+        # QK. Its token/head mode instead scales scores in FP32 and weights
+        # before PV. A layer scalar is a constant token/head scale cache:
+        # zero strides preserve its device storage without allocating a cache
+        # or reading values on the host, including during Graph replay.
+        quantization.update(
+            kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD,
+            k_scale_cache=kwargs["k_descale"].as_strided(key.shape[:3], (0, 0, 0)),
+            v_scale_cache=kwargs["v_descale"].as_strided(value.shape[:3], (0, 0, 0)),
+        )
+    output = kwargs.get("out")
+    if output is None:
+        output = torch.empty_like(kwargs["q"])
+    scale = kwargs.get("softmax_scale")
+    unified_attention(
+        q=kwargs["q"], k=key, v=value, out=output,
+        cu_seqlens_q=kwargs["cu_seqlens_q"],
+        max_seqlen_q=kwargs["max_seqlen_q"],
+        seqused_k=kwargs["seqused_k"], max_seqlen_k=kwargs["max_seqlen_k"],
+        softmax_scale=kwargs["q"].shape[-1] ** -0.5 if scale is None else scale,
+        causal=kwargs.get("causal", False),
+        window_size=kwargs.get("window_size") or (-1, -1),
+        block_table=kwargs["block_table"], softcap=kwargs.get("softcap", 0.0),
+        q_descale=None, k_descale=None, v_descale=None,
+        alibi_slopes=kwargs.get("alibi_slopes"),
+        **quantization,
+    )
+    return output
+
+
 def _e5m2_byte_view(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.element_size() != 1:
         raise ValueError("HCU E5M2 FlashAttention requires one-byte K/V storage")
     if tensor.dtype == torch.float8_e5m2:
         return tensor
     return tensor.view(torch.float8_e5m2)
+
+
+def _e4m3_cache_view(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.element_size() != 1:
+        raise ValueError("HCU E4M3 requires one-byte K/V storage")
+    return tensor.view(torch.float8_e4m3fn)
 
 
 def _reshape_and_cache_e5m2(
@@ -146,8 +223,12 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
-        if attn_type != "decoder" or sliding_window is not None or sinks is not None:
-            raise NotImplementedError("HCU Flash supports full decoder attention only")
+        if attn_type != "decoder" or sinks is not None:
+            raise NotImplementedError("HCU Flash supports decoder attention without sinks")
+        if sliding_window is not None and (
+            type(sliding_window) is not int or sliding_window <= 0
+        ):
+            raise ValueError("HCU Flash requires a positive integer sliding window")
         if self.dcp_world_size != 1 or self.pcp_world_size != 1:
             raise NotImplementedError("HCU Flash does not support context parallelism")
         if not HcuFlashAttentionBackend.supports_head_size(head_size):
@@ -169,6 +250,11 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             else None
         )
         self.logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
+        # Match Core's causal convention: the current token counts in the
+        # requested window, so a window of one sees no preceding tokens.
+        self.sliding_window = (
+            (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        )
         # Both vendor paths consume unquantized BF16/FP16 Q. Keep the public
         # base's fusion support disabled: native fused writers use another ABI.
         self.supports_quant_query_input = False
@@ -225,7 +311,7 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             softmax_scale=self.scale,
             causal=True,
             alibi_slopes=self.alibi_slopes,
-            window_size=(-1, -1),
+            window_size=self.sliding_window,
             softcap=self.logits_soft_cap,
             q_descale=None,
             k_descale=layer._k_scale.expand(descale_shape) if uses_fp8 else None,
@@ -276,6 +362,11 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         if self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE:
             from vllm._custom_ops import reshape_and_cache_flash
 
+            if self.kv_cache_dtype == _E4M3_KV_CACHE_DTYPE and key.dtype == torch.float16:
+                # The native half specialization rounds x/scale back to half
+                # before converting to FP8. Use its FP32 input specialization
+                # to avoid that extra rounding, retaining native quantize/scatter.
+                key, value = key.float(), value.float()
             reshape_and_cache_flash(
                 key,
                 value,
@@ -304,6 +395,31 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 raise NotImplementedError(
                     f"HCU FlashAttention FA2 does not support {name}"
                 )
+        if (kwargs.get("softcap", 0.0) > 0
+                or kwargs.get("window_size", (-1, -1)) != (-1, -1)):
+            # Preserve both softcap and the exact causal window using Core;
+            # do not depend on the vendor direct-paged path's mask support.
+            kwargs["layout"] = (
+                "bhsd" if self.kv_cache_layout == KVCacheLayout.LBHNC else "bshd"
+            )
+            if self.kv_cache_dtype in (_E5M2_KV_CACHE_DTYPE, _E4M3_KV_CACHE_DTYPE):
+                cache_view = (
+                    _e4m3_cache_view
+                    if self.kv_cache_dtype == _E4M3_KV_CACHE_DTYPE
+                    else _e5m2_byte_view
+                )
+                kwargs["k"] = cache_view(kwargs["k"])
+                kwargs["v"] = cache_view(kwargs["v"])
+                if _has_core_tensor_descales(kwargs):
+                    # Broadcast the layer scales through Core's token/head
+                    # scale API; avoid rounding dequantized K or scaling Q.
+                    return _triton_softcap_attention(**kwargs)
+                # Preserve nonuniform batch/head scale semantics. Core's
+                # per-tensor mode loads only the first scalar.
+                from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
+
+                return run_e5m2_attention(_triton_softcap_attention, kwargs)
+            return _triton_softcap_attention(**kwargs)
         if (getattr(self, "_prefill_gather_enabled", False)
                 and self.kv_cache_dtype != _E5M2_KV_CACHE_DTYPE):
             from hcu_vllm_das.attention import prefill_gather
@@ -338,9 +454,7 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             from hcu_vllm_das.attention.e4m3_attention import run_e4m3_attention
 
             for name in ("k", "v"):
-                if kwargs[name].element_size() != 1:
-                    raise ValueError("HCU E4M3 requires one-byte K/V storage")
-                kwargs[name] = kwargs[name].view(torch.float8_e4m3fn)
+                kwargs[name] = _e4m3_cache_view(kwargs[name])
             return run_e4m3_attention(_vendor_varlen_func(), kwargs)
         if (
             self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
@@ -396,7 +510,7 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
         device_capability: Any,
     ) -> str | None:
         if use_mla or has_sink or use_sparse or use_mm_prefix:
-            return "HCU Flash supports ordinary full decoder attention only"
+            return "HCU Flash supports ordinary decoder attention only"
         return None
 
     @classmethod
@@ -425,7 +539,7 @@ class HcuFlashAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_non_causal(cls) -> bool:

@@ -29,6 +29,28 @@ The kernel page is 64
 tokens. It neither copies nor replaces the official Flash forward method and
 does not require private HCU hooks in the Core.
 
+Positive `logits_soft_cap` uses Core's unchanged Triton attention over the same
+paged cache views, because the vendor paged path ignores softcap. See
+[softcap routing and validation](../docs/validation/vllm033-softcap.md).
+For explicit E4M3 and E5M2 caches, the Plugin preserves the format's typed
+view. Scalar FP32 layer descales use zero-stride views through Core's official
+`FP8_PER_TOKEN_HEAD` scale API, preserving FP32 score scaling before softcap
+without rescaling Q/output or allocating a full scale cache. Nonuniform
+request/head scales retain the shared query/output scale adapter.
+
+FP16 inputs written to an E4M3 cache use the existing native writer's FP32
+input specialization to avoid an extra half-precision rounding step. This
+allocates two temporary FP32 input tensors; their cost follows the supplied
+input shapes, including padded rows. Quantization and scatter remain native.
+
+Causal sliding windows also use the same official Core attention path, with
+`(window - 1, 0)` bounds, including when softcap is zero. Full attention with
+zero softcap retains its vendor route. The scheduler, sliding-cache manager,
+metadata builder and model layer policy remain owned by Core. Sink, noncausal,
+RSWA and context-parallel attention remain outside this provider's capability.
+Component coverage and pretrained Gemma2 qualification are tracked separately
+in the softcap validation record; enabling a capability is not an accuracy pass.
+
 ## V4.1 indexer cache default
 
 With the paired Adapter's V4.1 default policy, `indexer_kv_dtype=auto` resolves

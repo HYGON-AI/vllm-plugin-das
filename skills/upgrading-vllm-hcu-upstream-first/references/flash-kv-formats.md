@@ -22,6 +22,80 @@ changed-input Graph and applicable head sizes. A component pass still needs
 the same-checkpoint BF16-KV model comparison and original HumanEval protocol;
 retain raw scores and shutdown failures independently.
 
+A KV-dtype pair on the same Plugin measures a different change from an
+official-versus-Plugin pair at one fixed dtype. Retain both scopes; neither
+substitutes for the other. Compare per-task pass sets as well as scores:
+equal totals can hide a lost task offset by a gained task. Inspect the saved
+program and isolated checker result before attributing a loss to formatting
+or a kernel. Repeat the original full baseline cohort when characterizing
+default-serving variation, preserving the first candidate failure. An exit
+within the existing grace can still emit native leak diagnostics; record
+those separately from forced cleanup and normal lifecycle qualification.
+
+For a token-choice regression, compare both saved continuation histories with
+teacher-forced prompt logprobs before assigning the cause to decode. Verify
+tokenization boundaries; retokenized text is not the original emitted token ID
+stream. Warmed-prefix probes need actual cache-hit counts to establish a
+single-query call. Isolate a reader substitution over the same writer, typed
+cache and scales, and trace its execution. A restored choice establishes reader
+sensitivity, not a kernel defect, full-model recovery or accuracy acceptance;
+use the same captured inputs and an independent numerical reference next.
+
+When public responses preserve prompt and generated IDs, replay those integer
+arrays directly and bind source response hashes; verify current chat rendering
+still matches saved prompt IDs. Re-tokenizing answer text loses that exact
+history guarantee. Keep teacher-forced and warmed-prefix geometry distinct
+from the original concurrent free-running cohort.
+
+A whole Plugin installation can also register non-attention operators. When
+isolating an attention regression, an additional Plugin/official-backend
+control can distinguish registration effects from the requested backend path.
+Observe actual layer implementations, operator forwards, resolved layouts and
+kernel traces. Fresh services may autotune identical generated reduction
+source to different tiles and round differently. Retain selected tuning
+configurations and compare a fresh unchanged-path repeat before assigning
+a probability change to an OOT class. Narrowing a probability difference
+to one service path does not
+establish a defective native kernel or waive the original model loss. See the
+[BF16 code-pair and owner-isolation record](../../../docs/validation/vllm033-flash-bf16-owner-isolation.md).
+
+Validate positive softcap separately from ordinary FP8 attention. A vendor
+paged path can accept the argument while ignoring it. When routing softcap to
+Core's official attention, cover every advertised cache dtype: preserve E4M3
+and E5M2 typed views and apply their descales exactly once. Inspect the exact
+Core's scale arithmetic before choosing its mode. Its v0.33
+`FP8_PER_TENSOR` kernel scales FP32 KV tiles but then rounds them to Q's dtype;
+non-power-of-two scales can lose the original attention tolerance. The official
+`FP8_PER_TOKEN_HEAD` path instead scales FP32 scores before softcap and weights
+before PV. A genuine scalar layer scale can use this API through a zero-stride
+`[blocks, page, KV heads]` view of its original device storage, without a scale
+cache allocation, host value read or Q/output rescale. Preserve typed FP8 views
+and verify fixed-address, changing-scale Graph replays. Nonuniform request/head
+scales are a different contract; do not collapse them to a scalar or a shared
+physical-block scale cache. Retain an independent FP32 reference and unchanged
+tolerances, including scales that are not powers of two. Check native writer rounding separately from
+reader scaling: a half-input specialization may round `x/scale` to half before
+FP8 conversion while a BF16/FP32 specialization does not. Compare raw written
+bytes to independent FP32 quantization before attributing an attention error.
+If an admitted native FP32-input specialization is used to preserve precision,
+retain native quantize/scatter, account for active-token conversion scratch and
+validate changed-input/scale Graph replay and performance for that route.
+Exercise public forward dispatch,
+prefill-gather on/off, non-unit scales and changed-input Graph replay in both
+layouts. Core owns the softcap algorithm; a provider fallback does not prove
+the vendor implements it or qualify model accuracy.
+
+For pretrained softcap checkpoints, inspect per-layer attention policy too.
+Gemma2 alternates full and sliding layers; a full-attention synthetic fixture
+does not establish that combination. Preserve the requested window and Core's
+cache manager rather than removing the model's sliding configuration. Translate
+a causal window W to `(W - 1, 0)` and test W=1, a boundary-crossing small window
+and the checkpoint window. Cover finite windows with both zero and positive
+softcap, native cache writes, FP8 scales, ragged/empty rows and changed-input
+Graph against an independently masked reference. Mask support in a contiguous
+vendor path does not establish paged-window correctness. Reusing official Core
+attention through the Plugin boundary keeps the model and scheduler upstream.
+
 Bound temporary bytes as well as token counts. A batch-times-maximum-context
 gather can reserve every short decode row at one long prefill's length; count
 both FP8 gathers and both converted tensors while they coexist. Group sequences
@@ -54,6 +128,24 @@ records an E4M3 raw loss despite equal normalized totals and passing Graph/prefi
 probes. Its unchanged full-cohort BF16 repeat preserves the failing-task boundary;
 neither that repeat nor normal process exits waive accuracy or native-owner leaks.
 
+
+For a sliding-window model, include sequence positions on both sides of the
+window boundary and changed concurrent prefix repeats. Preserve exact integer
+prompts and generated tokens, inspect each layer's actual window/softcap/cache
+policy, and record prefix-hit counters plus actual Graph/kernel traces. A long
+prompt can still reuse cached blocks; distinguish its total sequence length
+from the uncached prefill length instead of calling every first-wave request
+cold. State which request waves the profile captures. Short key-retrieval probes
+supplement the original model evaluation and do not establish long uncached
+prefill, cache reclamation or accuracy/lifecycle acceptance.
+
+When replaying observed tuning choices as a diagnostic, retain the official
+cache key/config-hash validation and verify cache hits plus actual selected
+worker launchers before and after requests. Frozen objects may be absent
+from GC enumeration; inspect the compiler-owned module references without
+unfreezing GC or reloading kernels. For a single-choice control, verify all
+other effective configurations and generated-source identities remain fixed.
+Such sequential controls do not replace the original concurrent model cohort.
 For a pretrained startup launch failure after successful weight loading and partial
 Graph capture, retain that original failed cohort. A small probe with matching
 head/GQA geometry may still pass: compare the actual failing tensor shapes,
