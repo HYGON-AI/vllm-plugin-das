@@ -410,6 +410,10 @@ class HYV4DFlyForCausalLM(nn.Module):
             dtype = (
                 param.dtype
                 if param.dtype == torch.float8_e4m3fn
+                # CT W8A8 serializes dense/DFly linear weights as INT8.
+                # Preserve that storage contract, but do not relax norm,
+                # sink or other non-weight checkpoint dtype checks.
+                or (param.dtype == torch.int8 and name.endswith(".weight"))
                 or name.endswith((".weight_scale", ".weight_scale_inv"))
                 else torch.bfloat16
             )

@@ -274,3 +274,48 @@ def test_runtime_admission_is_explicit_eager_tp_only(
             scope["validate_runtime"](cfg)
     else:
         scope["validate_runtime"](cfg)
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn, torch.bfloat16])
+def test_dfly_required_dtypes_preserve_quant_weights_not_other_params(dtype):
+    from types import SimpleNamespace
+
+    tree = ast.parse((FLASH / "nvidia/dfly.py").read_text())
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_required_weights"
+    )
+    scope = {"torch": torch}
+    exec(
+        compile(
+            ast.Module(body=[method], type_ignores=[]), "<dfly-dtype-audit>", "exec"
+        ),
+        scope,
+    )
+    values = {
+        "layers.0.mlp.gate_up_proj.weight": dtype,
+        "layers.0.mlp.down_proj.weight": dtype,
+        "layers.0.mlp.down_proj.weight_scale": torch.bfloat16,
+        "layers.0.self_attn.q_b_proj.weight_scale_inv": torch.float32,
+        "layers.0.input_layernorm.weight": torch.float32,
+        "layers.0.self_attn.learnable_sink_param": torch.float32,
+        # An unexpected INT8 non-weight must not weaken BF16 auditing.
+        "layers.0.unexpected_metadata": torch.int8,
+        "layers.0.self_attn.mla_attn.k_scale": torch.float32,
+    }
+    model = SimpleNamespace(
+        named_parameters=lambda: [
+            (n, SimpleNamespace(dtype=d)) for n, d in values.items()
+        ]
+    )
+    required = scope["_required_weights"](SimpleNamespace(model=model))
+    assert required["layers.0.mlp.gate_proj.weight"] == dtype
+    assert required["layers.0.mlp.up_proj.weight"] == dtype
+    assert required["layers.0.mlp.down_proj.weight"] == dtype
+    assert required["layers.0.mlp.down_proj.weight_scale"] == torch.bfloat16
+    assert required["layers.0.self_attn.q_b_proj.weight_scale_inv"] == torch.float32
+    assert required["layers.0.input_layernorm.weight"] == torch.bfloat16
+    assert required["layers.0.self_attn.learnable_sink_param"] == torch.bfloat16
+    assert required["layers.0.unexpected_metadata"] == torch.bfloat16
+    assert "layers.0.self_attn.mla_attn.k_scale" not in required
