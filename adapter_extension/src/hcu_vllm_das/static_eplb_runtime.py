@@ -12,8 +12,9 @@ checkpoint weight is read, so this module instead
   exists and no rearrangement can run);
 * fans each logical checkpoint expert out to every physical slot the plan maps
   it to, before quantization reads the loaded parameters;
-* publishes the routing tensors Core's router reads, pinning one primary
-  replica per logical expert and disabling load recording.
+* publishes the routing tensors Core's router reads and disables load recording.
+  HY4 retains all loaded replicas for Core's token hash; V41 keeps its existing
+  primary-only dispatch contract.
 
 Scope is fail-closed: the owned PCP target model with expert parallel and a
 proposal-complete version-2 map. Anything else raises instead of silently
@@ -30,6 +31,7 @@ import torch
 
 from .static_eplb import StaticEplbPlan, load_static_eplb_plan
 from .static_eplb_dispatch import REPLICA_ORDER_BUILDERS
+from .hy4_static_scope import applies as is_hy4_static, owns_layer as owns_hy4_layer
 
 _CONFIG_KEY = 'hcu_static_eplb'
 _PLAN_ATTR = '_hcu_static_eplb_plan'
@@ -117,7 +119,6 @@ def validate_config(cfg) -> bool:
         return False
     from vllm import envs
 
-    from .v41_pcp import validate_config as validate_pcp
     errors = []
     p = cfg.parallel_config
     if not p.enable_expert_parallel:
@@ -155,8 +156,19 @@ def validate_config(cfg) -> bool:
             'divide evenly')
     if errors:
         raise StaticEplbError('HCU static EPLB: ' + '; '.join(errors))
+    if is_hy4_static(cfg):
+        from .hy4_static_scope import validate_scope
+        from hcu_adapter.bridges.vllm import require_extension_healthy
+        try:
+            validate_scope(cfg, options,
+                routing_simulation=envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY)
+        except ValueError as error:
+            raise StaticEplbError(str(error)) from error
+        require_extension_healthy('hy4-static-eplb')
+        return True
     # The owned PCP target is the only reviewed placement owner; its own
     # validation raises for every unsupported topology.
+    from .v41_pcp import validate_config as validate_pcp
     if not validate_pcp(cfg):
         raise StaticEplbError(
             'HCU static EPLB requires the owned V41 PCP target model')
@@ -165,6 +177,8 @@ def validate_config(cfg) -> bool:
 
 def _backbone_layer(cfg, prefix: str) -> bool:
     """True for target backbone MoE layers; DSpark draft layers keep native EP."""
+    if is_hy4_static(cfg):
+        return owns_hy4_layer(cfg, prefix)
     from vllm.model_executor.models.utils import extract_layer_index
     return extract_layer_index(prefix) < cfg.model_config.hf_config.num_hidden_layers
 
@@ -337,7 +351,11 @@ def bind_placement(model, cfg, *, bind_weight_loaders=True):
     if moe_model.num_redundant_experts != options.num_redundant_experts:
         raise StaticEplbError(
             'static EPLB redundant expert count was not published by MoE construction')
-    plan = bound if bound is not None else load_static_eplb_plan(
+    load_plan = load_static_eplb_plan
+    if is_hy4_static(cfg):
+        from .hy4_static_plan import load_hy4_plan
+        load_plan = load_hy4_plan
+    plan = bound if bound is not None else load_plan(
         options.expert_map_path,
         model_key=resolve_model_key(moe_model),
         expected_model_name=cfg.model_config.model,
@@ -529,13 +547,13 @@ def install_routing(model, cfg):
         num_nodes=get_node_count(),
         num_physical_experts=num_physical,
     )
-    # Every token takes the primary replica in column 0; Core's mapping kernel
-    # reads exactly ``logical_replica_count`` columns per logical expert, and
-    # recording stays off because the placement never changes.
-    primary_count = torch.ones((num_layers, num_logical), dtype=torch.long,
-                               device=device)
+    # HY4 v0.25.1 keeps the placement's actual multiplicities: Core hashes token
+    # positions across those replicas, even when load recording is disabled.
+    # Publishing ones silently concentrates hot experts on column 0. Keep the
+    # already-qualified V41 primary-only contract scoped to that model.
+    replica_count = counts if is_hy4_static(cfg) else torch.ones_like(counts)
     _publish(moe_model, cfg, logical_to_physical=ordered,
-             replica_count=primary_count, num_physical=num_physical, record=False)
+             replica_count=replica_count, num_physical=num_physical, record=False)
     setattr(moe_model, _INSTALLED_ATTR, True)
     return plan
 
