@@ -139,7 +139,7 @@ def test_prepare_inputs_selects_deepep_phase_batch(
     )
     with deepep_auto_request_phase_scope():
         result = runner.prepare_inputs("scheduler-output", "batch-req-state",
-                                       SimpleNamespace(num_tokens=1))
+                                       SimpleNamespace(num_tokens=1), 0)
         expected_batch = global_batch if pcp == 1 else local_batch
         phase_batch = (global_batch if architecture == "DeepseekV4ForCausalLM"
                        else expected_batch)

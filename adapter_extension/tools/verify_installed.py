@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify an installed vLLM 0.32 adapter-das plus DAS extension stack."""
+"""Verify an installed vLLM 0.33 adapter-das plus DAS extension stack."""
 
 from __future__ import annotations
 
@@ -14,14 +14,16 @@ from packaging.version import InvalidVersion, Version
 
 
 _REQUIRED_CAPABILITIES = frozenset(
-    {"lightop-rms-norm", "aiter-int8-moe"}
+    {"lightop-rms-norm"}
 )
 _REQUIRED_OOT_CLASSES = {
     "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm",
 }
 _REQUIRED_PLATFORM = "hcu_adapter.bridges.vllm.HcuPlatform"
-_REQUIRED_INT8_EXPERT = (
-    "hcu_vllm_das.moe.int8_oracle.HcuAiterInt8Experts"
+_INT8_SYMBOLS = (
+    "Int8MoeBackend", "map_int8_backend", "backend_to_kernel_cls",
+    "select_int8_moe_backend", "convert_to_int8_moe_kernel_format",
+    "make_int8_moe_quant_config", "make_int8_moe_kernel",
 )
 
 
@@ -128,11 +130,24 @@ def _distribution_report(distribution: object, record_sha256: str) -> dict[str, 
     }
 
 
+def _adapter_owner_name():
+    from importlib.util import spec_from_file_location,module_from_spec
+    spec=spec_from_file_location('_hcu_plugin_installed_adapter_owner',
+        Path(__file__).with_name('installed_adapter_owner.py'))
+    helper=module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    try:
+        return helper.adapter_distribution_name()
+    except RuntimeError as error:
+        raise InstalledVerificationError(str(error)) from error
+
+
 def collect_attestation() -> dict[str, object]:
     """Return a fail-closed installed-state attestation."""
 
     vllm_dist, vllm_owned, vllm_record = _distribution("vllm")
-    adapter_dist, adapter_owned, adapter_record = _distribution("sgl-kernel")
+    adapter_name = _adapter_owner_name()
+    adapter_dist, adapter_owned, adapter_record = _distribution(adapter_name)
     plugin_dist, plugin_owned, plugin_record = _distribution(
         "hcu-vllm-das-plugin"
     )
@@ -142,9 +157,9 @@ def collect_attestation() -> dict[str, object]:
         raise InstalledVerificationError(
             f"installed vLLM version is invalid: {vllm_dist.version!r}"
         ) from error
-    if parsed_vllm.epoch != 0 or parsed_vllm.release[:2] != (0, 32):
+    if parsed_vllm.epoch != 0 or parsed_vllm.release[:2] != (0, 33):
         raise InstalledVerificationError(
-            "installed vLLM must satisfy >=0.32.0,<0.33.0, "
+            "installed vLLM must satisfy >=0.33.0,<0.34.0, "
             f"got {vllm_dist.version!r}"
         )
 
@@ -152,13 +167,13 @@ def collect_attestation() -> dict[str, object]:
         "vllm.platform_plugins",
         name="hcu_adapter",
         value="hcu_adapter.bridges.vllm:hcu_platform_plugin",
-        distribution="sgl-kernel",
+        distribution=adapter_name,
     )
     _require_entry_point(
         "vllm.general_plugins",
         name="hcu_adapter",
         value="hcu_adapter.bridges.vllm:hcu_runtime_plugin",
-        distribution="sgl-kernel",
+        distribution=adapter_name,
     )
     extension_point = _require_entry_point(
         "hcu_adapter.extensions",
@@ -173,10 +188,10 @@ def collect_attestation() -> dict[str, object]:
     plugin_extension = _import_module("hcu_vllm_das.extension")
     vllm_origin = _module_origin(vllm_module, vllm_owned, "vllm")
     adapter_origin = _module_origin(
-        adapter_extensions, adapter_owned, "sgl-kernel"
+        adapter_extensions, adapter_owned, adapter_name
     )
     adapter_bridge_origin = _module_origin(
-        adapter_bridge, adapter_owned, "sgl-kernel"
+        adapter_bridge, adapter_owned, adapter_name
     )
     plugin_origin = _module_origin(
         plugin_extension, plugin_owned, "hcu-vllm-das-plugin"
@@ -186,6 +201,15 @@ def collect_attestation() -> dict[str, object]:
         adapter_version=adapter_dist.version,
         vllm_version=vllm_dist.version,
     )
+    official_int8_oracle = _import_module(
+        "vllm.model_executor.layers.fused_moe.oracle.int8"
+    )
+    oracle_origin = _module_origin(official_int8_oracle, vllm_owned, "vllm")
+    before = {name: getattr(official_int8_oracle, name, None) for name in _INT8_SYMBOLS}
+    if any(value is None for value in before.values()):
+        raise InstalledVerificationError("official INT8 oracle contract unavailable")
+    if getattr(official_int8_oracle, "_hcu_vllm_das_aiter_int8_installed", False):
+        raise InstalledVerificationError("retired private INT8 oracle integration is active")
     reports = adapter_extensions.activate_extensions(context, [extension_point])
     matching = [
         report for report in reports if report.entry_point_name == "das_hcu"
@@ -236,47 +260,27 @@ def collect_attestation() -> dict[str, object]:
         _module_origin(oot_module, plugin_owned, "hcu-vllm-das-plugin")
         oot_classes[class_name] = oot_name
 
-    plugin_int8_oracle = _import_module("hcu_vllm_das.moe.int8_oracle")
-    oracle_origin = _module_origin(
-        plugin_int8_oracle,
-        plugin_owned,
-        "hcu-vllm-das-plugin",
-    )
-    official_int8_oracle = _import_module(
-        "vllm.model_executor.layers.fused_moe.oracle.int8"
-    )
-    try:
-        selected_backend = official_int8_oracle.map_int8_backend("aiter")
-        selected_classes = official_int8_oracle.backend_to_kernel_cls(
-            selected_backend
-        )
-    except Exception as error:
-        raise InstalledVerificationError(
-            f"explicit AITER INT8 selector is unavailable: {error}"
-        ) from error
+    if any(getattr(official_int8_oracle, name) is not value for name, value in before.items()):
+        raise InstalledVerificationError("DAS activation modified official INT8 oracle")
+    if "aiter-int8-moe" in capabilities:
+        raise InstalledVerificationError("unregistered AITER INT8 capability advertised")
+    selected_backend = official_int8_oracle.map_int8_backend("triton")
+    selected_classes = official_int8_oracle.backend_to_kernel_cls(selected_backend)
     backend_name = getattr(selected_backend, "value", None)
-    experts_class = getattr(plugin_int8_oracle, "HcuAiterInt8Experts", None)
-    if backend_name != "AITER" or selected_classes != [experts_class]:
-        raise InstalledVerificationError(
-            "explicit AITER INT8 selector did not resolve to the Plugin expert"
-        )
-    experts_name = (
-        f"{experts_class.__module__}.{experts_class.__qualname__}"
-        if isinstance(experts_class, type)
-        else ""
-    )
-    if experts_name != _REQUIRED_INT8_EXPERT:
-        raise InstalledVerificationError(
-            f"AITER INT8 expert has unexpected owner: {experts_name}"
-        )
+    if backend_name != "TRITON" or not selected_classes:
+        raise InstalledVerificationError("official Triton INT8 selector unavailable")
+    experts_name = f"{selected_classes[0].__module__}.{selected_classes[0].__qualname__}"
+    if not experts_name.startswith("vllm."):
+        raise InstalledVerificationError("INT8 expert is not owned by official vLLM")
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "vllm": {
             **_distribution_report(vllm_dist, vllm_record),
             "module_origin": vllm_origin,
         },
         "adapter": {
+            "distribution": adapter_name,
             **_distribution_report(adapter_dist, adapter_record),
             "module_origin": adapter_origin,
             "bridge_origin": adapter_bridge_origin,
@@ -295,6 +299,8 @@ def collect_attestation() -> dict[str, object]:
         "oot_classes": oot_classes,
         "int8_moe": {
             "backend": backend_name,
+            "official_symbols_unchanged": True,
+            "aiter_integration": "unsupported: no public INT8 expert registry",
             "experts_class": experts_name,
             "oracle_module_origin": oracle_origin,
         },

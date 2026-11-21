@@ -280,7 +280,17 @@ def test_every_hcu_marked_test_file_is_registered() -> None:
         if _contains_pytest_hcu_marker(path)
     }
     registered_files = {registration.test_file for registration in parse_registry()}
-    assert hcu_test_files <= registered_files
+    # v0.33 has an independent release runner/map, not legacy vllm_hcu jobs.
+    # Only files actually executed by that runner count toward coverage.
+    from tools.run_v033_ci import test_files as v033_test_files
+    from select_v033_tests import select_jobs as select_v033
+
+    release_files = set()
+    for tier, job_id in [("device", "v033-device-gfx936"), ("device-gfx938", "v033-device-gfx938")]:
+        for path in v033_test_files(tier):
+            assert job_id in {job["id"] for job in select_v033([path])["jobs"]}
+            release_files.add(path)
+    assert hcu_test_files <= registered_files | release_files
 
 
 def test_due_quarantine_builds_a_fail_closed_retest_job(tmp_path: Path) -> None:

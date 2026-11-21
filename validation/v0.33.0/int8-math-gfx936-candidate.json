@@ -1,0 +1,550 @@
+{
+  "target_ref": "v0.33.0",
+  "target_sha": "4ba787ec9959e566d3b587a796dff07673324da5",
+  "created_utc": "2026-11-03T14:18:59.982517+00:00",
+  "last_good": false,
+  "mr": "https://github.com/HYGON-AI/vllm-plugin-das/pull/330",
+  "production": {
+    "plugin_build_source_sha": "529855a50e509a867911839d2a2197b1db594dcd",
+    "plugin_wheel": "/data/models/vllm033-upgrade-20261103/wheels/asm-math-plugin/hcu_vllm_das_plugin-0.3.0.dev0-py3-none-any.whl",
+    "plugin_wheel_sha256": "e905ce20ef0a9025b32d478806af6c015da0863f94965f3455793297e7450925",
+    "installed_root": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/lib/python3.12/site-packages",
+    "exact_python_files": 14,
+    "core_adapter_provenance": "final033-build-provenance.json",
+    "change": "ASM uses public native sorting/GEMMs with official quantization, activation and reduction; other vendor solutions retain their prior path"
+  },
+  "diagnosis": {
+    "factorial_variants": {
+      "original": {
+        "strict_passed": 24,
+        "total": 32,
+        "max_abs_error": 0.001708984375
+      },
+      "official_quant_only": {
+        "strict_passed": 22,
+        "total": 32,
+        "max_abs_error": 0.001708984375
+      },
+      "official_activation_only": {
+        "strict_passed": 24,
+        "total": 32,
+        "max_abs_error": 0.0019073486328125
+      },
+      "official_quant_and_activation": {
+        "strict_passed": 32,
+        "total": 32,
+        "max_abs_error": 0.000244140625
+      }
+    },
+    "half_tie_example": {
+      "normalized": 0.5,
+      "vendor_int8": 0,
+      "official_int8": 1
+    },
+    "activation_example": [
+      {
+        "different_values": 68237,
+        "max_abs_error": 0.00390625,
+        "vendor_diff_from_fp64_single_round": 2,
+        "vendor_diff_from_fp64_double_round": 68237,
+        "official_diff_from_fp64_single_round": 68239,
+        "official_diff_from_fp64_double_round": 0
+      }
+    ],
+    "limits": {
+      "min_reference_rms": 0.001,
+      "max_nmae": 0.03,
+      "max_nrmse": 0.03,
+      "max_abs_error": 0.001
+    },
+    "stage_capture": "evidence/int8-ep-stages-attempt1/result.json",
+    "finding": "Quantization rule and BF16 SiLU intermediate rounding both contribute; same-input Graph/eager was already exact. External replacements are diagnostic only."
+  },
+  "installed_asm": {
+    "rows": [
+      {
+        "m": 16,
+        "layout": "linear",
+        "rank": 0,
+        "metrics": [
+          {
+            "reference_rms": 0.007021407596766949,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.00797574408352375,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.009608214721083641,
+            "nmae": 5.8779576647793874e-05,
+            "nrmse": 0.00046321580884978175,
+            "max_abs_error": 0.0001220703125
+          },
+          {
+            "reference_rms": 0.012978121638298035,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 128,
+        "layout": "linear",
+        "rank": 0,
+        "metrics": [
+          {
+            "reference_rms": 0.006594907026737928,
+            "nmae": 1.1242316588777612e-07,
+            "nrmse": 2.213844345533289e-05,
+            "max_abs_error": 6.103515625e-05
+          },
+          {
+            "reference_rms": 0.0073240334168076515,
+            "nmae": 1.2452841247068136e-07,
+            "nrmse": 2.0748488168464974e-05,
+            "max_abs_error": 6.103515625e-05
+          },
+          {
+            "reference_rms": 0.009331094101071358,
+            "nmae": 1.9716029697747217e-08,
+            "nrmse": 4.516817170951981e-06,
+            "max_abs_error": 1.52587890625e-05
+          },
+          {
+            "reference_rms": 0.012457114644348621,
+            "nmae": 1.1441885362728499e-05,
+            "nrmse": 0.00020991318160668015,
+            "max_abs_error": 0.000244140625
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 16,
+        "layout": "linear",
+        "rank": 1,
+        "metrics": [
+          {
+            "reference_rms": 0.0062706382013857365,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.006885615177452564,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.0088886683806777,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.012712753377854824,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 128,
+        "layout": "linear",
+        "rank": 1,
+        "metrics": [
+          {
+            "reference_rms": 0.006681432016193867,
+            "nmae": 1.3658819852935267e-08,
+            "nrmse": 4.460469426703639e-06,
+            "max_abs_error": 1.52587890625e-05
+          },
+          {
+            "reference_rms": 0.007085440680384636,
+            "nmae": 1.2967744211778154e-08,
+            "nrmse": 4.2061351450684015e-06,
+            "max_abs_error": 1.52587890625e-05
+          },
+          {
+            "reference_rms": 0.009367678314447403,
+            "nmae": 1.5685183143432369e-06,
+            "nrmse": 8.328768308274448e-05,
+            "max_abs_error": 0.0001220703125
+          },
+          {
+            "reference_rms": 0.012486725114285946,
+            "nmae": 2.0097422748222016e-05,
+            "nrmse": 0.0002834931656252593,
+            "max_abs_error": 0.000244140625
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 16,
+        "layout": "round-robin",
+        "rank": 0,
+        "metrics": [
+          {
+            "reference_rms": 0.0063155414536595345,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.007181829772889614,
+            "nmae": 5.08556368004065e-05,
+            "nrmse": 0.0003716622304636985,
+            "max_abs_error": 6.103515625e-05
+          },
+          {
+            "reference_rms": 0.009083147160708904,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.012192229740321636,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 128,
+        "layout": "round-robin",
+        "rank": 0,
+        "metrics": [
+          {
+            "reference_rms": 0.0065147047862410545,
+            "nmae": 2.940798893291685e-08,
+            "nrmse": 9.430827958567534e-06,
+            "max_abs_error": 3.0517578125e-05
+          },
+          {
+            "reference_rms": 0.007191328797489405,
+            "nmae": 8.544046892211554e-08,
+            "nrmse": 2.0302362827351317e-05,
+            "max_abs_error": 6.103515625e-05
+          },
+          {
+            "reference_rms": 0.009134303778409958,
+            "nmae": 8.81613999581532e-08,
+            "nrmse": 1.734139004838653e-05,
+            "max_abs_error": 6.103515625e-05
+          },
+          {
+            "reference_rms": 0.012474503368139267,
+            "nmae": 1.492981738238086e-07,
+            "nrmse": 3.310915781185031e-05,
+            "max_abs_error": 0.0001220703125
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 16,
+        "layout": "round-robin",
+        "rank": 1,
+        "metrics": [
+          {
+            "reference_rms": 0.006838661152869463,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.007637972943484783,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.009559356607496738,
+            "nmae": 0.0,
+            "nrmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          {
+            "reference_rms": 0.013352466747164726,
+            "nmae": 1.845422303858868e-07,
+            "nrmse": 2.5251871193177067e-05,
+            "max_abs_error": 6.103515625e-05
+          }
+        ],
+        "native_gemm_calls": 16
+      },
+      {
+        "m": 128,
+        "layout": "round-robin",
+        "rank": 1,
+        "metrics": [
+          {
+            "reference_rms": 0.006621509790420532,
+            "nmae": 8.127335604513064e-08,
+            "nrmse": 2.0625417164410464e-05,
+            "max_abs_error": 6.103515625e-05
+          },
+          {
+            "reference_rms": 0.007252251263707876,
+            "nmae": 6.606900360139889e-09,
+            "nrmse": 2.117930534950574e-06,
+            "max_abs_error": 7.62939453125e-06
+          },
+          {
+            "reference_rms": 0.009234093129634857,
+            "nmae": 2.4894568184663513e-08,
+            "nrmse": 7.2167367761721835e-06,
+            "max_abs_error": 3.0517578125e-05
+          },
+          {
+            "reference_rms": 0.012607444077730179,
+            "nmae": 3.1880837525477546e-08,
+            "nrmse": 9.620242053642869e-06,
+            "max_abs_error": 6.103515625e-05
+          }
+        ],
+        "native_gemm_calls": 16
+      }
+    ],
+    "ep_cases": 8,
+    "changed_graph_replays": 24,
+    "native_gemm_calls_each": 16
+  },
+  "checks": {
+    "portable_passed": 253,
+    "portable_skipped": 66,
+    "installed_int8_passed": 11,
+    "installed_int8_deprecation_warnings": 14,
+    "before_fix_m128_failed": 4,
+    "focused_cpu_passed": 43
+  },
+  "benchmark": {
+    "status": "COMPLETE",
+    "scope": "single-device warmed Graph kernel microbenchmark; not full-model speed or distributed EP",
+    "iterations_per_sample": 100,
+    "samples": 3,
+    "rows": [
+      {
+        "m": 1,
+        "ep_mapping": null,
+        "arms": {
+          "official_triton": {
+            "microseconds": [
+              54.849557876586914,
+              52.766361236572266,
+              52.542362213134766
+            ],
+            "median_us": 52.766361236572266
+          },
+          "plugin_native_asm": {
+            "microseconds": [
+              59.435157775878906,
+              59.123148918151855,
+              59.20156002044678
+            ],
+            "median_us": 59.20156002044678
+          }
+        },
+        "asm_over_official_latency": 1.121956463039454
+      },
+      {
+        "m": 1,
+        "ep_mapping": "round-robin-rank0",
+        "arms": {
+          "official_triton": {
+            "microseconds": [
+              55.398359298706055,
+              53.26876163482666,
+              53.13436031341553
+            ],
+            "median_us": 53.26876163482666
+          },
+          "plugin_native_asm": {
+            "microseconds": [
+              82.13594436645508,
+              83.31033706665039,
+              83.05753707885742
+            ],
+            "median_us": 83.05753707885742
+          }
+        },
+        "asm_over_official_latency": 1.5592165939250053
+      },
+      {
+        "m": 16,
+        "ep_mapping": null,
+        "arms": {
+          "official_triton": {
+            "microseconds": [
+              456.24767303466797,
+              456.8860626220703,
+              456.2236785888672
+            ],
+            "median_us": 456.24767303466797
+          },
+          "plugin_native_asm": {
+            "microseconds": [
+              409.0541076660156,
+              409.9053192138672,
+              408.72291564941406
+            ],
+            "median_us": 409.0541076660156
+          }
+        },
+        "asm_over_official_latency": 0.8965615209503406
+      },
+      {
+        "m": 16,
+        "ep_mapping": "round-robin-rank0",
+        "arms": {
+          "official_triton": {
+            "microseconds": [
+              250.83820343017578,
+              251.18059158325195,
+              250.68302154541016
+            ],
+            "median_us": 250.83820343017578
+          },
+          "plugin_native_asm": {
+            "microseconds": [
+              270.4494094848633,
+              270.70220947265625,
+              270.23019790649414
+            ],
+            "median_us": 270.4494094848633
+          }
+        },
+        "asm_over_official_latency": 1.0781826922155682
+      },
+      {
+        "m": 128,
+        "ep_mapping": null,
+        "arms": {
+          "official_triton": {
+            "microseconds": [
+              964.8536682128906,
+              965.3913879394531,
+              965.341796875
+            ],
+            "median_us": 965.341796875
+          },
+          "plugin_native_asm": {
+            "microseconds": [
+              870.5050659179688,
+              873.3081817626953,
+              872.0794677734375
+            ],
+            "median_us": 872.0794677734375
+          }
+        },
+        "asm_over_official_latency": 0.9033893182668865
+      },
+      {
+        "m": 128,
+        "ep_mapping": "round-robin-rank0",
+        "arms": {
+          "official_triton": {
+            "microseconds": [
+              944.5737457275391,
+              944.559326171875,
+              945.1689910888672
+            ],
+            "median_us": 944.5737457275391
+          },
+          "plugin_native_asm": {
+            "microseconds": [
+              867.5466156005859,
+              870.5130767822266,
+              868.4329223632812
+            ],
+            "median_us": 868.4329223632812
+          }
+        },
+        "asm_over_official_latency": 0.9193913405822942
+      }
+    ],
+    "tool_sha256": "cf2017dea4409a22221f616e450b952fb230dab83d2d7aadc0f7fbea06c304e3",
+    "provider_file": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/lib/python3.12/site-packages/hcu_vllm_das/moe/fused_moe_aiter.py"
+  },
+  "byte_check": {
+    "status": "PASS",
+    "exact_python_files": 14,
+    "environments": [
+      ".venv-plugin-review",
+      ".venv-acceptance"
+    ],
+    "wheel_sha256": "e905ce20ef0a9025b32d478806af6c015da0863f94965f3455793297e7450925",
+    "hybrid_profile_flash_bytes_unchanged": true
+  },
+  "cleanup": {
+    "checked_utc": "2026-11-03T14:18:19.518167+00:00",
+    "all_eight_gpu_vram_mib": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "all_owned_probes_terminal": true,
+    "old_owned_ports_still_closed": [
+      18152,
+      18153,
+      18154,
+      18155,
+      18156,
+      18157,
+      18158
+    ],
+    "gpu5_6_protected": true,
+    "other_user_processes_or_devices_modified": false,
+    "device_resets": false
+  },
+  "preserved_tool_failures": {
+    "quant_rounding_attempt1": "Uncontrolled legacy platform selection; superseded by attempt2 with explicit Adapter platform assertion",
+    "cpu_attempt1": "Four old boundary tests expected early mask conversion; updated to exercise final native stage boundary",
+    "cpu_attempt2": "New test lacked source import path; collection failed",
+    "portable_attempt1": "Incorrect Adapter source path; collection failed",
+    "portable_attempt2": "VLLM_TARGET_ROOT omitted; thirteen source-contract tests failed",
+    "wheel_attempt1": "build module unavailable; normal pip PEP517 wheel build succeeded in attempt2"
+  },
+  "artifact_sha256": {
+    "probe-int8-quant-rounding.py": "98bb02eaa90517302b8323e03656520988ae528d08f77f7aff79869ddd0e6c55",
+    "probe-int8-ep-stages.py": "08ba43de16913a6d0f54da26d13c5cb92886c312ebbceb110df71739d46b12aa",
+    "probe-int8-ep-activation.py": "2fb49e4f44a0548b6bbaba4d0326dc5f122f04a7f65e18b220ebb8a6c5571ca3",
+    "experiment-int8-asm-stages.py": "a375bcd74148425d27427aaac6cf4d4b6aebd3b002dd146dd9452bb689602555",
+    "probe-int8-asm-stages.py": "9bf968f86ab1fd6691ce24a8473d6f21f0a3f5dfe521a1a386fe9c10c488b2b6",
+    "benchmark-int8-asm-math.py": "cf2017dea4409a22221f616e450b952fb230dab83d2d7aadc0f7fbea06c304e3",
+    "evidence/int8-quant-rounding-attempt2/result.json": "37421efc410ac13e7556625603fb63a65270ae2f363db8bb9ad31ef4f48e6bda",
+    "evidence/int8-ep-stages-attempt1/result.json": "201850d4b875117f26add10217991d20f6372cf1f1d93f601cc20479b7d7dc37",
+    "evidence/int8-ep-activation-attempt1/result.json": "9d4902a00f7939fa53fbd2ed0d155c0935d680ddb07e453472b3f703f3841067",
+    "evidence/int8-asm-stages-attempt1/result.json": "3c9f295aa4e0a3abeb09ed555dab9c933dbd51504211ea16155dd514f3ad4c5e",
+    "evidence/v033-asm-ep-regression-before.log": "a3b89080e274a4391e10f5a829aaf569886ceddced4c5a34e406ef552534a60b",
+    "evidence/v033-asm-int8-hcu-after.log": "561f74f61dd18fe1d002708da48870cfd642b086e4ef190ea1d18145047cd8d8",
+    "evidence/v033-asm-full-portable-attempt3.log": "5c3783bb544790d20a5e061b93714d27298cb76d3875e51db311dd573c5c9dea",
+    "evidence/int8-asm-math-benchmark-attempt1/result.json": "945b7ba83cfb3d311168fcca0a59ebb1fad9a0dff11c4fd61217cd2eafa8ed49"
+  },
+  "limitations": [
+    "Synthetic fixed-seed operator weights, not complete model checkpoint acceptance",
+    "Unchanged vendor Triton/CK/MoE-C pipeline is not certified by ASM acceptance; earlier strict failures remain",
+    "No full W8A8 model, distributed EP, arbitrary padded/shuffled layouts, other architectures or FP16 numerical claim",
+    "Microbenchmarks are mixed: preserve explicit opt-in and do not claim universal or model speedup",
+    "E5M2 and hybrid BF16 model quality gates remain open; PR330 remains draft/unmerged",
+    "Core runtime and Adapter unchanged; no production alias rebinding or copied generic framework runner"
+  ]
+}

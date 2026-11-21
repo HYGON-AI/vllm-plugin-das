@@ -22,7 +22,6 @@ from vllm.model_executor.layers.attention.mla_attention import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
@@ -33,7 +32,7 @@ from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 from vllm_hcu.model_executor.layers.attention.lightop_concat_runtime import (
     concat_mla_decode,
 )

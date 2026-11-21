@@ -1,0 +1,20 @@
+{
+  "description": "FP8 PCP8 example with a custom gfx938 COV5 toolchain",
+  "host_ip": "192.0.2.10",
+  "model": "/llm-models/DeepSeek-V4.1-Flash-Channel-FP8",
+  "python": "/usr/local/bin/python3",
+  "eval_python": "/path/to/eval-venv/bin/python",
+  "data": "/path/to/humaneval",
+  "tuning_path": "/path/to/rocblas-tuning",
+  "kv_cache_bytes": 25769803776,
+  "idle_vram_mib": 2,
+  "runtime_env": {
+    "AITER_JIT_DIR": "/path/to/aiter-jit",
+    "AITER_CODE_OBJECT_VERSION": "5",
+    "GPU_ARCHS": "gfx938",
+    "TILELANG_CACHE_DIR": "/path/to/tilelang-cache",
+    "LD_PRELOAD": "/path/to/hip-trace.so"
+  },
+  "path_prefix": "/path/to/toolchain/bin",
+  "vendor_manifest": "/path/to/vendor-manifest.json"
+}

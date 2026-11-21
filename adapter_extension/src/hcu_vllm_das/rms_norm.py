@@ -1,15 +1,15 @@
-"""vLLM 0.32 OOT LightOp implementation of ``RMSNorm``."""
+"""Optional eager LightOp RMSNorm; compiled execution stays with vLLM IR."""
 
 from __future__ import annotations
 
 import torch
-from lightop.norm import fused_add_rms_norm, rmsnorm_forward_autograd
 
 from vllm import envs
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .environment import rms_norm_enabled
+from .extension import get_lightop_norm
 
 
 _LIGHTOP_RMS_NORM_MIN_WIDTH = 64
@@ -21,7 +21,14 @@ def _rms_norm_impl(
     variance_epsilon: float,
     training: bool,
 ) -> torch.Tensor:
-    return rmsnorm_forward_autograd(x, weight, variance_epsilon, training)
+    del training  # The vLLM operator is inference-only.
+    # vLLM's native IR rounds the normalized value before multiplying weight.
+    # The autograd export narrows epsilon to x.dtype. The public inference
+    # export retains FP32 epsilon; its default aliases x, so provide an output.
+    normalized = get_lightop_norm().rms_norm(
+        x, torch.ones_like(weight), variance_epsilon, torch.empty_like(x)
+    )
+    return normalized * weight
 
 
 def _rms_norm_fake(
@@ -40,7 +47,10 @@ def _fused_add_rms_norm_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> None:
-    fused_add_rms_norm(x, residual, weight, variance_epsilon)
+    get_lightop_norm().fused_add_rms_norm(
+        x, residual, torch.ones_like(weight), variance_epsilon
+    )
+    x.mul_(weight)
 
 
 def _fused_add_rms_norm_fake(
@@ -112,6 +122,11 @@ class HcuRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Core owns compiler precision and fusion across residual chains.
+        # Opaque eager vendor ops would force intermediate low-precision stores.
+        if torch.compiler.is_compiling():
+            return super().forward_cuda(x, residual)
+
         if not self._can_use_lightop(x, residual):
             return super().forward_cuda(x, residual)
 

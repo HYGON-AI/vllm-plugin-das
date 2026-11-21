@@ -8,6 +8,12 @@ are retained in the corresponding local files.
 
 ## vLLM Upstream Baseline
 
+The PCP inverse-RoPE integration references dyldu/vllm-plugin-das PR #5,
+commit `4a8a0bf915f009f1b77254c2a07db966173f91d2`, under Apache-2.0.
+`adapter_extension/src/hcu_vllm_das/csrc/inverse_rope.cu` carries the existing
+`vllm_hcu/csrc/fused_deepseek_v4_inv_rope_kernel.cu` from this repository at
+`d024e8db02cd95b401603b6d9b52e02433284f6a`, with its original notices retained.
+
 - Upstream repository: `https://github.com/vllm-project/vllm.git`
 - Upstream branch: `releases/v0.25.1`
 - Upstream tag: `v0.25.1`

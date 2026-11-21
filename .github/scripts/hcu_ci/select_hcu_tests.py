@@ -299,9 +299,14 @@ def select_jobs(
     return ordered, selected_groups, fallback
 
 
-def _git_changed_paths(base: str, head: str) -> list[str]:
+def _git_changed_paths(base: str, head: str, *, include_deleted: bool = False) -> list[str]:
+    command = ["git", "diff", "--name-only",
+               "--diff-filter=ACDMRTUXB" if include_deleted else "--diff-filter=ACMRTUXB"]
+    if include_deleted:
+        command.append("--no-renames")
+    command.extend([base, head])
     result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB", base, head],
+        command,
         cwd=REPOSITORY,
         text=True,
         stdout=subprocess.PIPE,
@@ -331,7 +336,9 @@ def _write_github_outputs(path: Path, payload: dict[str, Any]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path,
+                        help="selector configuration (defaults to the selected release)")
+    parser.add_argument("--release", choices=("v0.28.1-dev", "v0.33.0"), default="v0.28.1-dev")
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument(
@@ -348,36 +355,39 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        config = _load_config(args.config)
+        config = _load_config(args.config or DEFAULT_CONFIG) if args.release == "v0.28.1-dev" else None
         if args.paths_from is not None:
             if str(args.paths_from) == "-":
                 changed_paths = sys.stdin.read().splitlines()
             else:
                 changed_paths = args.paths_from.read_text(encoding="utf-8").splitlines()
         elif args.base and args.head:
-            changed_paths = _git_changed_paths(args.base, args.head)
+            changed_paths = _git_changed_paths(
+                args.base, args.head, include_deleted=args.release == "v0.33.0",
+            )
         else:
             raise SelectionError(
                 "provide --base and --head, or provide --paths-from"
             )
-        jobs, groups, fallback = select_jobs(
-            config,
-            changed_paths,
-            full=args.full,
-            accuracy=args.accuracy,
-        )
-        payload = {
-            "jobs": jobs,
-            "groups": groups,
-            "docs_only": groups == ["docs-only"],
-            "fallback": fallback,
-            "changed_paths": sorted(changed_paths),
-        }
+        if args.release == "v0.33.0":
+            from select_v033_tests import select_jobs as select_v033
+            overrides = {"config_path": args.config} if args.config is not None else {}
+            payload = select_v033(changed_paths, full=args.full, accuracy=args.accuracy,
+                                  **overrides)
+        else:
+            jobs, groups, fallback = select_jobs(
+                config, changed_paths, full=args.full, accuracy=args.accuracy,
+            )
+            payload = {
+                "jobs": jobs, "groups": groups,
+                "docs_only": groups == ["docs-only"], "fallback": fallback,
+                "changed_paths": sorted(changed_paths),
+            }
         rendered = json.dumps(payload, indent=2, sort_keys=True)
         print(rendered)
         if args.github_output is not None:
             _write_github_outputs(args.github_output, payload)
-    except (OSError, SelectionError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"HCU CI selection failed: {exc}", file=sys.stderr)
         return 2
     return 0

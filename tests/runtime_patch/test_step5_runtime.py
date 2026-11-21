@@ -543,3 +543,69 @@ def test_cold_moe_consumers_bind_compatible_deep_gemm_exports():
         [sys.executable, "-c", script], env=env, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_step5_real_batch_forwards_active_lora_count_to_runner(monkeypatch):
+    from vllm_hcu.v1 import step5_execution
+
+    class StopAfterPrepare(RuntimeError):
+        pass
+
+    descriptor = SimpleNamespace(num_tokens=1)
+    batch_state = SimpleNamespace(
+        num_tokens=1,
+        num_scheduled_tokens={"request": 1},
+        is_prefilling_np=np.array([False]),
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"request": 1},
+        total_num_scheduled_tokens=1,
+    )
+    seen = {}
+
+    def prepare_inputs(
+        scheduler, state, batch, num_active_loras
+    ):
+        seen.update(
+            scheduler=scheduler,
+            state=state,
+            batch=batch,
+            num_active_loras=num_active_loras,
+        )
+        raise StopAfterPrepare
+
+    runner = SimpleNamespace(
+        update_pp_decode_requests=lambda: None,
+        finish_requests=lambda output: None,
+        free_states=lambda output: None,
+        add_requests=lambda output: None,
+        update_requests=lambda output: None,
+        block_tables=SimpleNamespace(apply_staged_writes=lambda: None),
+        gather_batch_req_state=lambda output, dummy: (batch_state, 1),
+        pcp_manager=None,
+        lora_config=None,
+        is_encoder_decoder=False,
+        cudagraph_manager=object(),
+        dp_size=1,
+        dp_rank=0,
+        parallel_config=object(),
+        ubatch_runner=None,
+        decode_query_len=1,
+        observability_config=SimpleNamespace(cudagraph_metrics=False),
+        prepare_inputs=prepare_inputs,
+    )
+    monkeypatch.setattr(
+        step5_execution,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (descriptor, None),
+    )
+
+    with pytest.raises(StopAfterPrepare):
+        step5_execution.execute_model(runner, scheduler_output)
+
+    assert seen == {
+        "scheduler": scheduler_output,
+        "state": batch_state,
+        "batch": descriptor,
+        "num_active_loras": 0,
+    }

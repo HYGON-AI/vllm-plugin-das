@@ -44,6 +44,27 @@ export HIPBLASLT_TUNING_CONFIG="<hipBLASLt 调优配置文件>"
 export ROCBLAS_TENSILE_LIB_DIR="<rocBLAS Tensile 库目录>"
 ```
 
+#### 同节点 HIP IPC 的设备可见性
+
+排查同节点 HIP 传输的首次拷贝崩溃时，同时检查 `ROCR_VISIBLE_DEVICES`
+和每个进程的 `HIP_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES`。在已测试的
+DTK2610/gfx938 运行时上，两端分别设置互不相交的单卡 ROCR 列表，会在
+`hipMemcpyAsync` → HSA `GpuAgent::DmaCopy` 中崩溃；不加载 Torch 或 Mooncake
+的独立 HIP IPC 程序也能复现。
+
+该运行时的两卡对照保留共同的 ROCR 列表，再分别选择计算卡。例如，已分配卡为
+6、7 时，两端均设置 `ROCR_VISIBLE_DEVICES=6,7`：
+
+| 环境变量 | P 进程 | D 进程 |
+| --- | --- | --- |
+| `HIP_VISIBLE_DEVICES` | `0` | `1` |
+| `CUDA_VISIBLE_DEVICES` | `0` | `1` |
+
+HIP 索引相对于 ROCR 列表；启动前核对实际 PCI bus 和各进程的设备数。
+此设置仅是该运行时已验证的部署条件，不是所有版本的要求或原生源码修复。
+独立 HIP 与原 Mooncake 缓冲区 API 均已通过两轮地址不变、输入变化的逐字节校验；
+这不代替真实 P/D 模型输出、精度、Graph、性能或正常退出验收。
+
 ### TTFT 分段追踪
 
 开启后，Prefill / Decode 进程会在关键路径上输出结构化 **TTFT_EVENT** 日志，用于 PD 分离场景下的 TTFT 六段分解分析。

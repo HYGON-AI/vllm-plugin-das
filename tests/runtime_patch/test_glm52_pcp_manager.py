@@ -210,6 +210,9 @@ def _make_batch(
             [is_prefilling for _, _, _, is_prefilling in requests], dtype=np.bool_
         ),
         has_prefill=any(is_prefilling for _, _, _, is_prefilling in requests),
+        decode_graph_eligible=not any(
+            is_prefilling for _, _, _, is_prefilling in requests
+        ),
         input_ids=input_ids,
         positions=positions,
         is_padding=is_padding,

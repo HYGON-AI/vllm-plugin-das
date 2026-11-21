@@ -4,12 +4,25 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
-
-from tools import check_patch_test_coverage as coverage_gate
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+
+def _load_tool_module(name: str):
+    path = REPOSITORY / "tools" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"plugin_tools_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+coverage_gate = _load_tool_module("check_patch_test_coverage")
 
 
 def test_every_patch_module_has_contract_and_direct_test_reference() -> None:
