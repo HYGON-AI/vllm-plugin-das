@@ -419,9 +419,16 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
                     expert_ids=m_indices,
                 )
         else:
+            # GEMM1 has consumed the permuted input in workspace13. GEMM2
+            # reads this FP8 view before unpermute writes the final output.
+            quant_out = _resize_cache(
+                workspace13.view(dtype=torch.float8_e4m3fn),
+                (m_aligned, self.adjust_N_for_activation(N, activation)),
+            )
             q_activation, q_activation_scale = fuse_silu_mul_fp8_quant(
                 gateup_output,
                 fp8type=0,
+                output=quant_out,
                 expert_ids=m_indices,
                 limit=self.quant_config.gemm1_clamp_limit,
             )

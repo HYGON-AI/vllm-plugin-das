@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import copy
 import importlib
+import math
 import logging
 import sys
 from contextlib import contextmanager, nullcontext
@@ -1124,7 +1125,7 @@ def _dpsk_namespace(logger: _WarningLogger, calls: list[tuple[str, tuple, dict]]
         "deepgemm_unpermute_and_reduce": lambda **kwargs: kwargs["output"].copy_(
             kwargs["a"]
         ),
-        "_resize_cache": lambda _cache, shape: torch.empty(shape),
+        "_resize_cache": lambda cache, shape: cache.flatten()[:math.prod(shape)].view(shape),
         "m_grouped_fp8_gemm_nt_contiguous": contiguous_gemm,
         "m_grouped_fp8_gemm_nt_masked": masked_gemm,
         "m_grouped_fp8_gemm_nt_masked_ll": masked_gemm,
@@ -1140,6 +1141,7 @@ def _dpsk_contiguous_self() -> SimpleNamespace:
         _deepgemm_w13="packed-w13",
         _deepgemm_w2="packed-w2",
         ALIGNMENT=256,
+        adjust_N_for_activation=lambda n, _activation: n // 2,
         moe_problem_size=lambda *_args: (1, 1, 4, 2, None),
         _ensure_expert_tokens_meta=lambda **kwargs: kwargs["expert_tokens_meta"],
         _ensure_2d_scale=lambda scale: scale,
@@ -1228,11 +1230,13 @@ def test_dpsk_lazy_fp8_exports_use_categorized_kernels_and_consume_results(
     def quant(input: torch.Tensor, **kwargs):
         calls.append(("quant", (input,), kwargs))
         assert torch.equal(input, torch.full_like(input, 4))
-        assert set(kwargs) == {"fp8type", "expert_ids", "limit"}
+        assert set(kwargs) == {"fp8type", "output", "expert_ids", "limit"}
         assert kwargs["fp8type"] == 0
         assert torch.equal(kwargs["expert_ids"], torch.tensor([0]))
         assert kwargs["limit"] is None
-        return torch.full((1, 2), 6), torch.full((1, 1), 0.5)
+        out = kwargs["output"]
+        assert out.shape == (1, 2) and out.dtype == torch.float8_e4m3fn
+        return out.fill_(6), torch.full((1, 1), 0.5)
 
     def quant_ep(input: torch.Tensor, **kwargs):
         calls.append(("quant-ep", (input,), kwargs))
@@ -1260,7 +1264,7 @@ def test_dpsk_lazy_fp8_exports_use_categorized_kernels_and_consume_results(
         "quant-ep",
         "masked-gemm",
     ]
-    assert torch.equal(calls[2][1][0][0], torch.full((1, 2), 6))
+    assert torch.equal(calls[2][1][0][0].float(), torch.full((1, 2), 6))
     assert torch.equal(calls[5][1][0][0], torch.full((1, 1, 2), 7))
     assert torch.equal(contiguous_output, torch.full_like(contiguous_output, 9))
 

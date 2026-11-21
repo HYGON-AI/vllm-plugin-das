@@ -19,6 +19,7 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.patch.config import (
+    HY4_MEGAMOE_BACKEND,
     HcuFeatureConfig,
     get_hcu_config,
     normalize_hcu_moe_backend,
@@ -456,6 +457,9 @@ def _wrap_constructor(owner: type) -> None:
             kwargs,
         )
         original(self, *args, **kwargs)
+        # argparse may reuse its default mapping across parses of the same parser.
+        if self.additional_config is not None:
+            self.additional_config = dict(self.additional_config)
         # The upstream generated constructor has now initialized
         # additional_config.  Store a plain dict for hash/pickle/JSON support.
         set_hcu_config(self, feature_config)
@@ -584,6 +588,29 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
         config = create_engine_config(self, *args, **kwargs)
+        if get_hcu_config(config).hy4_fp8_megamoe:
+            feature_config = feature_config.with_updates(hy4_fp8_megamoe=True, moe_backend="deep_gemm")
+        if get_hcu_config(config).hy4_w4a8_megamoe:
+            feature_config = feature_config.with_updates(hy4_w4a8_megamoe=True, moe_backend="deep_gemm")
+        if feature_config.hy4_w4a8_megamoe:
+            model = config.model_config
+            quant = getattr(model.hf_config, "quantization_config", None)
+            if (model.architectures != ["HYV4ForCausalLM"] or model.quantization != "compressed-tensors"
+                    or not isinstance(quant, Mapping) or quant.get("format") != "pack-quantized"):
+                raise ValueError("HY4 W4A8 MegaMoE requires a text HY4 compressed-tensors INT4 checkpoint")
+        if feature_config.hy4_fp8_megamoe:
+            model = config.model_config
+            quant = getattr(model.hf_config, "quantization_config", None)
+            if not (
+                model.architectures == ["HYV4VLForConditionalGeneration"]
+                and model.quantization == "compressed-tensors"
+                and isinstance(quant, Mapping)
+                and quant.get("format") == "float-quantized"
+            ):
+                raise ValueError(
+                    f"--moe-backend {HY4_MEGAMOE_BACKEND} requires a HY4-VL "
+                    "compressed-tensors channel FP8 checkpoint"
+                )
         set_hcu_config(config, feature_config)
         for public, sidecar in _HCU_EPLB_FIELDS.items():
             attribute = f"_vllm_hcu_{sidecar}"

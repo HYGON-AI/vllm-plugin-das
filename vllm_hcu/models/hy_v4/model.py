@@ -24,6 +24,7 @@
 """Inference-only HY V4 model for HCU with strict checkpoint loading."""
 
 import typing
+from contextlib import nullcontext
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 
@@ -78,6 +79,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.model_executor.layers.quantization.hyv4_ownership import (
     mark_hyv4_quant_config,
 )
@@ -493,6 +495,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         super().__init__()
 
         config = _normalize_hyv4_config(vllm_config.model_config.hf_config)
+        features = get_hcu_config(vllm_config)
+        self.use_mega_moe = features.hy4_fp8_megamoe or features.hy4_w4a8_megamoe
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -599,6 +603,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                 assert isinstance(layer.mlp, HYV4MoEFused)
                 example_layer = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
+                if features.hy4_w4a8_megamoe:
+                    from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
+                        HcuCompressedTensorsW4A8Int8MoEMethod,
+                    )
+                    owner = layer.mlp.experts.routed_experts
+                    if not isinstance(owner.quant_method, HcuCompressedTensorsW4A8Int8MoEMethod):
+                        raise ValueError(f"HY4 W4A8 MegaMoE requires compressed INT4 experts for {owner}")
+                    owner._hy4_w4a8_megamoe = True
 
         if example_layer is None:
             self.num_moe_layers = 0
@@ -686,8 +698,14 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             # prepare_input, and residual is unused.
             residual = None if self.enable_ihc else intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        scope = nullcontext()
+        if self.use_mega_moe:
+            from .megamoe import mega_forward_batch
+
+            scope = mega_forward_batch(hidden_states.shape[0])
+        with scope:
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             if self.enable_ihc:
