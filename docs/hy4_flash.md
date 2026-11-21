@@ -1,16 +1,30 @@
 # HYV4 Flash on vLLM 0.33 (candidate)
 
 The legacy source registration declares `HYV4FlashForCausalLM` and
-`HYV4FlashVLForConditionalGeneration`. These declarations are not delivered by
-the active v0.33 plugin wheel; the packaging integration blocker below must be
-fixed before claiming installed model registration or HCU serving support.
+`HYV4FlashVLForConditionalGeneration`. The active v0.33 plugin now delivers
+Flash configuration metadata through an Adapter extension, but these model
+implementations and registrations are still absent from that wheel. The
+integration blocker below must be fixed before claiming HCU serving support.
 
-## v0.33 package integration blocker
+### Configuration port
 
-The prospective integration of PR #493 head `acab29bb2228` with release target
+The active `hyv4-flash-config` capability registers `hy_v4_flash` and
+`hy_v4_flash_vl` with public Transformers AutoConfig. It inherits official
+Core's text configuration and preserves the candidate's Flash/vision config
+fields and validation. It does not touch Core's model registry or register
+the legacy plugin platform. Real installed config parsing, serialization,
+foreign-owner refusal, partial-commit failure and process lifecycle contracts
+are selected by `tests/vllm033/test_hyv4_flash_config_cpu.py` in portable CI.
+This first part of the port does not close model implementation, tokenizer,
+multimodal processor, attention, weights, device or accuracy gates.
+
+## Remaining v0.33 model integration blocker
+
+The original prospective integration of PR #493 head `acab29bb2228` with release target
 `32a1a6c05d6d` merges without conflicts, but its actual
 `hcu-vllm-das-plugin==0.33.0` wheel contains neither `vllm_hcu` nor HYV4 Flash
-model modules. The active `adapter_extension/pyproject.toml` includes only
+model modules. This historical finding predates the configuration-only port
+above. The active `adapter_extension/pyproject.toml` includes only
 `hcu_vllm_das` packages and Adapter extension entry points. The target also
 explicitly disables the repository-root legacy build. Adding the repository
 to `PYTHONPATH` or rebuilding the retired root project cannot qualify this

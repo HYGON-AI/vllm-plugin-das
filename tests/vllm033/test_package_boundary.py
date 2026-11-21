@@ -29,6 +29,7 @@ EXPECTED_ENTRY_POINTS = {
         "das_hcu_v41_pcp": "hcu_vllm_das.v41_pcp_activation:extension_spec",
         "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
         "das_hcu_step5_config": "hcu_vllm_das.step5_activation:extension_spec",
+        "das_hcu_hyv4_flash_config": "hcu_vllm_das.hyv4_flash_config_activation:extension_spec",
     }
 }
 
@@ -152,6 +153,9 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
         }
     }
     assert "hcu_vllm_das/dsv41_activation.py" in names
+    assert "hcu_vllm_das/hyv4_flash_config_activation.py" in names
+    assert "hcu_vllm_das/models/hy_v4_flash/configs.py" in names
+    assert "hcu_vllm_das/models/hy_v4_flash/vision_config.py" in names
     assert "hcu_vllm_das/quantization/dsv41_channel_fp8.py" in names
     assert "[vllm.platform_plugins]" not in entry_point_lines
     assert "[vllm.general_plugins]" not in entry_point_lines
