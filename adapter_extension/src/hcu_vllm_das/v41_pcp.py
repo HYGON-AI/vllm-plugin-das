@@ -8,9 +8,10 @@ is genuinely private to it:
 
 * the FP8 reference scorer (`v41_indexer.indexer`) that PCP scoring reuses;
 * the Engram config validator for the private host-table adapter;
+* Layer Split attention, cache placement and its transfer contract;
 * `ModelRegistry` publication of the owned model class.
 
-Those two callables are injected into the adapter at activation, because the
+The scorer and validators are injected into the adapter at activation, because the
 adapter may not import the plugin (direction rule: plugin -> adapter only).
 """
 from __future__ import annotations
@@ -18,8 +19,37 @@ from __future__ import annotations
 import sys
 
 from hcu_adapter.kernels import pcp_fork
+from .layer_split_config import adapter_hooks, layer_split_enabled as layer_split_selected
 
-validate_config = pcp_fork.validate_config
+def validate_config(cfg):
+    validate_layer_split_policy(cfg)
+    if layer_split_selected(cfg):
+        from .dsa_cache_layer_split import split_config
+        if split_config(cfg) is None:
+            raise ValueError('Layer Split requires PCP>1 and KV source layers')
+    return pcp_fork.validate_config(cfg)
+
+
+def validate_layer_split_policy(cfg):
+    if not layer_split_selected(cfg):
+        return
+    from .environment import _flag
+    if not _flag('VLLM_HCU_DSV41_PCP_ATTENTION', default=False):
+        raise ValueError('Layer Split requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
+    if pcp_fork.selected_mode() != 'native':
+        raise ValueError('Layer Split requires native PCP; stock/kill-switch cannot shard caches')
+    if adapter_hooks() is None:
+        raise ValueError('Layer Split requires the companion HCU Adapter CLI and KV layout hooks')
+
+
+def _validate_transfer(cfg):
+    # Keep the official rejection unless the extension supplies its own protocol.
+    if not layer_split_selected(cfg):
+        raise ValueError('KV transfer requires a separate replicated-cache contract')
+    validate_layer_split_policy(cfg)
+    from .dsa_cache_layer_split import validate_layer_split_transfer
+    validate_layer_split_transfer(cfg)
+
 is_v41 = pcp_fork.is_v41
 select_attention = pcp_fork.select_attention
 build_classes = pcp_fork.build_classes
@@ -78,6 +108,9 @@ def bind_adapter_classes() -> None:
 
     pcp_fork.set_indexer_reference(reference.indexer)
     pcp_fork.set_engram_validator(validate_engram_config)
+    transfer = getattr(pcp_fork, 'set_kv_transfer_validator', None)
+    if transfer is not None:
+        transfer(_validate_transfer)
     from .inverse_rope_policy import selected_mode
     if selected_mode() == "hcu":
         from .inverse_rope_pcp import prepare_forward_mqa
@@ -102,7 +135,16 @@ def bind_adapter_classes() -> None:
     _bound = True
 
 
-def attention_class():
+def attention_class(cfg=None, *, dspark=False):
     """Return the adapter-owned PCP attention class for this process."""
     bind_adapter_classes()
+    validate_layer_split_policy(cfg)
+    if layer_split_selected(cfg):
+        from .dsa_cache_layer_split import apply_kv_source_write_suppression
+        from .v41_pcp_layer_split import HcuV41PcpAttention, dspark_attention_class
+        apply_kv_source_write_suppression()
+        return dspark_attention_class() if dspark else HcuV41PcpAttention
+    if dspark:
+        from .pcp_dspark import HcuV41PcpDSparkAttention
+        return HcuV41PcpDSparkAttention
     return build_classes()["attention"]

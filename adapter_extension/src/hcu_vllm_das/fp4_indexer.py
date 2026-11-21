@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.mla import indexer as metadata
 from . import fp4_packer
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
 from .v41_pcp import HcuV41PcpAttention
+from .v41_pcp_layer_split import LayerSplitAttentionMixin, LayerSplitIndexerMixin
 
 
 # anchor-baseline(③): Core 5afd482929, 0.33.1.dev3, constructor globals are
@@ -200,3 +201,14 @@ class Fp4PcpAttention(HcuV41PcpAttention, _Fp4CommonAttention):
     """
     def _indexer_cls(self, k_cache):
         return Fp4Indexer
+
+
+class Fp4LayerSplitIndexer(LayerSplitIndexerMixin, Fp4Indexer):
+    """Keep the official FP4 producer/reader; write only on the source owner."""
+
+
+class Fp4LayerSplitPcpAttention(LayerSplitAttentionMixin, Fp4PcpAttention):
+    """FP4 constructors plus shared main/SWA ownership and bounded replay."""
+
+    def _indexer_cls(self, k_cache):
+        return Fp4LayerSplitIndexer

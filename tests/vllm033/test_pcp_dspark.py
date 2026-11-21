@@ -58,6 +58,26 @@ def test_static_target_and_native_draft_are_separate(monkeypatch):
         owned.HcuV41PcpDSparkAttention.__mro__.index(owned.attention.DeepseekV4Attention))
 
 
+def test_static_target_keeps_layer_split_for_dspark_with_swa_replay(monkeypatch):
+    from hcu_vllm_das import v41_pcp_layer_split as split
+
+    monkeypatch.setenv('VLLM_HCU_DSV41_PCP_ATTENTION', '1')
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+    cfg = config()
+    cfg.additional_config['hcu_layer_split'] = {'enabled': True}
+    cfg.model_config.hf_config.kv_source_layer_ids = [2]
+    cfg.cache_config.swa_bounded_replay = True
+    assert static.validate_config(cfg)
+    selected = models.select_attention(cfg)
+    assert issubclass(selected, owned.HcuV41PcpDSparkAttention)
+    assert selected.forward_mqa is split.LayerSplitAttentionMixin.forward_mqa
+    assert selected._indexer_cls(None, None) is split.HcuV41PcpIndexer
+    assert selected.__mro__.index(owned._PcpDSparkAttentionBase) < (
+        selected.__mro__.index(owned.attention.DeepseekV4Attention))
+    assert models._EPLB_DECODER_INIT.__globals__['_select_dsv4_attn_cls'] is models.select_attention
+    assert models._FP4_EPLB_DECODER_INIT.__globals__['_select_dsv4_attn_cls'] is models._fp4_attention
+
+
 @pytest.mark.parametrize('method', ['mtp', 'eagle3', 'dflash'])
 def test_other_speculators_remain_rejected(method):
     cfg = config()

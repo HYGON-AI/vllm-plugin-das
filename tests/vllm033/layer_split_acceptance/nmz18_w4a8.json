@@ -1,0 +1,18 @@
+{
+  "description": "W4A8 PCP8 Layer Split example with a fixed KV budget",
+  "host_ip": "192.0.2.10",
+  "model_format": "ct-w4a8",
+  "model": "/llm-models/DeepSeek-V4.1-Flash-Channel-INT4-w4a8",
+  "python": "/usr/local/bin/python3",
+  "eval_python": "/path/to/eval-venv/bin/python",
+  "data": "/path/to/humaneval",
+  "tuning_path": "/path/to/rocblas-tuning",
+  "kv_cache_bytes": 12884901888,
+  "idle_vram_mib": 2.05078125,
+  "runtime_env": {
+    "GPU_ARCHS": "gfx938",
+    "TILELANG_CACHE_DIR": "/path/to/tilelang-cache"
+  },
+  "path_prefix": "/usr/local/bin",
+  "vendor_manifest": "/path/to/vendor-manifest.json"
+}

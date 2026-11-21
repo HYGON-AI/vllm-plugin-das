@@ -17,7 +17,7 @@ from hcu_vllm_das import inverse_rope_hcu as inverse
 from hcu_vllm_das import inverse_rope_pcp
 hcu_config = _adapter_module('hcu_config')
 hcu_env = _adapter_module('hcu_env')
-from hcu_adapter.kernels import pcp_fork
+from hcu_adapter.kernels import pcp_fork, pcp_rope_policy
 from hcu_vllm_das.inverse_rope_policy import selected_mode
 
 
@@ -26,6 +26,10 @@ def isolated_policy(monkeypatch):
     config = {"ops": {}, "overrides": {}}
     monkeypatch.setattr(hcu_config, "load", lambda: config)
     monkeypatch.setenv("HCU_DISABLE_OPS", "")
+    monkeypatch.setenv("HCU_VLLM_PCP_IMPL", "native")
+    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_ATTENTION", "1")
+    monkeypatch.delenv(pcp_rope_policy.MODE_VARIABLE, raising=False)
+    monkeypatch.setattr(pcp_rope_policy, "_process_arch", lambda _pid: "gfx938")
     monkeypatch.setattr(inverse_rope_pcp, "_state", None)
     monkeypatch.setattr(inverse_rope_pcp, "_failure", None)
     return config["ops"]
@@ -40,7 +44,7 @@ def test_catalog_validates_inverse_rope():
 
 @pytest.mark.parametrize("op", ["vllm_pcp", "vllm_inverse_rope"])
 def test_kill_switch_overrides_inverse_rope(monkeypatch, isolated_policy, op):
-    assert selected_mode() == "stock"
+    assert selected_mode() == "hcu"
     isolated_policy["vllm_inverse_rope"] = "hcu"
     assert selected_mode() == "hcu"
     monkeypatch.setenv("HCU_DISABLE_OPS", op)
@@ -99,15 +103,16 @@ def test_inverse_loader_stages_sources_outside_the_installed_package(monkeypatch
 
 
 @pytest.mark.parametrize("mode,admitted", [("stock", True), ("native", False)])
-def test_inverse_rope_cannot_silently_use_unowned_attention(
+def test_inverse_rope_leaves_unowned_attention_on_core(
         monkeypatch, isolated_policy, mode, admitted):
     from hcu_vllm_das.models import v41_pcp as model
 
     isolated_policy["vllm_inverse_rope"] = "hcu"
     monkeypatch.setattr(pcp_fork, "selected_mode", lambda: mode)
     monkeypatch.setattr(model, "validate_config", lambda cfg: admitted)
-    with pytest.raises(ValueError, match="requires native PCP"):
-        model.select_attention(object())
+    stock = object()
+    monkeypatch.setattr(model.native, "_select_dsv4_attn_cls", lambda cfg: stock)
+    assert model.select_attention(object()) is stock
 
 
 def test_inverse_rope_without_pcp_owner_fails_activation(monkeypatch):
