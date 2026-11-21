@@ -556,6 +556,31 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
 
+## Optional HY4 LL tuning
+
+```bash
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export HCU_VLLM_HY4_LL_TUNING=1
+```
+
+This defaults to off and requires Adapter's
+`hcu_adapter.features.ct_w4a8.masked_activation` provider. It is restricted to
+text HY4 W4A8 on gfx938: BF16, DP16/EP16, TP/PP/PCP/DCP1, DeepEP LL,
+H6144/I2048, 256 experts with top-k8, a 32-token per-rank capacity, positive
+SwiGLU clamp, and FULL Graph with compilation mode 0. Other configurations
+retain the original experts and providers.
+
+The two masked GEMMs reuse Core's CPU DP estimate with a 128-token scheduling
+floor; missing DP metadata retains the full-capacity hint. Device counts and
+capacity remain unchanged. The Adapter uses 64 persistent slots per expert and
+the v0.25 FP32 SwiGLU/INT8 quantization math. This differs from the current
+LightOp vendor path's rounding and requires model accuracy validation.
+Component timings do not establish serving throughput or TTFT improvements.
+
+Restart with `HCU_VLLM_HY4_LL_TUNING=0` to disable this policy, or
+`VLLM_HCU_USE_CUSTOM_OPS=0` for the master rollback. P-side HT/static EPLB is
+unaffected.
+
 ## Adapter directory layouts
 
 Adapter's root-module and `infra`/`features` layouts use the same Plugin entry

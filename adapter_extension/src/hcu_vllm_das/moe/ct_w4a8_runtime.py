@@ -162,6 +162,8 @@ class HcuCTMaskedExperts(_Experts):
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.BatchedExperts
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceDelegate()
+    def expected_m(self, global_num_experts, capacity, topk):
+        return capacity
     def workspace_shapes(self,M,N,K,topk,global_num_experts,local_num_experts,expert_tokens_meta,activation):
         total=self.max_num_tokens*self.num_dispatchers
         if M!=total: raise ValueError('LL received token extent differs from checked capacity')
@@ -173,17 +175,19 @@ class HcuCTMaskedExperts(_Experts):
         e,t,n,k,_=self.moe_problem_size(hidden_states,w1,w2,topk_ids)
         if t!=self.max_num_tokens*self.num_dispatchers: raise ValueError('LL input exceeds expert workspace contract')
         counts=expert_tokens_meta.expert_num_tokens
+        expected_m=self.expected_m(global_num_experts,t,topk_ids.shape[-1])
         gateup=_resize_cache(workspace13,(e,t,n))
-        self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,t)
+        self.ops.gemm_masked((hidden_states,a1q_scale),(self.weights[0],self.w1_scale),gateup,counts,expected_m)
         limit=self.quant_config.gemm1_clamp_limit
         if limit is not None and limit>0:
             mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=t)
         else:
             mid,ms=self.ops.silu_quant_ep(gateup,tokens_per_expert=counts)
-        self.ops.gemm_masked((mid,ms),(self.weights[1],self.w2_scale),output,counts,t)
+        self.ops.gemm_masked((mid,ms),(self.weights[1],self.w2_scale),output,counts,expected_m)
 
 
 def make_experts(moe,quant,weights,ops,prepare):
     if prepare.activation_format==mk.FusedMoEActivationFormat.BatchedExperts:
-        return HcuCTMaskedExperts(moe,quant,weights,ops,prepare.max_num_tokens_per_rank(),prepare.num_dispatchers())
+        from hcu_vllm_das.hy4_ll_experts import make_ll_experts
+        return make_ll_experts(moe,quant,weights,ops,prepare)
     return HcuCTContiguousExperts(moe,quant,weights,ops)
