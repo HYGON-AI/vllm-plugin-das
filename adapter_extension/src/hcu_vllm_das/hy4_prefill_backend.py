@@ -6,7 +6,7 @@ from vllm.logger import init_logger
 
 from .hy4_prefill_workspace import coalesce_prefill
 
-logger = init_logger(__name__)
+logger = init_logger(f"vllm.{__name__}")
 
 
 class HcuHY4PCPWorkspaceBuilder(HcuSparseFlashMLABackend.get_builder_cls()):
