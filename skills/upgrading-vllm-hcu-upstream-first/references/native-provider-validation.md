@@ -46,6 +46,29 @@ and the original cleanup deadline separately: fewer imports do not establish a
 clean exit or a speedup. The Plugin RMS example is documented in
 `docs/validation/vllm033-rms-lazy-provider.md`.
 
+For quantized prefill performance, inspect the public GEMM's implementation
+before adding a new size fallback: it may already dequantize and call ordinary
+matmul. Compare the actual compiled serving IR, since eager official dispatch
+can select a different algorithm. If an optional provider stores different
+packed weights, official dequantization cannot read them directly. A narrow
+Plugin layout conversion can retain official matmul, but admit it from actual
+repacked values, preserve unknown-layout fallback and freeze the selected
+mode across reload. Validate the final installed implementation independently
+of a prototype, including both packing branches and changed-input Graph replay.
+Measure throughput and TTFT separately; a throughput gain can accompany a
+substantial first-token regression. See
+`docs/validation/vllm033-autoawq-prefill.md` for the scoped AutoAWQ example.
+
+Compare temporary layouts using conversion plus the downstream GEMM: returning
+a transposed view can accelerate conversion but select a slower BLAS algorithm.
+Bind trace comparisons to matching prefill geometry; mixed prefill/decode
+totals do not isolate conversion cost. Check launch traversal against physical
+packing before changing the format, and revalidate both physical packing tiles.
+Keep physical packing separate from launch tuning. A wider program that wins
+on the largest weight can regress smaller shards; compare conversion plus GEMM
+across the admitted shapes before choosing a size policy, then validate the
+final installed kernel and changed-input Graph independently of the prototype.
+
 Before carrying a constructor patch that forces a native operator, inspect the
 target's dispatch and precision guards. For clamp SwiGLU, current v0.33 Core
 already selects its ROCm kernel for default alpha/beta and retains its Torch

@@ -88,6 +88,40 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Explicit AutoAWQ candidate
+
+Request `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=lightop-autoawq` and set both
+`VLLM_HCU_USE_CUSTOM_OPS=1` and `VLLM_HCU_USE_LIGHTOP_AWQ=1`. The two switches
+default to OFF; changing the serving policy requires a process restart.
+The independent extension registers an official `AutoAWQConfig` subclass for
+the three existing AWQ aliases. It leaves the official class, loader,
+checkpoint format, MoE selection and excluded modules intact.
+
+Only FP16, four-bit zero-point, group-128 dense layers with a tuned post-TP
+shape use LightOp. BF16, untuned shapes, other configurations, batch-invariant
+mode and unavailable provider/repack retain the complete selected official
+method. All preparation and repack validation precede parameter replacement.
+Once LightOp layout is established, reload uses the official recorded loader
+metadata and rejects provider failure rather than falling back over the wrong
+layout. Canonical checkpoint weights are not retained twice.
+
+Repacking and small batches use `lightop.gemm_ops` public functions. For
+M>64, the vendor already dequantizes before an ordinary matrix multiplication.
+When the actual repacked bytes match the Plugin's supported layout, a narrow
+Triton reader writes the temporary FP16 KN input for `torch.matmul`. Other
+layouts retain the public vendor GEMM. Reload cannot change the reader mode
+captured by an existing graph; no second weight representation is retained.
+See [the prefill implementation and validation boundary](../docs/validation/vllm033-autoawq-prefill.md).
+
+The GEMM crosses an official dispatcher custom op with a non-aliasing output
+and FakeTensor rule so pybind code is not traced through Dynamo. The effective
+master/child policy enters the official compilation cache factors. The native
+suite covers all 16 admitted post-TP shapes with M=1/17/65/128/256/512, the
+official AWQ Triton and dequantized references, fullgraph Inductor, bias and
+fixed-address changed-input replay. Test coverage does not itself establish
+passing execution, another architecture, a complete model or HumanEval.
+Keep this candidate opt-in until the applicable gates are completed.
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
