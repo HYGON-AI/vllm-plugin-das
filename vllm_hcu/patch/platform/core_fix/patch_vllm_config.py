@@ -424,7 +424,21 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        if not (is_deepseek_v4(vllm_config) and is_dspark_enabled(vllm_config)):
+            raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        # PCP prefill has dynamic query ownership and KV gathers. Only the
+        # replicated decode layout can replay a full target graph.
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        compilation = vllm_config.compilation_config
+        if compilation.cudagraph_mode == CUDAGraphMode.PIECEWISE:
+            raise ValueError(
+                "DeepSeek V4 PCP+DSpark does not support PIECEWISE CUDA graphs; "
+                "use NONE or a mode that explicitly permits full decode graphs."
+            )
+        if compilation.cudagraph_mode.has_full_cudagraphs():
+            compilation.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            compilation.mode = CompilationMode.NONE
     if relaxed_glm53_topology and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
@@ -446,14 +460,17 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         method = _require_hcu_pcp_attribute(
             speculative_config, "method", "SpeculativeConfig"
         )
-        if method != "mtp":
+        dspark_pcp = is_deepseek_v4(vllm_config) and method == "dspark"
+        if method != "mtp" and not dspark_pcp:
             raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
         num_speculative_tokens = _require_hcu_pcp_attribute(
             speculative_config,
             "num_speculative_tokens",
             "SpeculativeConfig",
         )
-        if num_speculative_tokens not in (1, 2, 3):
+        if dspark_pcp and num_speculative_tokens < 1:
+            raise ValueError("DeepSeek V4 PCP+DSpark requires positive draft tokens.")
+        if not dspark_pcp and num_speculative_tokens not in (1, 2, 3):
             raise ValueError(
                 "GLM-5.2 PCP+MTP requires one to three speculative tokens."
             )
@@ -742,15 +759,28 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
+        # Channel-FP8 V4 registers shared or independent HT/LL tensors in
+        # one EPLB transfer list. The normal sync/async commit boundary thus
+        # publishes routing only after both layouts have been updated.
+        auto_online_eplb = (
+            feature_config.moe_backend == "deep_gemm"
+            and not {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"}.isdisjoint(
+                model_architectures(vllm_config)
+            )
+            and getattr(
+                getattr(model_config, "hf_config", None), "expert_dtype", None
+            ) == "fp8"
+        )
         # Static EPLB loads every physical expert directly from the
         # checkpoint before either layout is packed and never rearranges.
         if (
             getattr(parallel_config, "enable_eplb", False)
             and feature_config.expert_map_path is None
+            and not auto_online_eplb
         ):
             raise ValueError(
-                "deepep_auto with EPLB is not supported because the HT and "
-                "LL expert weight layouts cannot be rebalanced atomically; "
+                "deepep_auto with EPLB is not supported for this model/backend; "
+                "online rebalancing requires DeepSeek V4 FP8 with deep_gemm; "
                 "use a static expert_map_path instead"
             )
         # Only V4 restores global prefill phase evidence for PCP-only auto.

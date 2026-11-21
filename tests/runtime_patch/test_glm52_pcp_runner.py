@@ -55,6 +55,11 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    from vllm_hcu.v1.pcp_manager import (
+        pcp_dispatch_metadata_scope, set_pcp_dispatch_metadata,
+    )
+    pcp_module.pcp_dispatch_metadata_scope = pcp_dispatch_metadata_scope
+    pcp_module.set_pcp_dispatch_metadata = set_pcp_dispatch_metadata
     pcp_module.make_hcu_pcp_manager_cls = lambda config: NullPCPManager
 
     class FakeBlockTables:

@@ -686,3 +686,36 @@ def test_forced_v1_pcp_is_rejected_during_platform_config_lifecycle(
 
     with pytest.raises(ValueError, match="Model Runner V2"):
         HCUPlatform.check_and_update_config(config)
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 5, 8])
+def test_deepseek_v4_pcp_allows_dspark(make_pcp_config, tokens):
+    config = make_pcp_config(
+        architecture="DeepseekV4ForCausalLM",
+        tp=1, pcp=8, speculative=True,
+        speculative_method="dspark", num_speculative_tokens=tokens,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+def test_deepseek_v4_pcp_rejects_empty_dspark(make_pcp_config):
+    config = make_pcp_config(
+        architecture="DeepseekV4ForCausalLM",
+        tp=1, pcp=8, speculative=True,
+        speculative_method="dspark", num_speculative_tokens=0,
+    )
+    with pytest.raises(ValueError, match="positive draft tokens"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
+@pytest.mark.parametrize("architecture", [
+    "GlmMoeDsaForCausalLM", "HYV4ForCausalLM", "DeepSeekV4MTPModel",
+])
+def test_other_pcp_models_still_reject_dspark(make_pcp_config, architecture):
+    config = make_pcp_config(
+        architecture=architecture,
+        tp=4, pcp=2, speculative=True,
+        speculative_method="dspark", num_speculative_tokens=5,
+    )
+    with pytest.raises(ValueError, match="only supports built-in MTP"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
