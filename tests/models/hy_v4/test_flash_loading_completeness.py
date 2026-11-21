@@ -44,6 +44,26 @@ def model(monkeypatch):
     for layer in result.model.layers:
         layer.mlp = torch.nn.Module()
         layer.mlp.expert_bias = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
+    for layer in result.model.layers:
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.indexer = torch.nn.Module()
+        layer.self_attn.indexer.intra_group_ape = torch.nn.Parameter(torch.empty(2, 128))
+        layer.self_attn.learnable_sink_param = torch.nn.Parameter(torch.empty(1))
+        layer.engram_layer = torch.nn.Module()
+        layer.engram_layer.unified_pre_gamma = torch.nn.Parameter(torch.empty(3))
+        layer.engram_layer.unified_per_hc_scales = torch.nn.ParameterList(
+            [torch.nn.Parameter(torch.empty(3)) for _ in range(2)])
+        layer.engram_layer.value_proj = torch.nn.Linear(2, 3)
+        layer.engram_layer.key_projs = torch.nn.ModuleList(
+            [torch.nn.Linear(2, 3) for _ in range(2)])
+        for name in ("hc_attn_layer", "hc_mlp_layer"):
+            module = torch.nn.Module()
+            module.hc_scale = torch.nn.Parameter(torch.empty(2))
+            module.hc_base = torch.nn.Parameter(torch.empty(6))
+            setattr(layer, name, module)
+    result.model.hc_head = torch.nn.Module()
+    result.model.hc_head.hc_head_base = torch.nn.Parameter(torch.empty(2))
+    result.model.hc_head.hc_head_scale = torch.nn.Parameter(torch.empty(1))
     result.model.loaded_parts = {}
     calls = []
     result.model.verify_loaded_parts = lambda: calls.append("shards")
@@ -121,3 +141,57 @@ def test_stream_error_preserves_exception_and_cleans_audit_state(monkeypatch):
             raise RuntimeError("broken stream")
     assert calls == [] and shell._weight_loading_depth == 0
     assert not shell._seen_weights and not shell._loaded_weights
+
+
+NON_WEIGHT_LEAVES = (
+    "self_attn.indexer.intra_group_ape", "self_attn.learnable_sink_param",
+    "engram_layer.unified_pre_gamma", "engram_layer.unified_per_hc_scales.0",
+    "engram_layer.unified_per_hc_scales.1", "engram_layer.value_proj.bias",
+    "engram_layer.key_projs.0.bias", "engram_layer.key_projs.1.bias",
+    "hc_attn_layer.hc_scale", "hc_attn_layer.hc_base",
+    "hc_mlp_layer.hc_scale", "hc_mlp_layer.hc_base",
+)
+MANDATORY_NON_WEIGHTS = tuple(
+    f"model.layers.{layer}.{leaf}" for layer in range(2) for leaf in NON_WEIGHT_LEAVES
+) + ("model.hc_head.hc_head_base", "model.hc_head.hc_head_scale")
+
+
+@pytest.mark.parametrize("omitted", MANDATORY_NON_WEIGHTS)
+def test_entire_learned_non_weight_parameter_missing_rejects(monkeypatch, omitted):
+    shell, calls = model(monkeypatch)
+    assert omitted in dict(shell.named_parameters())
+    with pytest.raises(ValueError, match=omitted):
+        with shell.weight_loading_session():
+            shell._loaded_weights.update(name for name, _ in shell.named_parameters() if name != omitted)
+    assert calls == []
+    assert shell._weight_loading_depth == 0 and not shell._loaded_weights
+
+
+def test_mandatory_non_weights_load_through_actual_assignment(monkeypatch):
+    import regex as re
+    from types import MethodType
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    shell, calls = model(monkeypatch)
+    shell.model.config = SimpleNamespace(engram_layer_ids=(1, 2))
+    shell.model.engram_hash = object()
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HYV4FlashModel")
+    nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
+    nodes += [n for n in tree.body if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "_EXPERT_WEIGHT" for t in n.targets)]
+    nodes += [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("load_weights", "_record_part")]
+    namespace = {"re": re, "default_weight_loader": default_weight_loader}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(SOURCE), "exec"), namespace)
+    shell.model._record_part = MethodType(namespace["_record_part"], shell.model)
+    parameters = dict(shell.named_parameters())
+    values = {name: torch.full_like(parameters[name], i + 1) for i, name in enumerate(MANDATORY_NON_WEIGHTS)}
+    with shell.weight_loading_session():
+        shell._loaded_weights.update(name for name in parameters if name not in values)
+        loaded = namespace["load_weights"](shell.model,
+            ((name.removeprefix("model."), value) for name, value in values.items()))
+        assert loaded == {name.removeprefix("model.") for name in values}
+        shell._loaded_weights.update("model." + name for name in loaded)
+    assert calls == ["core", "shards"]
+    for name, value in values.items():
+        torch.testing.assert_close(parameters[name], value, rtol=0, atol=0)

@@ -32,7 +32,15 @@ The current runtime explicitly rejects speculative decoding.
 
 Quantized checkpoint completeness includes every routed layer's FP32
 `expert_bias`, including the `gate.e_score_correction_bias` checkpoint alias;
-do not rely on Core's optional quantized tracker to detect a whole missing bias.
+the explicit audit also requires materialized IndexPool `intra_group_ape`,
+Engram pre-gamma/per-HC scales and projection biases, HC base/scale parameters,
+and learned attention sinks. A quantized Core tracker and an audit over only
+observed shards can miss whole non-`.weight` tensors; constructor defaults
+cannot replace learned checkpoint values. CPU regressions reject each omitted
+tensor before the recording Core tracker and exercise canonical tensor assignment
+through the actual loader body. Constructor/tracker shells remain explicit;
+these are not installed checkpoint, long-context, TP or device/model tests.
+
 For visual 2D RoPE, the learned position-embedding edge is a training grid,
 while preprocessing can admit longer rectangular grids. The tower retains
 Core's original table and uses its inverse frequencies for a local,
