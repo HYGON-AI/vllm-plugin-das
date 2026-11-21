@@ -17,6 +17,11 @@ def test_core_forwards_and_compile_wrapper_are_retained():
     assert owned.HcuHY4StaticBackbone.__init__.__code__ is owned.native.HYV4Model.__init__.__code__
     assert owned.native.HYV4DecoderLayer.__init__.__globals__['HYV4MoEFused'] is owned.moe.HYV4MoEFused
     assert owned.mtp.HYV4MultiTokenPredictorLayer.__init__.__globals__['HYV4DecoderLayer'] is owned.nvidia.HYV4DecoderLayer
+    assert owned.HcuHY4StaticAttention.forward is owned.attention.HYV4MLAAttention.forward
+    assert owned.HcuHY4StaticAttention.__init__.__code__ is owned.attention.HYV4MLAAttention.__init__.__code__
+    assert owned.HcuHY4StaticAttention.__init__.__globals__['MLAAttention'] is owned.make_attention
+    assert owned.HcuHY4StaticDecoder.__init__.__globals__['HYV4MLAAttention'] is owned.HcuHY4StaticAttention
+    assert owned.native.HYV4DecoderLayer.__init__.__globals__['HYV4MLAAttention'] is owned.attention.HYV4MLAAttention
 
 
 def test_native_checkpoint_mapping_emits_only_logical_ids_for_static_fanout():

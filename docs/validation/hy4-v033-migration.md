@@ -1,5 +1,46 @@
 # HY4 v0.25.1 → v0.33.0
 
+## PCP segment workspace candidate (2026-11-21)
+
+For the owned static-R16 model on P, opt in with:
+
+```bash
+export VLLM_HCU_SPARSE_MLA_PREFILL_WORKSPACE_DEDUP=1
+```
+
+Adjacent PCP query segments with the same native `req_idx` share one longest
+KV context. Native cache writing, gather, logical-index conversion, sink,
+attention kernels and the forward loop stay unchanged. Only the owned layer's
+metadata builder changes; the public backend registry and Adapter impl retain
+their owners. DCP, HiSparse, other backends, pure decode and unsupported layouts
+keep the native path. Default is off; `HCU_DISABLE_OPS=hy4_prefill_workspace`
+disables it in a fresh process.
+
+If no gather/MLA calls can be removed and the original BF16 region fits the
+device L2, retain native metadata. Unknown L2 uses the same conservative rule.
+The cache size is read once during builder initialization, not per layer/step.
+This is same-request segment coalescing, not cross-request physical-page dedup.
+
+Component validation used Core `c440c08` and gfx938: 112 CPU checks, six real
+native-builder/packed-cache-writer/forward GPU cases, bitwise parity, partial
+pages, strided pages, mixed decode/MTP and changed-input Graph. At Q `[378,64,576]`
+with 2048 valid indices, KV gather rows fall from 164189 to 84835; isolated native
+MLA path median is 1.496→1.417 ms. Inputs are synthetic with trace-derived sizes;
+this is not an end-to-end TTFT or throughput result.
+
+```bash
+HCU_ADAPTER_HOST=none HIP_VISIBLE_DEVICES= VLLM_PLUGINS=__disabled__ python -m pytest -q \
+  tests/vllm033/test_hy4_prefill_workspace.py \
+  tests/vllm033/test_hy4_static_models.py
+
+HCU_ADAPTER_HOST=vllm VLLM_PLUGINS=hcu_adapter python -m pytest -q \
+  tests/vllm033/test_hy4_prefill_workspace_gpu.py
+```
+
+Installed model startup, frozen HumanEval164 and unprofiled146→2920 still gate
+qualification. Earlier scores and throughput below belong to their named source
+combinations; they do not validate this candidate.
+
 ## Scope and ownership
 
 Target checkpoint: `hygon/Hy4-preview-Channel-INT4-w4a8`. Preserve PCP16 + EP16

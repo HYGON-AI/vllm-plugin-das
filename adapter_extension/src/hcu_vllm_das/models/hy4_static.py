@@ -9,11 +9,12 @@ untouched. Dynamic Core EPLB stays off while each owned MoE gets fixed slots.
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.models.hy_v4.amd import model as native
-from vllm.models.hy_v4.nvidia import model as nvidia, moe, mtp
+from vllm.models.hy_v4.nvidia import model as nvidia, moe, mtp, attention
 
 from .. import static_eplb_runtime as runtime
 from ..hy4_constructor import bind_constructor
 from ..hy4_static_plan import load_hy4_plan
+from ..hy4_prefill_workspace import make_attention
 from .hy4_ct import HcuHY4CTBackbone, HcuHY4CTMTP
 
 
@@ -40,9 +41,14 @@ class HcuHY4StaticMoE(moe.HYV4MoEFused):
         self.physical_expert_end = self.physical_expert_start + self.n_local_physical_experts
 
 
+class HcuHY4StaticAttention(attention.HYV4MLAAttention):
+    __init__ = bind_constructor(attention.HYV4MLAAttention.__init__,
+                               {'MLAAttention': make_attention})
+
+
 class HcuHY4StaticDecoder(native.HYV4DecoderLayer):
     __init__ = bind_constructor(native.HYV4DecoderLayer.__init__,
-                               {'HYV4MoEFused': HcuHY4StaticMoE})
+        {'HYV4MoEFused': HcuHY4StaticMoE, 'HYV4MLAAttention': HcuHY4StaticAttention})
 
 
 def _logical_expert_mapping(*args, **kwargs):
@@ -65,7 +71,7 @@ _OUTER_INIT = bind_constructor(native.HYV4ForCausalLM.__init__,
 
 class HcuHY4StaticMTPDecoder(nvidia.HYV4DecoderLayer):
     __init__ = bind_constructor(nvidia.HYV4DecoderLayer.__init__,
-                               {'HYV4MoEFused': HcuHY4StaticMoE})
+        {'HYV4MoEFused': HcuHY4StaticMoE, 'HYV4MLAAttention': HcuHY4StaticAttention})
 
 
 class HcuHY4StaticPredictorLayer(mtp.HYV4MultiTokenPredictorLayer):
