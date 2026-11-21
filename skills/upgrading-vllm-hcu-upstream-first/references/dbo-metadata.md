@@ -43,6 +43,38 @@ preserve resource-preflight failures and do not use shared-device timings as
 performance acceptance. Do not claim that CPU regression success or a startup
 failure in an earlier component validates the metadata fix end to end.
 
+## Metadata reuse within each microbatch
+
+Inspect the runner's metadata cache as well as the slicing helper. A backend
+that supports `update_block_table` may preserve query offsets, sequence lengths
+and scheduler metadata while replacing only block tables and slot mappings.
+Reusing that object across microbatches mixes one batch's sequence metadata
+with another's KV addresses. Scope compatible-group reuse by microbatch ID;
+preserve the unsplit `None` identity. This generic runner contract belongs in
+Core, without copying the runner or changing the attention backend in
+Adapter/Plugin.
+
+Public [PR #48659](https://github.com/vllm-project/vllm/pull/48659) proposes this
+cache-key fix. Check its current status and the selected release's actual
+implementation before backporting; an existing upstream request is not a
+reason to create another public duplicate. A hybrid model's GDN builder may
+disable block-table reuse while its full-attention builder enables it, so
+trace each actual builder rather than attributing the failure by model family.
+
+Observe expected and returned request counts, token counts, query offsets and
+sequence lengths for each microbatch. Record pointer identity without a device
+copy where the backend contract preserves those tensors. Phase flags and
+workspace capacity can pass while this separate cache contract corrupts
+outputs. Concurrent HTTP calls alone do not prove microbatch execution:
+client construction and request arrival can serialize a small test. Confirm
+the failing path in the unmodified base and correct output after the fix.
+Preserve unsuccessful reproducers rather than treating a passing base as RED.
+
+Keep protocol, request and problem bytes equal in accuracy comparisons. An
+output containing only punctuation until the fixed token limit is corruption
+evidence, not a reason to increase the budget. Saved text does not establish
+NaNs, generated token IDs or logits; collect those separately if needed.
+
 ## Unsplit MoE workspace after microbatched warmup
 
 Trace DP coordination and the selected dispatch backend separately from phase
