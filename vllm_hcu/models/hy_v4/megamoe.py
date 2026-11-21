@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import os
 
 import torch
 import torch.distributed as dist
@@ -62,7 +63,7 @@ def _stage_w4a8(hidden, physical_ids, weights, buffer):
     buffer.topk_weights[:rows].copy_(weights)
 
 
-def run_hy4_mega_experts(provider, hidden, physical_ids, weights, packed, buffer, clamp):
+def run_hy4_mega_experts(provider, hidden, physical_ids, weights, packed, buffer, clamp, *, eplb=None, offset=0):
     """Consume the physical top-8 IDs selected by the static EPLB router."""
     rows = hidden.shape[0]
     if hidden.ndim != 2 or hidden.shape[1] != 6144 or hidden.dtype != torch.bfloat16:
@@ -72,7 +73,17 @@ def run_hy4_mega_experts(provider, hidden, physical_ids, weights, packed, buffer
     if rows > buffer.num_max_tokens_per_rank:
         raise ValueError("HY4 MegaMoE per-rank token capacity exceeded")
     w4a8 = getattr(buffer, "mode", None) == "w4a8"
-    if rows and w4a8:
+    if rows and eplb is not None:
+        from .megamoe_eplb import stage_logical
+
+        stage_logical(hidden, physical_ids, weights, buffer, eplb, offset)
+        if not getattr(buffer, "_hy4_logical_stage_seen", False):
+            buffer._hy4_logical_stage_seen = True
+            if buffer.group.rank() == 0:
+                from vllm.logger import init_logger
+
+                init_logger("vllm.hy4.megamoe").info("HY4 fused R16 mapping and W4A8 input staging active")
+    elif rows and w4a8:
         _stage_w4a8(hidden, physical_ids, weights, buffer)
     elif rows:
         provider.mega_moe_preprocess(hidden.contiguous(), physical_ids.long().contiguous(),
@@ -126,6 +137,13 @@ class Hy4MegaKernel:
     def output_is_reduced():
         return True
 
+    def route_static(self, router, hidden, logits, input_ids):
+        router._validate_eplb_state()
+        weights, logical = router._compute_routing(hidden, logits, torch.int64, input_ids=input_ids)
+        if router.capture_fn is not None:
+            router.capture_fn(logical)
+        return self._prefill(hidden, logical, weights, router.eplb_state)
+
     def apply(self, hidden_states, w1, w2, topk_weights, topk_ids, activation,
               global_num_experts, expert_map, apply_router_weight_on_input,
               shared_experts=None, shared_experts_input=None, shared_experts_x_and_scale_quanted=None):
@@ -140,6 +158,9 @@ class Hy4MegaKernel:
             )
         if global_num_experts != 272 or apply_router_weight_on_input:
             raise ValueError("HY4 MegaMoE requires output-weighted physical R16 routing")
+        return self._prefill(hidden_states, topk_ids, topk_weights)
+
+    def _prefill(self, hidden_states, topk_ids, topk_weights, eplb=None):
         # Profiling and replicated MTP can supply a much larger batch than a
         # normal PCP shard. All ranks must issue the same number of IPC calls.
         capacity = self.buffer.num_max_tokens_per_rank
@@ -148,6 +169,7 @@ class Hy4MegaKernel:
             return run_hy4_mega_experts(
                 self.provider, hidden_states, topk_ids, topk_weights, self.packed,
                 self.buffer, self.clamp,
+                **({"eplb": eplb} if eplb is not None else {}),
             )
         outputs = []
         for step in range(rounds):
@@ -155,6 +177,7 @@ class Hy4MegaKernel:
             outputs.append(run_hy4_mega_experts(
                 self.provider, hidden_states[span], topk_ids[span], topk_weights[span],
                 self.packed, self.buffer, self.clamp,
+                **({"eplb": eplb, "offset": step * capacity} if eplb is not None else {}),
             ))
         return torch.cat(outputs)
 
@@ -306,6 +329,7 @@ def install_hy4_w4a8_mega_kernel(method, layer):
     buffer = _group_buffer(mega, ep, 272, capacity, w4a8=True)
     method.moe_quant_config = method.get_fused_moe_quant_config(layer)
     method.moe_kernel = Hy4MegaKernel(mega, packed, buffer, ep, layer.swiglu_limit)
+    method._hy4_static_route = method.moe_kernel.route_static if os.getenv("HY4_MEGA_FUSE_EPLB") == "1" else None
     if ep.rank_in_group == 0:
         init_logger("vllm.hy4.megamoe").info(
             "Installed HY4 W4A8 MegaMoE: layer=%s revision=%s capacity=%d",
