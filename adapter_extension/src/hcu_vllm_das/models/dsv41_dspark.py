@@ -49,11 +49,17 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
             _owned_quant_kind(vllm_config) is not None
             and getattr(target_parallel, 'prefill_context_parallel_size', 1) > 1
         ):
-            from ..pcp_dspark_draft import draft_config as pcp_draft_config
+            from vllm.logger import init_logger
+            from ..pcp_dspark_draft import draft_config as pcp_draft_config, moe_pcp_size
 
             local = pcp_draft_config(vllm_config)
             with set_current_vllm_config(local):
                 constructor(vllm_config=local, prefix=prefix)
+            init_logger('vllm.hcu_dspark_pcp').info(
+                'HCU PCP DSpark drafter ready: attention_PCP=%d expert_PCP=%d speculative_tokens=%d',
+                local.parallel_config.prefill_context_parallel_size, moe_pcp_size(local),
+                local.speculative_config.num_speculative_tokens,
+            )
         else:
             constructor(vllm_config=vllm_config, prefix=prefix)
         if native_ll:

@@ -1,0 +1,17 @@
+{
+  "description": "FP8 PCP8 example using operators installed in the image",
+  "host_ip": "192.0.2.10",
+  "model": "/llm-models/DeepSeek-V4.1-Flash-Channel-FP8",
+  "python": "/usr/local/bin/python3",
+  "eval_python": "/path/to/eval-venv/bin/python",
+  "data": "/path/to/humaneval",
+  "tuning_path": "/path/to/rocblas-tuning",
+  "kv_cache_bytes": 25769803776,
+  "idle_vram_mib": 2,
+  "runtime_env": {
+    "GPU_ARCHS": "gfx938",
+    "TILELANG_CACHE_DIR": "/path/to/tilelang-cache"
+  },
+  "path_prefix": "/usr/local/bin",
+  "vendor_manifest": "/path/to/vendor-manifest.json"
+}

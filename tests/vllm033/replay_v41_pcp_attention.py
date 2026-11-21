@@ -29,9 +29,11 @@ try:
     prod=importlib.import_module('hcu_vllm_das.v41_pcp')
     models=importlib.import_module('hcu_vllm_das.models.v41_pcp')
     activation=importlib.import_module('hcu_vllm_das.v41_pcp_activation')
+    layer_split=importlib.import_module('hcu_vllm_das.dsa_cache_layer_split')
+    split_attention=importlib.import_module('hcu_vllm_das.v41_pcp_layer_split')
 except ModuleNotFoundError as error:
     if not error.name.startswith('hcu_vllm_das.'):raise
-    prod=models=activation=None
+    prod=models=activation=layer_split=None
 RESULTS=[]
 
 def require():assert prod is not None,'PCP production modules are absent'
@@ -45,10 +47,11 @@ def reject(fn, kind=(ValueError, RuntimeError)):
     try:fn()
     except kind:return
     raise AssertionError('invalid PCP contract admitted')
-def cfg(width=8):
-    return NS(model_config=NS(enforce_eager=True,hf_config=NS(model_type='deepseek_v41',engram_layer_ids=[],vision_n_layers=0)),
+def cfg(width=8, *, split=False):
+    return NS(model_config=NS(enforce_eager=True,hf_config=NS(model_type='deepseek_v41',engram_layer_ids=[],vision_n_layers=0,kv_source_layer_ids=[2,8,14,20])),
         parallel_config=NS(prefill_context_parallel_size=width,decode_context_parallel_size=1,pipeline_parallel_size=1,data_parallel_size=1,tensor_parallel_size=1,enable_dbo=False,enable_eplb=False),
         use_v2_model_runner=True,speculative_config=None,lora_config=None,kv_transfer_config=None,
+        additional_config={'hcu_layer_split': {'enabled': True}} if split else {},
         kernel_config=NS(monokernel=False),cache_config=NS(swa_bounded_replay=False),
         attention_config=NS(backend=None,indexer_sparse_logits=False,resolve_indexer_kv_dtype=lambda _: 'fp8'))
 
@@ -61,11 +64,18 @@ def admission():
         x=cfg();setattr(x.model_config,field,value);reject(lambda:prod.validate_config(x))
     for field in ('decode_context_parallel_size','pipeline_parallel_size','data_parallel_size'):
         x=cfg();setattr(x.parallel_config,field,2);reject(lambda:prod.validate_config(x))
-    for field in ('speculative_config','lora_config','kv_transfer_config'):
+    for field in ('speculative_config','lora_config'):
         x=cfg();setattr(x,field,object());reject(lambda:prod.validate_config(x))
+    # Official default still refuses transfer; Layer Split has its own protocol.
+    x=cfg();x.kv_transfer_config=object();reject(lambda:prod.validate_config(x))
+    with patch.dict(os.environ,{'VLLM_HCU_DSV41_PCP_ATTENTION':'1', 'HCU_VLLM_PCP_IMPL':'native'}):
+        x=cfg(split=True);x.kv_transfer_config=object();reject(lambda:prod.validate_config(x))
     x=cfg();x.model_config.hf_config.engram_layer_ids=[1];reject(lambda:prod.validate_config(x))
     x=cfg();x.kernel_config.monokernel=True;reject(lambda:prod.validate_config(x))
-    x=cfg();x.attention_config.resolve_indexer_kv_dtype=lambda _: 'mxfp4';reject(lambda:prod.validate_config(x))
+    # This case checks the FP8-only owner rejecting an FP4 request. Pin the
+    # owner: FP4 is now enabled by default and has its own full admission tests.
+    with patch.dict(os.environ, {'HCU_VLLM_FP4_INDEXER_IMPL': 'stock'}):
+        x=cfg();x.attention_config.resolve_indexer_kv_dtype=lambda _: 'mxfp4';reject(lambda:prod.validate_config(x))
     assert prod.HcuV41PcpBackend.supports_pcp() and prod.HcuV41PcpSwaBackend.supports_pcp()
     assert prod.HcuV41PcpBackend.get_builder_cls() is rocm.DeepseekV41ROCMAiterMLASparseMetadataBuilder
     assert prod.HcuV41PcpSwaBackend.get_builder_cls() is rocm.DeepseekV41ROCMAiterSparseSWAMetadataBuilder
@@ -133,7 +143,11 @@ def publication():
     with ExitStack() as s:
         s.enter_context(patch('vllm.platforms.current_platform', NS(
             is_rocm=lambda:True, device_name='hcu', register_worker_selector=lambda fn:None)))
-        s.enter_context(patch.dict(os.environ,{'VLLM_HCU_DSV41_PCP_ATTENTION':'1'}))
+        # This case isolates PCP publication. Host/FP4 have independent
+        # reasons to publish the same owned model even when PCP is off.
+        s.enter_context(patch.dict(os.environ,{'VLLM_HCU_DSV41_PCP_ATTENTION':'1',
+            'VLLM_HCU_DSV41_ENGRAM_HOST':'0'}))
+        s.enter_context(patch.object(activation,'fp4_selected',return_value=False))
         s.enter_context(patch.object(activation,'_state',None));s.enter_context(patch.object(activation,'_failure',None))
         s.enter_context(patch.object(activation,'_is_hcu',return_value=True))
         s.enter_context(patch.object(ModelRegistry,'models',dict(ModelRegistry.models)))
@@ -147,7 +161,9 @@ def publication():
         ModelRegistry.models['DeepseekV41ForCausalLM']=old
         reject(activation.check_health,ExtensionCommitError)
     with ExitStack() as s:
-        s.enter_context(patch.dict(os.environ,{'VLLM_HCU_DSV41_PCP_ATTENTION':'0'}))
+        s.enter_context(patch.dict(os.environ,{'VLLM_HCU_DSV41_PCP_ATTENTION':'0',
+            'VLLM_HCU_DSV41_ENGRAM_HOST':'0'}))
+        s.enter_context(patch.object(activation,'fp4_selected',return_value=False))
         s.enter_context(patch.object(activation,'_state',None));s.enter_context(patch.object(activation,'_failure',None))
         s.enter_context(patch.object(activation,'_is_hcu',return_value=True))
         original=ModelRegistry.models['DeepseekV41ForCausalLM']
@@ -192,6 +208,8 @@ def native_preparation_200():
             attn.use_pcp=True;attn.aux_stream_list=None;attn.n_local_heads=1;attn.head_dim=1;attn.ln_events=[None,None]
             attn.rotary_emb=attn.indexer_rotary_emb=NS(cos_sin_cache=torch.empty(1));attn.swa_cache_layer=NS(prefix='swa',block_size=32,kv_cache=torch.empty(1,32,584,dtype=torch.uint8))
             attn.padded_heads=1;attn.kv_mxfp8=False;attn.eps=1e-6
+            # __new__ skips the PCP constructor; exercise its native fallback.
+            attn._initialize_q_rope = attn._prepare_q_rope = None
             attn._wq_b_proj=lambda qr,scale:qr
             global_slots=allpos.long()+32
             def swa_store(values,cache,slots,p,*args):
@@ -274,9 +292,138 @@ def local_output():
     assert prod.HcuV41PcpAttention._o_proj is rocm.DeepseekV41ROCMAiterMLAAttention._o_proj
 
 
-for name,fn in [('admission_and_owned_backends',admission),('native_constructor_namespace',constructors),('decoder_replay_gate',decoder_replay_gate),('public_model_publication',publication),('native_CR2_link_200x8',native_ring_200),('native_preparation_200x8',native_preparation_200),('production_FP8_local_scoring_200x8',local_indexer_200),('actual_local_output_and_padding',local_output)]:case(name,fn)
+def layer_split_ownership():
+    require()
+    # Pure sizing math, independent of any model/config machinery.
+    assert layer_split.get_layer_shard_range(0,8,4)==(0,1)
+    assert layer_split.get_layer_shard_range(3,8,4)==(3,4)
+    assert layer_split.get_layer_shard_range(4,8,4)==(4,4)
+    assert layer_split.get_layer_shard_range(7,8,4)==(4,4)
+    reject(lambda:layer_split.get_layer_shard_range(8,8,4),ValueError)
+    reject(lambda:layer_split.get_layer_shard_range(0,0,4),ValueError)
+    reject(lambda:layer_split.get_layer_owner(4,8,4),ValueError)
+    owners={kv_id:layer_split.kv_source_owner_rank(kv_id,(2,8,14,20),8) for kv_id in (2,8,14,20)}
+    assert owners=={2:0,8:1,14:2,20:3}
+    assert layer_split.kv_source_owner_rank(20,(2,8,14,20),4)==3
+    # Layer Split is a property of each resolved configuration.
+    assert layer_split.layer_split_enabled(cfg()) is False
+    assert layer_split.layer_split_enabled(cfg(split=True)) is True
+    malformed=cfg()
+    malformed.additional_config['hcu_layer_split']={'enabled':'yes'}
+    reject(lambda:layer_split.layer_split_enabled(malformed),ValueError)
+    # PCP8 must preserve every source's native spec, including non-owners.
+    obj=object.__new__(split_attention.HcuV41PcpAttention);torch.nn.Module.__init__(obj)
+    obj.kv_source_layer_id=20
+    sentinel=object()
+    with patch.object(common.DeepseekV4Attention,'get_kv_cache_spec',return_value=sentinel), \
+         patch.object(layer_split,'_state',None):
+        for rank in range(8):
+            with patch.object(layer_split,'get_pcp_group',return_value=NS(rank_in_group=rank)):
+                assert obj.get_kv_cache_spec(cfg(8,split=True)) is sentinel
+                assert layer_split.layer_split_state()==(8,(2,8,14,20),rank)
+
+
+def layer_split_indexer_cache():
+    from vllm.models.deepseek_v41.attention import DeepseekV4IndexerCache
+    obj=object.__new__(DeepseekV4IndexerCache)
+    obj.prefix='model.layers.20.attn.indexer.k_cache'
+    obj.cache_config=NS(block_size=64);obj.head_dim=132;obj.dtype=torch.uint8
+    obj.compress_ratio=1;obj.sparse_logits=False;obj.rocm_mxfp4=False
+    config=cfg(8);config.cache_config.cache_dtype='auto'
+    for rank in range(8):
+        with patch.object(layer_split,'get_pcp_group',return_value=NS(rank_in_group=rank)):
+            assert obj.get_kv_cache_spec(config) is not None
+
+
+def layer_split_write_suppression():
+    require()
+    from vllm.models.deepseek_v41.attention import DeepseekV4Indexer
+    from vllm.models.deepseek_v41.compressor import DeepseekCompressor
+    layer_split.apply_kv_source_write_suppression()
+    assert getattr(DeepseekCompressor.insert_cache,'_hcu_layer_split_wrapper',False)
+    assert getattr(DeepseekV4Indexer._produce_k,'_hcu_layer_split_wrapper',False)
+    layer_split.apply_kv_source_write_suppression()  # re-applying must be a no-op.
+
+    class Boom(Exception):pass
+    comp=object.__new__(DeepseekCompressor);comp.k_cache_prefix='model.layers.20'
+    idx=object.__new__(DeepseekV4Indexer);idx.k_cache=NS(prefix='model.layers.20.indexer.k_cache')
+    sentinel=object()
+    # Probe whether native actually ran: both bodies touch get_forward_context()
+    # before any cache write, so a probe exception there distinguishes "native
+    # ran" (owner / unaffected config) from "wrapper suppressed before calling
+    # native at all" (non-owner), without needing full attention fixtures.
+    for is_owner,native_should_run in [(True,True),(False,False),(None,True)]:
+        with patch.object(layer_split,'_is_owner',return_value=is_owner):
+            with patch.object(compressor,'get_forward_context',side_effect=Boom):
+                if native_should_run:reject(lambda:comp.insert_cache(sentinel,None,None),Boom)
+                else:comp.insert_cache(sentinel,None,None)
+            with patch.object(common,'get_forward_context',side_effect=Boom):
+                if native_should_run:reject(lambda:idx._produce_k(sentinel,None,None),Boom)
+                else:idx._produce_k(sentinel,None,None)
+    # Hash drift must be fatal and must not touch either installed wrapper.
+    live_insert=DeepseekCompressor.insert_cache;live_produce=DeepseekV4Indexer._produce_k
+    with patch.object(layer_split,'_write_suppression_applied',False),\
+         patch.object(layer_split,'_COMPRESSOR_INSERT_CACHE_REVIEWED','0'*64):
+        reject(layer_split.apply_kv_source_write_suppression,RuntimeError)
+    assert DeepseekCompressor.insert_cache is live_insert and DeepseekV4Indexer._produce_k is live_produce
+    # Forward uses the ownership state admitted by the worker config.
+    ids=(2,8,14,20)
+    with patch.object(layer_split,'_state',None):
+        assert layer_split._is_owner('model.layers.20') is None
+    with patch.object(layer_split,'_state',(8,ids,3)):
+        assert layer_split._is_owner('model.layers.20') is True
+        assert layer_split._is_owner('model.layers.20.indexer.k_cache') is True
+        assert layer_split._is_owner('model.layers.2') is False
+    with patch.object(layer_split,'_state',(8,ids,5)):
+        assert layer_split._is_owner('model.layers.20') is False
+
+
+def layer_split_compressed_cache_accessor():
+    require()
+    local_own=torch.ones(2);local_src=torch.full((2,),7.)
+    def make(is_source):
+        obj=object.__new__(split_attention.HcuV41PcpAttention);torch.nn.Module.__init__(obj)
+        obj.is_kv_source=is_source;obj.compressed_cache_prefix='model.layers.20'
+        obj.kv_cache=local_own;obj._static_forward_context={'model.layers.20':NS(kv_cache=local_src)}
+        return obj
+    calls=[]
+    def fake_broadcast(prefix,owner,cache):calls.append((prefix,owner,cache));return 'broadcast-result'
+    ids=(2,8,14,20)
+    with patch.object(split_attention,'broadcast_kv_source_cache',fake_broadcast):
+        for is_source,expected_local in [(True,local_own),(False,local_src)]:
+            obj=make(is_source)
+            # No admitted ownership state: a local read only.
+            with patch.object(layer_split,'_state',None):
+                assert obj._compressed_kv_cache() is expected_local
+            with patch.object(layer_split,'_state',(8,ids,5)):
+                # Warm-up pass (no metadata dict): no collective on any rank.
+                with patch.object(split_attention,'get_forward_context',return_value=NS(attn_metadata=None)):
+                    assert obj._compressed_kv_cache() is expected_local
+                assert calls==[]
+                # Real pass: broadcast from the owner of layer 20 (rank 3).
+                with patch.object(split_attention,'get_forward_context',return_value=NS(attn_metadata={})):
+                    obj._broadcast_compressed_cache()
+                assert calls==[('model.layers.20',3,expected_local)]
+                calls.clear()
+
+
+def layer_split_broadcast():
+    from test_dsa_cache_layout import (
+        groups, placement, runtime,
+        test_broadcast_writes_bound_scratch_with_padding_and_no_receive_allocation,
+        test_empty_local_queries_still_participate_in_collectives,
+    )
+    # Direct replay calls do not execute pytest's worker-registration fixture.
+    with patch.object(runtime, '_source_block_sizes', {
+        name: spec.block_size for name, spec in placement._specs(groups()[0])
+    }):
+        test_broadcast_writes_bound_scratch_with_padding_and_no_receive_allocation()
+        test_empty_local_queries_still_participate_in_collectives()
+
+
+for name,fn in [('admission_and_owned_backends',admission),('native_constructor_namespace',constructors),('decoder_replay_gate',decoder_replay_gate),('public_model_publication',publication),('native_CR2_link_200x8',native_ring_200),('native_preparation_200x8',native_preparation_200),('production_FP8_local_scoring_200x8',local_indexer_200),('actual_local_output_and_padding',local_output),('layer_split_ownership',layer_split_ownership),('layer_split_indexer_cache',layer_split_indexer_cache),('layer_split_write_suppression',layer_split_write_suppression),('layer_split_compressed_cache_accessor',layer_split_compressed_cache_accessor),('layer_split_broadcast',layer_split_broadcast)]:case(name,fn)
 repo=Path(__file__).resolve().parents[2]
 functions=[native_model.DeepseekV4DecoderLayer.__init__,native_model.DeepseekV4Model.__init__,vl_model.DeepseekV41ForCausalLM.__init__]
-report=dict(cases=RESULTS,passed=sum(r['status']=='passed' for r in RESULTS),total=len(RESULTS),cuda_initialized=torch.cuda.is_initialized(),native_model_source=native_model.__file__,native_rocm_source=rocm.__file__,native_constructor_hashes={f'{f.__module__}.{f.__qualname__}':hashlib.sha256(inspect.getsource(f).encode()).hexdigest() for f in functions},vllm_metadata=importlib.metadata.version('vllm'),source_hashes={str(p.relative_to(repo)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (repo/'adapter_extension/src/hcu_vllm_das').glob('v41_pcp*.py')},boundaries='CPU source replay; transports, projection/cache/GPU kernels doubled; no GPU/full model/Graph accuracy')
+report=dict(cases=RESULTS,passed=sum(r['status']=='passed' for r in RESULTS),total=len(RESULTS),cuda_initialized=torch.cuda.is_initialized(),native_model_source=native_model.__file__,native_rocm_source=rocm.__file__,native_constructor_hashes={f'{f.__module__}.{f.__qualname__}':hashlib.sha256(inspect.getsource(f).encode()).hexdigest() for f in functions},vllm_metadata=importlib.metadata.version('vllm'),source_hashes={str(p.relative_to(repo)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (repo/'adapter_extension/src/hcu_vllm_das').glob('*.py') if p.name.startswith(('v41_pcp', 'dsa_cache_'))},boundaries='CPU source replay; transports, projection/cache/GPU kernels doubled; no GPU/full model/Graph accuracy')
 Path(sys.argv[1]).write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))
 sys.exit(0 if report['passed']==report['total'] and not report['cuda_initialized'] else 1)
