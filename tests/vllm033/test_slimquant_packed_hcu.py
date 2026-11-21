@@ -30,6 +30,81 @@ def _unpack_reference(packed, *, swapped=False, unsigned=False):
     return torch.stack(pair, dim=-1).flatten(-2).to(torch.int32)
 
 
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize(
+    "rows,hidden,topk",
+    [(0, 256, 2), (1, 256, 2), (4, 2560, 10), (17, 2560, 10),
+     (256, 2560, 10), (1024, 2560, 10), (9, 256, 16), (5, 320, 32), (2, 8192, 1),
+     (3, 16384, 2), (3, 256, 64)],
+)
+def test_actual_padding_preparation_contract_and_changing_input_graph(
+    dtype_name, rows, hidden, topk
+):
+    import torch
+    from hcu_vllm_das.slimquant_packed import prepare_packed_provider_inputs
+
+    dtype = getattr(torch, dtype_name)
+    generator = torch.Generator(device="cuda").manual_seed(367211)
+    x = torch.randn((rows, hidden), device="cuda", dtype=dtype, generator=generator)
+    ids = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    for row in range(rows):
+        ids[row] = torch.randperm(2 * topk, device="cuda", generator=generator)[:topk]
+    weights = torch.rand((rows, topk), device="cuda", generator=generator)
+    if rows:
+        ids[0].fill_(-1)
+        x[0, ::2] = float("nan")
+        x[0, 1::2] = float("inf")
+        weights[0].fill_(float("nan"))
+    if rows > 1:
+        ids[1, ::2] = -1
+    if rows == 17:
+        # apply accepts strided route metadata; outputs must be contiguous.
+        ids = ids.repeat_interleave(2, dim=1)[:, ::2]
+        weights = weights.repeat_interleave(2, dim=1)[:, ::2]
+
+    def assert_contract(output):
+        # Independent CPU predicates and uniqueness oracle. Padding-id order
+        # is intentionally unspecified; padding carries no contribution.
+        y, w, i = [value.cpu() for value in output]
+        source_x, source_w, source_i = [value.cpu() for value in (x, weights, ids)]
+        valid = source_i >= 0
+        torch.testing.assert_close(y[valid.any(-1)], source_x[valid.any(-1)], rtol=0, atol=0)
+        torch.testing.assert_close(w[valid], source_w[valid], rtol=0, atol=0)
+        torch.testing.assert_close(i[valid], source_i[valid], rtol=0, atol=0)
+        assert not y[~valid.any(-1)].count_nonzero()
+        assert not w[~valid].count_nonzero()
+        assert ((i[~valid] >= 0) & (i[~valid] < topk)).all()
+        assert all(len(set(row)) == topk for row in i.tolist())
+        for original, result in zip((x, weights, ids), output):
+            assert result.shape == original.shape and result.dtype == original.dtype
+            assert result.is_contiguous()
+
+    original = [value.clone() for value in (x, weights, ids)]
+    assert_contract(prepare_packed_provider_inputs(x, weights, ids))
+    for before, after in zip(original, (x, weights, ids)):
+        torch.testing.assert_close(before, after, rtol=0, atol=0, equal_nan=True)
+    if not rows:
+        return
+    prepare_packed_provider_inputs(x, weights, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = prepare_packed_provider_inputs(x, weights, ids)
+    pointers = [value.data_ptr() for value in output]
+    for generation in range(4):
+        if generation % 2:
+            ids[0] = torch.arange(topk, device="cuda", dtype=torch.int32)
+            weights[0].fill_(0.25)
+            x[0].fill_(generation + 1)
+        else:
+            ids[0].fill_(-1)
+            weights[0].fill_(float("nan"))
+            x[0].fill_(float("nan"))
+        graph.replay()
+        assert_contract(output)
+        assert [value.data_ptr() for value in output] == pointers
+
+
 def _quantized_reference(x, ids, routes, weights, dtype, **decode):
     """CPU integer GEMMs and explicit producer/storage rounding, no vendor API."""
     import torch

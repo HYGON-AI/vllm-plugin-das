@@ -39,6 +39,20 @@ def prepare_packed_provider_inputs(x, topk_weights, topk_ids):
     Unused hidden rows may contain NaNs; zero them before zero-weight routes
     are evaluated. Tensor predicates remain dynamic during Graph replay.
     """
+    # This is a per-layer operation even for a tiny decode batch. Avoid a
+    # sequence of eager sort/scan/gather kernels in the validated HCU geometry.
+    # Larger shapes retain the Torch path rather than growing a K-by-K tile
+    # or a whole hidden row without a bound.
+    if (
+        x.is_cuda
+        and x.ndim == 2
+        and x.is_contiguous()
+        and 0 < x.shape[1] <= 8192
+        and 0 < topk_ids.shape[-1] <= 32
+    ):
+        from .slimquant_packed_triton import prepare_provider_inputs
+
+        return prepare_provider_inputs(x, topk_weights, topk_ids)
     valid = topk_ids >= 0
     # Core guarantees top-k <= expert count. Among the first top-k experts,
     # at least as many ids are unused as there are padding slots in this row.
