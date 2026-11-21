@@ -38,6 +38,9 @@ verifier. Verify the registered target implementation and its observable
 behavior; direct verifier calls do not qualify full configuration construction
 or model execution.
 
+For Mooncake cross-stage timing and legacy tracing switches, follow
+[stage correlation and startup ordering](references/mooncake-stage-tracing.md).
+
 Confirm that tests call the production owner. A class or timeout formula copied
 into a test can pass after the production code regresses. Use real ZMQ sockets
 for receive behavior and real FutureWrapper constructors for queue ordering and
