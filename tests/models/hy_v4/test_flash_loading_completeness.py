@@ -58,8 +58,9 @@ def model(monkeypatch):
             [torch.nn.Linear(2, 3) for _ in range(2)])
         for name in ("hc_attn_layer", "hc_mlp_layer"):
             module = torch.nn.Module()
-            module.hc_scale = torch.nn.Parameter(torch.empty(2))
-            module.hc_base = torch.nn.Parameter(torch.empty(6))
+            module.hc_pre = torch.nn.Module()
+            module.hc_pre.hc_scale = torch.nn.Parameter(torch.empty(2))
+            module.hc_pre.hc_base = torch.nn.Parameter(torch.empty(4))
             setattr(layer, name, module)
     result.model.hc_head = torch.nn.Module()
     result.model.hc_head.hc_head_base = torch.nn.Parameter(torch.empty(2))
@@ -148,8 +149,8 @@ NON_WEIGHT_LEAVES = (
     "engram_layer.unified_pre_gamma", "engram_layer.unified_per_hc_scales.0",
     "engram_layer.unified_per_hc_scales.1", "engram_layer.value_proj.bias",
     "engram_layer.key_projs.0.bias", "engram_layer.key_projs.1.bias",
-    "hc_attn_layer.hc_scale", "hc_attn_layer.hc_base",
-    "hc_mlp_layer.hc_scale", "hc_mlp_layer.hc_base",
+    "hc_attn_layer.hc_pre.hc_scale", "hc_attn_layer.hc_pre.hc_base",
+    "hc_mlp_layer.hc_pre.hc_scale", "hc_mlp_layer.hc_pre.hc_base",
 )
 MANDATORY_NON_WEIGHTS = tuple(
     f"model.layers.{layer}.{leaf}" for layer in range(2) for leaf in NON_WEIGHT_LEAVES
@@ -195,3 +196,30 @@ def test_mandatory_non_weights_load_through_actual_assignment(monkeypatch):
     assert calls == ["core", "shards"]
     for name, value in values.items():
         torch.testing.assert_close(parameters[name], value, rtol=0, atol=0)
+
+
+def test_disabled_hc_constructor_has_no_mandatory_hc_parameters(monkeypatch):
+    shell, calls = model(monkeypatch)
+    source = SOURCE.parents[2] / "hy_v4/hc.py"
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "HYV4HCLayer")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                and n.name == "__init__")
+    # Keep the real conditional constructor and Python's zero-argument super.
+    body = ast.parse("class DisabledHC(torch.nn.Module):\n    pass\n").body[0]
+    body.body = [init]
+    nodes = [ast.ImportFrom(module="__future__",
+                           names=[ast.alias(name="annotations")], level=0), body]
+    namespace = {"torch": torch}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+                 str(source), "exec"), namespace)
+    for layer in shell.model.layers:
+        for name in ("hc_attn_layer", "hc_mlp_layer"):
+            module = namespace["DisabledHC"](SimpleNamespace(enable_ihc=False), 0)
+            assert not list(module.named_parameters())
+            setattr(layer, name, module)
+    del shell.model.hc_head
+    with shell.weight_loading_session():
+        shell._loaded_weights.update(name for name, _ in shell.named_parameters())
+    assert calls == ["core", "shards"]
