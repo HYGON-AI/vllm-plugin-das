@@ -12,8 +12,9 @@ checkpoint weight is read, so this module instead
   exists and no rearrangement can run);
 * fans each logical checkpoint expert out to every physical slot the plan maps
   it to, before quantization reads the loaded parameters;
-* publishes the routing tensors Core's router reads, pinning one primary
-  replica per logical expert and disabling load recording.
+* publishes the routing tensors Core's router reads and disables load recording.
+  HY4 retains all loaded replicas for Core's token hash; V41 keeps its existing
+  primary-only dispatch contract.
 
 Scope is fail-closed: the owned PCP target model with expert parallel and a
 proposal-complete version-2 map. Anything else raises instead of silently
@@ -546,13 +547,13 @@ def install_routing(model, cfg):
         num_nodes=get_node_count(),
         num_physical_experts=num_physical,
     )
-    # Every token takes the primary replica in column 0; Core's mapping kernel
-    # reads exactly ``logical_replica_count`` columns per logical expert, and
-    # recording stays off because the placement never changes.
-    primary_count = torch.ones((num_layers, num_logical), dtype=torch.long,
-                               device=device)
+    # HY4 v0.25.1 keeps the placement's actual multiplicities: Core hashes token
+    # positions across those replicas, even when load recording is disabled.
+    # Publishing ones silently concentrates hot experts on column 0. Keep the
+    # already-qualified V41 primary-only contract scoped to that model.
+    replica_count = counts if is_hy4_static(cfg) else torch.ones_like(counts)
     _publish(moe_model, cfg, logical_to_physical=ordered,
-             replica_count=primary_count, num_physical=num_physical, record=False)
+             replica_count=replica_count, num_physical=num_physical, record=False)
     setattr(moe_model, _INSTALLED_ATTR, True)
     return plan
 
