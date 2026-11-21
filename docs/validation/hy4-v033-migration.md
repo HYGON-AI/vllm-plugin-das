@@ -303,3 +303,41 @@ these nine cases; this supersedes overlapping earlier counts. No RDMA engine or
 GPU transfer is instantiated in these tests.
 Actual PCP16→DP16 transport, cancellation under load and full PD HumanEval
 remain required before this connector can be accepted.
+
+### PCP MTP decisions
+
+A subsequent read-only PCP16 trace found different draft IDs at proposal4:
+rank0 `[4239,1246,926]`, rank6 `[4239,1246,25]`. The next verification accepted
+three tokens on rank0 and four on rank6 for the same request. Per-rank request
+history then diverged. This establishes a distributed state-consistency defect;
+it does not establish why the initial floating-point sampling decisions differed.
+
+The static HY4 provider now registers an existing Adapter post-model-load
+callback before weight allocation. It binds only the loaded native MTP
+instance's `sample_draft`: execute the original sampler, then use Core's PCP
+rank0 broadcast. Synchronization happens at every draw, before the next draft
+forward writes KV. Synchronizing only the completed proposal would be too late.
+Core classes, globals, proposal loops, target verification and state updates
+remain unchanged. This is neither synthetic acceptance nor uniform MoE routing.
+
+The scope is eager MRV2/TP1/PP1/DP1/DCP1, PCP>1, native MTP and greedy draft
+sampling. Unsupported workers are refused before allocation. Probabilistic
+drafts, adaptive verification and watermarking are excluded; PCP1 and no-MTP
+instances retain their original methods. Owner/process/group drift latches an
+error rather than continuing with a partially synchronized instance.
+
+The updated installed affected CPU suite passed245 tests, including12 native
+sampling and shared load-seam cases. In a separate sixteen-request experiment,
+seven raw draft draws still differed, but no completed proposal or target
+sample/count disagreement was captured within the bounded trace. All sixteen
+responses parsed as Python. The experiment used batch budget32768 to avoid an
+intermittent HSA allocation failure in the98304 startup profile; it is not a
+best-configuration throughput measurement. Full accuracy with the packaged
+provider remains pending.
+
+The current-platform0.25.1 D control completed158/164, with failures103,115,116,
+132,145,160. Core7b108a and Plugin7a5a4af use the same DTK2610/Torch2.11/FlashMLA
+as the candidate, on the same D node and read-only model mount. The metadata
+probe hashes config, checkpoint index and tokenizer; it does not recompute all
+checkpoint shard hashes. This is a single-D control, not the full historical PD
+stack or a performance-parity result.

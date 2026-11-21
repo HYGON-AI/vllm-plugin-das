@@ -84,6 +84,8 @@ _MTP_INIT = bind_constructor(mtp.HYV4MTP.__init__,
 
 def _preflight(cfg, *, draft):
     runtime.validate_config(cfg)
+    from ..hy4_pcp_mtp import prepare
+    prepare(cfg)
     options = runtime.read_options(cfg)
     hf = cfg.model_config.hf_config
     if draft:
