@@ -8,6 +8,15 @@ import torch
 from vllm_hcu.patch.worker.op_opt import patch_kimi_k3_eplb_model as patch
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pp_missing_layer_cache(monkeypatch):
+    from vllm.model_executor.models import utils
+
+    # The pinned vLLM caches by id(model). Short-lived CPU fixtures can reuse
+    # an earlier model's ID and otherwise inherit its PP ownership metadata.
+    monkeypatch.setattr(utils, "_model_to_pp_missing_layer_names", {})
+
+
 def test_kimi_model_exposes_moe_protocol_and_current_weight_views(monkeypatch):
     class Runner:
         def __init__(self):
