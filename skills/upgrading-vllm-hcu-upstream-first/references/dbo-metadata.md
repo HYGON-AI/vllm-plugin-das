@@ -56,7 +56,12 @@ HCU fix. Zero reservation does not disable DBO or establish overlap performance.
 If Adapter scopes the official environment input, cover the actual controller
 construction points: this release uses V1 model loading and V2 KV
 initialization. Restore the previous environment on exceptions and between
-models. A cached stale Core value must fail clearly; clearing Core's cache is
+models. Trace `WorkerProc.enable_envs_cache()` between these phases: V1 KV
+initialization must not reapply a temporary budget after the V1 controller
+already exists. V2's later controller cannot inherit an earlier temporary
+value after the cache freezes. A V1-only admission repair must leave V2
+official-owned and record its default as unqualified rather than claiming
+both runners work. A cached stale Core value must fail clearly; clearing Core's cache is
 not validation. Test real configuration constructors, the bound-device
 controller and the installed model separately. Compare stock and automatic
 policy with the official variable absent; record an explicit-zero control as
