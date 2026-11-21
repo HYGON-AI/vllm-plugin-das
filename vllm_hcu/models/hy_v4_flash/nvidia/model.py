@@ -433,7 +433,12 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
                 required = {
                     name
                     for name, _ in self.named_parameters()
-                    if name.endswith((".weight", ".w13_weight", ".w2_weight"))
+                    if name.endswith((
+                        ".weight", ".w13_weight", ".w2_weight",
+                        ".w13_weight_packed", ".w2_weight_packed",
+                        ".w13_weight_scale", ".w2_weight_scale",
+                        ".w13_weight_shape", ".w2_weight_shape",
+                    ))
                 }
                 missing = required - self._loaded_weights
                 if missing:

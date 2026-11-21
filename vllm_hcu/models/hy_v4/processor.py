@@ -327,6 +327,7 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
         image_std=None,
         patch_size=16,
         merge_size=2,
+        spatial_patch_size=1,
         timestamp_token_per_frame=None,
         timestamp_token_reserve=None,
         video_max_image_size=None,
@@ -350,7 +351,7 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
                     w,
                     t,
                     patch_size,
-                    merge_size,
+                    merge_size * spatial_patch_size,
                     size.longest_edge,
                     video_max_image_size or self.video_max_image_size,
                     timestamp_token_per_frame
@@ -363,9 +364,10 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
                 video = self.resize(
                     video, SizeDict(height=h, width=w), PILImageResampling.BICUBIC
                 )
-            if h % (patch_size * merge_size) or w % (patch_size * merge_size):
+            factor = patch_size * merge_size * spatial_patch_size
+            if h % factor or w % factor:
                 raise ValueError(
-                    "Video frame dimensions must align with patch and merge"
+                    "Video frame dimensions must align with patch, merge and spatial compression"
                 )
             if t * h * w > size.longest_edge:
                 raise ValueError("Processed video exceeds its total max_pixels budget")
