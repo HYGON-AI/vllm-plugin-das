@@ -106,3 +106,16 @@ To enable the text-config flag from the CLI for a VL checkpoint, create a
 pass a partial `text_config` dict through `--hf-overrides`: the installed
 Transformers `update` replaces that attribute rather than deep-merging it.
 Never edit the original checkpoint or installed packages for this experiment.
+
+
+### Whole-parameter completeness
+
+The outer Flash loading session must require all six expert
+`w13/w2_weight_{packed,scale,shape}` parameters, even if no shard for a parameter
+was observed. The per-expert shard audit only sees names present in the stream.
+Keep the official Core tracker and shard checks after this explicit audit.
+Core builds with stricter quantized tracking already provide an additional
+check; compatible Core builds must not be assumed to have that stricter policy.
+The completeness regressions isolate the final Core tracker to verify the
+Plugin audit itself, including nested sessions and exception cleanup. They do
+not test checkpoint sharding, weight postprocessing or full-model inference.
