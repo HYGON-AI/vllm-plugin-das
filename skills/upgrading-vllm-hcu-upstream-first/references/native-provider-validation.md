@@ -183,6 +183,18 @@ format within that tool; do not inject runtime overrides through the Plugin.
 Track compile-only, training, parsing, correctness and measured CSV export
 separately. A successful dry-run establishes parameter mapping only.
 
+If compile/training/parsing succeeded but benchmark collection fails on a
+missing dependency, retain the original exit code and generated configs. Check
+whether the selected public CLI supports benchmark-only recovery: the inspected
+BoltOps `--benchmark` path skips Steps1-3 and reuses installed configs. Add only
+missing dependencies in physically owned package/metadata directories; validate
+shared dependency owners and RECORDs before and after installation. Seal the
+configs, recover Steps4-5 in a new bounded run, and bind its result to the original
+successful stages. This path uses relaxed CSV discovery, so separately require
+the exact requested M/architecture/dtype/geometry coverage and positive finite
+measurements. Do not retune, rewrite a failed full-run receipt, or let old native
+or model supervisors silently accept the recovered lineage.
+
 Inspect the current correctness stage rather than relying on an older guide.
 The observed INT4 W4A8 tuner uses FP16 and enables its reference only for
 M<=256; its Torch fallback shares provider activation quantization. That does

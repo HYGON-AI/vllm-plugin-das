@@ -582,3 +582,62 @@ Evidence: `evidence/pr367-provider-tuning-20261122/`: first-run/dry-run receipts
 `tuner-api-red.log`, `tuner-api-final.log`, tools JUnit/recovery log,
 `fixed-candidate.json`, `provider-publication.json`, installed/shared attestations,
 `publication-validation-snapshot.json` and live `tuning-fixed-r1/` receipts.
+
+
+## Public tuner benchmark-only recovery (2026-11-22)
+
+The previously live fixed full CLI is now terminal with exit2. Compile-only2
+passed and all five training shards passed; parsing generated both top/bottom
+JSONs for M1/4/32/256/1024. Step4 then failed during collection because matplotlib
+was absent. The failed receipt and both failed gated supervisors remain unchanged;
+neither old supervisor launched native or model work.
+
+Six absent benchmark packages were added only to physical private directories
+with --no-deps; all wheel payloads/RECORDs and existing shared dependencies were
+validated. The unchanged public --benchmark CLI recovered only Steps4-5 in a
+new bounded run, exit0, five benchmark tests passed. No retuning occurred; both
+generated config hashes remain identical. The reference is FP16 for M<=256 and
+shares provider activation quantization; M1024 is not covered by that reference.
+AITER's reference implementation performed normal private-cache JIT (module_aiter_enum
+and module_cpp_api); no installed native package or FlashAttention was rebuilt.
+Original/private provider,14 owned packages, six new packages and shared
+Torch/Triton/LightOp audits pass before native execution.
+
+CSV coverage is checked independently because --benchmark uses relaxed discovery:
+exactly five real positive finite full-MoE Graph measurements, no missing-M or
+nearest-M fallback. Times are component measurements, not model throughput:
+
+| M | time_us |
+| --- | --- |
+| 1 | 88.685 |
+| 4 | 194.828 |
+| 32 | 782.731 |
+| 256 | 1621.060 |
+| 1024 | 1880.654 |
+
+Both recovered native runs pass: 36 small-batch FP16/BF16 expanded-versus-fused,
+zero-padding and changed-input Graph cases, plus 24 large-batch cases including
+sampled independent signed-INT4 CPU math, changed-input replay and
+sentinel/nonfinite padding. These use the actual shard geometry
+E512/H2560/I320/top-k10. All compared outputs, padding checks and stable Graph
+pointer assertions pass; original weights remain unchanged. The 36 and 24 are
+distinct runs; historical matrices are not pooled. Provider, owned-package and
+shared-package audits also pass after both native runs.
+
+New recovery lineage binds the original successful Steps1-3, recovered Steps4-5,
+unchanged configs, CSV and package attestations before native execution. The old
+full CLI still exited2; the new recovery result does not rewrite it. Repository
+and external skills now explain this recovery and physical dependency ownership.
+
+No tuned model request or HumanEval generation is represented by this component
+result. Original96-request0/32 text agreement,103.756 versus151.681token/s
+(-31.60%), normal lifecycle, submitted-head CI and full-feature/topology/PLE/update
+gates remain open. Keep Plugin367 Draft. Production/tests/tools/CI remain
+b53f900a553cf3165b6f377ece81592dbcbdf48b. No FlashAttention modification/rebuild or
+DeepSeek V4.1 checkpoint test.
+
+Evidence: evidence/pr367-provider-tuning-20261122/{tuning-fixed-r1,
+benchmark-recovery-r1,continuation-validation-recovered-r1,
+native-tuned-small-recovered-r1,native-tuned-vendor-recovered-r1}/ and
+recovered-tuning-gates-r1.json; evidence/pr367-benchmark-recovery-20261122/
+contains this summary, external skill archive and publication receipts.
