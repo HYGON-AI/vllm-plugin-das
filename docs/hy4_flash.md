@@ -30,6 +30,16 @@ The current runtime explicitly rejects speculative decoding.
 
 ## Validation gates
 
+Quantized checkpoint completeness includes every routed layer's FP32
+`expert_bias`, including the `gate.e_score_correction_bias` checkpoint alias;
+do not rely on Core's optional quantized tracker to detect a whole missing bias.
+For visual 2D RoPE, the learned position-embedding edge is a training grid,
+while preprocessing can admit longer rectangular grids. The tower retains
+Core's original table and uses its inverse frequencies for a local,
+nonpersistent extension when needed. CPU tests cover real admitted profiling
+grids, repeated growth without a construction config context, and unchanged
+small-grid values. Encoder Graph and installed VL model validation remain open.
+
 CPU-only seam tests:
 
 ```sh

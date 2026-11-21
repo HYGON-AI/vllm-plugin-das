@@ -306,6 +306,7 @@ class HYV4VisionTransformer(nn.Module):
         use_dp = is_vit_use_data_parallel(config.num_attention_heads)
         self.tp_size = 1 if use_dp else get_tensor_model_parallel_world_size()
         self.rotary_pos_emb = None
+        self.register_buffer("_vision_cos_sin_cache", None, persistent=False)
         if config.use_2d_rope:
             if config.rope_2d_percent != 1.0:
                 raise ValueError("HYV4 vision supports only full 2D RoPE")
@@ -334,6 +335,25 @@ class HYV4VisionTransformer(nn.Module):
         assert self.rotary_pos_emb is not None
         max_grid = max(max(h, w) for _, h, w in grid_thw)
         cos_table, sin_table = self.rotary_pos_emb.get_cos_sin(max_grid)
+        if cos_table.shape[0] < max_grid:
+            # Learned position embeddings are interpolated: their training
+            # edge is not an upper bound on grids admitted by preprocessing.
+            # Keep the factory-shared Core cache unchanged. Grow a local
+            # nonpersistent table using Core's frequencies, without creating
+            # a new CustomOp outside its model-construction config context.
+            cache = self._vision_cos_sin_cache
+            if cache is None or cache.shape[0] < max_grid:
+                capacity = cos_table.shape[0] if cache is None else cache.shape[0]
+                length = max(max_grid, 2 * capacity)
+                with torch.device(cos_table.device):
+                    inv_freq = self.rotary_pos_emb._compute_inv_freq(
+                        self.rotary_pos_emb.base
+                    )
+                    positions = torch.arange(length, dtype=torch.float32)
+                    angles = torch.outer(positions, inv_freq)
+                    cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+                self._vision_cos_sin_cache = cache
+            cos_table, sin_table = cache[:max_grid].chunk(2, dim=-1)
         indices = [
             torch.stack(
                 (torch.arange(h).repeat_interleave(w), torch.arange(w).repeat(h)),

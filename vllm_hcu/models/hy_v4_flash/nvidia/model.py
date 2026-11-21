@@ -438,6 +438,7 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
                         ".w13_weight_packed", ".w2_weight_packed",
                         ".w13_weight_scale", ".w2_weight_scale",
                         ".w13_weight_shape", ".w2_weight_shape",
+                        ".expert_bias",
                     ))
                 }
                 missing = required - self._loaded_weights

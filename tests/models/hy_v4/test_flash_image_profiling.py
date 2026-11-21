@@ -74,3 +74,94 @@ def test_maximum_matches_all_feasible_grids_with_configured_newlines(newline, ma
 def test_impossible_aligned_pixel_budget_reports_no_shape(minimum, maximum):
     with pytest.raises(ValueError):
         _profile_shape(minimum, maximum)
+
+
+def _vision_rope():
+    """Real Core RoPE with only the vision layer/constructor shell isolated."""
+    import torch
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    source = MODEL / "vision.py"
+    tree = ast.parse(source.read_text())
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_rope_cos_sin")
+    namespace = {"torch": torch, "get_rope": get_rope}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    shell = torch.nn.Module()
+    shell.rotary_pos_emb = get_rope(head_size=64, max_position=129,
+        is_neox_style=True, dtype=torch.float32,
+        rope_parameters={"rope_theta": 10000.0, "partial_rotary_factor": 0.5})
+    shell.register_buffer("_vision_cos_sin_cache", None, persistent=False)
+    return shell, namespace["_rope_cos_sin"]
+
+
+@pytest.fixture
+def vision_rope_context():
+    import torch
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    initialized = torch.cuda.is_initialized()
+    with set_current_vllm_config(VllmConfig()):
+        yield
+    assert torch.cuda.is_initialized() == initialized
+
+
+def _check_rope_values(actual, grid):
+    import torch
+
+    # Independent unbounded 2D definition, not another cached Core lookup.
+    indices = torch.cat([torch.stack((torch.arange(h).repeat_interleave(w),
+                                     torch.arange(w).repeat(h)), -1).repeat(t, 1)
+                         for t, h, w in grid])
+    angles = indices.float()[..., None] / (10000.0 ** (torch.arange(0, 32, 2).float() / 32))
+    expected = angles.cos().flatten(1), angles.sin().flatten(1)
+    for value, reference in zip(actual, expected):
+        assert value.dtype == torch.float32 and value.device.type == "cpu"
+        torch.testing.assert_close(value, reference, rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize("newline", [False, True])
+@pytest.mark.parametrize("maximum", [512**2, 2048**2])
+def test_profile_image_grid_has_complete_vision_rope(newline, maximum, vision_rope_context):
+    size, resize = _profile_shape(512**2, maximum, newline=newline)
+    assert resize(size.height, size.width, 32, 512**2, maximum) == (size.height, size.width)
+    grid = [[1, size.height // 16, size.width // 16]]
+    shell, rope = _vision_rope()
+    _check_rope_values(rope(shell, grid), grid)
+
+
+@pytest.mark.parametrize("grid", [[[1, 1638, 10]], [[1, 10, 1638]], [[2, 132, 130]]])
+def test_vision_rope_grows_for_rectangular_and_multiframe_grids(grid, vision_rope_context):
+    import torch
+    from vllm.config import set_current_vllm_config
+
+    shell, rope = _vision_rope()
+    before = tuple(value.clone() for value in rope(shell, [[1, 4, 6]]))
+    original_cache = shell.rotary_pos_emb.cos_sin_cache.clone()
+    # Core CustomOps require a construction context. Runtime growth must
+    # work after that context is gone and must not mutate a shared object.
+    with set_current_vllm_config(None):
+        _check_rope_values(rope(shell, grid), grid)
+        pointer = shell._vision_cos_sin_cache.data_ptr()
+        _check_rope_values(rope(shell, grid), grid)
+    assert shell._vision_cos_sin_cache.data_ptr() == pointer
+    torch.testing.assert_close(shell.rotary_pos_emb.cos_sin_cache, original_cache, rtol=0, atol=0)
+    assert not any("cos_sin_cache" in name for name in shell.state_dict())
+    for value, original in zip(rope(shell, [[1, 4, 6]]), before):
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
+
+
+def test_vision_rope_extends_again_for_larger_mixed_grid_without_config(vision_rope_context):
+    import torch
+    from vllm.config import set_current_vllm_config
+
+    shell, rope = _vision_rope()
+    with set_current_vllm_config(None):
+        first = [[1, 132, 4]]
+        old = tuple(value.clone() for value in rope(shell, first))
+        old_capacity = shell._vision_cos_sin_cache.shape[0]
+        grid = [[1, 8, 12], [2, old_capacity + 2, 4]]
+        _check_rope_values(rope(shell, grid), grid)
+        assert shell._vision_cos_sin_cache.shape[0] >= old_capacity + 2
+        for value, original in zip(rope(shell, first), old):
+            torch.testing.assert_close(value, original, rtol=0, atol=0)

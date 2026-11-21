@@ -40,12 +40,54 @@ def model(monkeypatch):
             torch.nn.Parameter(torch.zeros(1), requires_grad=False))
     result.model.norm = torch.nn.Module()
     result.model.norm.weight = torch.nn.Parameter(torch.ones(1))
+    result.model.layers = torch.nn.ModuleList([torch.nn.Module(), torch.nn.Module()])
+    for layer in result.model.layers:
+        layer.mlp = torch.nn.Module()
+        layer.mlp.expert_bias = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
     result.model.loaded_parts = {}
     calls = []
     result.model.verify_loaded_parts = lambda: calls.append("shards")
     monkeypatch.setattr(DefaultModelLoader, "track_weights_loading",
         lambda self, *args, **kwargs: calls.append("core"))
     return result, calls
+
+
+@pytest.mark.parametrize("layer", [0, 1])
+def test_entire_correction_bias_missing_rejects_without_core_tracker(monkeypatch, layer):
+    shell, calls = model(monkeypatch)
+    omitted = f"model.layers.{layer}.mlp.expert_bias"
+    with pytest.raises(ValueError, match=omitted):
+        with shell.weight_loading_session():
+            shell._loaded_weights.update(name for name, _ in shell.named_parameters() if name != omitted)
+    assert calls == []
+    assert shell._weight_loading_depth == 0 and not shell._loaded_weights
+
+
+@pytest.mark.parametrize("checkpoint_leaf", ["expert_bias", "gate.e_score_correction_bias"])
+def test_correction_bias_canonical_and_checkpoint_alias_load_completely(monkeypatch, checkpoint_leaf):
+    import regex as re
+    from types import MethodType
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    shell, calls = model(monkeypatch)
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HYV4FlashModel")
+    nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
+    nodes += [n for n in tree.body if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "_EXPERT_WEIGHT" for t in n.targets)]
+    nodes += [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("load_weights", "_record_part")]
+    namespace = {"re": re, "default_weight_loader": default_weight_loader}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(SOURCE), "exec"), namespace)
+    shell.model._record_part = MethodType(namespace["_record_part"], shell.model)
+    values = [torch.arange(3).float() + layer + 1 for layer in range(2)]
+    with shell.weight_loading_session():
+        shell._loaded_weights.update(name for name, _ in shell.named_parameters() if not name.endswith(".expert_bias"))
+        loaded = namespace["load_weights"](shell.model,
+            ((f"layers.{layer}.mlp.{checkpoint_leaf}", value) for layer, value in enumerate(values)))
+        shell._loaded_weights.update("model." + name for name in loaded)
+    assert calls == ["core", "shards"]
+    for layer, value in zip(shell.model.layers, values):
+        torch.testing.assert_close(layer.mlp.expert_bias, value, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("missing", PACKED)
