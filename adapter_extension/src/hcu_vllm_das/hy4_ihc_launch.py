@@ -68,9 +68,3 @@ def selected(cfg):
     if use_tuned:
         logger.info_once('HY4 native iHC launch 4/4 enabled for gfx938 backbone')
     return use_tuned
-
-
-def make_ct_decoder(*args, **kwargs):
-    cfg = kwargs.get('vllm_config') if 'vllm_config' in kwargs else args[1]
-    cls = TunedDecoder if selected(cfg) else native.HYV4DecoderLayer
-    return cls(*args, **kwargs)

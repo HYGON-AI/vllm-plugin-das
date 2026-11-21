@@ -6,19 +6,27 @@ from vllm.models.hy_v4.nvidia import mtp
 
 from ..hy4_constructor import bind_constructor
 from ..hy4_indexer_loader import load_indexer_wk
-from ..hy4_ihc_launch import make_ct_decoder
+from .. import hy4_ihc_launch as ihc_launch
 
 
 class HcuHY4CTBackbone(native.HYV4Model):
-    __init__ = bind_constructor(native.HYV4Model.__init__,
-                               {'HYV4DecoderLayer': make_ct_decoder})
     load_weights = bind_constructor(native.HYV4Model.load_weights,
         {'_try_load_fp8_indexer_wk': load_indexer_wk})
 
 
+class HcuHY4CTLaunchBackbone(HcuHY4CTBackbone):
+    __init__ = bind_constructor(native.HYV4Model.__init__,
+                               {'HYV4DecoderLayer': ihc_launch.TunedDecoder})
+
+
+def make_ct_backbone(*, vllm_config, prefix=''):
+    cls = HcuHY4CTLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4CTBackbone
+    return cls(vllm_config=vllm_config, prefix=prefix)
+
+
 class HcuHY4CTForCausalLM(native.HYV4ForCausalLM):
     __init__ = bind_constructor(native.HYV4ForCausalLM.__init__,
-                               {'HYV4Model': HcuHY4CTBackbone})
+                               {'HYV4Model': make_ct_backbone})
 
 
 class HcuHY4CTMTP(mtp.HYV4MTP):

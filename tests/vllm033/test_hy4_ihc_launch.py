@@ -79,17 +79,23 @@ def test_launch_bindings_keep_native_code_and_precision():
 
 
 @pytest.mark.parametrize('selected', [False, True])
-def test_ct_factory_keeps_constructor_arguments(monkeypatch, selected):
+@pytest.mark.parametrize('kind', ['ct', 'static'])
+def test_backbone_factory_keeps_constructor_arguments(monkeypatch, selected, kind):
     owned = module()
+    from hcu_vllm_das.models import hy4_ct as ct, hy4_static as static
     calls = []
     monkeypatch.setattr(owned, 'enabled', lambda cfg: selected)
-    monkeypatch.setattr(owned.native, 'HYV4DecoderLayer',
+    owner = ct if kind == 'ct' else static
+    base = 'HcuHY4CTBackbone' if kind == 'ct' else 'HcuHY4StaticBackbone'
+    tuned = 'HcuHY4CTLaunchBackbone' if kind == 'ct' else 'HcuHY4StaticLaunchBackbone'
+    monkeypatch.setattr(owner, base,
                         lambda *a, **kw: calls.append(('native', a, kw)) or 'native')
-    monkeypatch.setattr(owned, 'TunedDecoder',
+    monkeypatch.setattr(owner, tuned,
                         lambda *a, **kw: calls.append(('tuned', a, kw)) or 'tuned')
     cfg = config()
-    kwargs = {'config': cfg.model_config.hf_config, 'vllm_config': cfg, 'prefix': 'model.layers.0'}
-    assert owned.make_ct_decoder(**kwargs) == ('tuned' if selected else 'native')
+    kwargs = {'vllm_config': cfg, 'prefix': 'model'}
+    factory = owner.make_ct_backbone if kind == 'ct' else owner.make_static_backbone
+    assert factory(**kwargs) == ('tuned' if selected else 'native')
     assert calls == [('tuned' if selected else 'native', (), kwargs)]
 
 
@@ -102,3 +108,49 @@ def test_backbone_and_static_keep_native_loops_and_mtp():
     assert static.HcuHY4StaticMTP.forward is static.mtp.HYV4MTP.forward
     assert static.HcuHY4StaticLaunchDecoder._forward_ihc is owned.TunedDecoder._forward_ihc
     assert owned.native.HYV4DecoderLayer._forward_ihc.__globals__['triton_ihc_post_pre_rms_norm'] is owned.kernels.triton_ihc_post_pre_rms_norm
+
+
+def _raw_constructor(function):
+    while function.__module__ == 'vllm.compilation.decorators':
+        cells = dict(zip(function.__code__.co_freevars, function.__closure__))
+        function = cells['old_init'].cell_contents
+    return function
+
+
+@pytest.mark.parametrize('kind', ['ct', 'static', 'ct-launch', 'static-launch'])
+def test_actual_native_backbone_constructor_keeps_decoder_type_check(monkeypatch, kind):
+    """Execute the full native ctor body; only heavy layer leaves are doubled."""
+    owned = module()
+    from hcu_vllm_das.hy4_constructor import bind_constructor
+    from hcu_vllm_das.models import hy4_ct as ct, hy4_static as static
+
+    def tiny_decoder(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.block_type = 'feedforward'
+
+    for cls in [owned.native.HYV4DecoderLayer, owned.TunedDecoder,
+                static.HcuHY4StaticDecoder, static.HcuHY4StaticLaunchDecoder]:
+        monkeypatch.setattr(cls, '__init__', tiny_decoder)
+    monkeypatch.setattr(owned, 'selected', lambda cfg: True)
+    cls = {'ct': ct.HcuHY4CTBackbone, 'ct-launch': ct.HcuHY4CTLaunchBackbone,
+           'static': static.HcuHY4StaticBackbone,
+           'static-launch': static.HcuHY4StaticLaunchBackbone}[kind]
+    raw = _raw_constructor(cls.__init__)
+    body = bind_constructor(raw, {
+        'current_platform': NS(device_type='cpu'),
+        'get_pp_group': lambda: NS(is_first_rank=True, is_last_rank=True),
+        'VocabParallelEmbedding': torch.nn.Embedding,
+        'RMSNorm': torch.nn.RMSNorm,
+        'make_layers': lambda count, make, prefix: (0, count, torch.nn.ModuleList([
+            make(f'{prefix}.{i}') for i in range(count)])),
+    })
+    hf = NS(hidden_size=8, vocab_size=8, num_hidden_layers=1, enable_ihc=False,
+            tie_word_embeddings=False, rms_norm_eps=1e-6, routed_scaling_factor=1.,
+            n_routed_experts=4, moe_intermediate_size=8, n_shared_experts=1,
+            norm_topk_prob=True)
+    cfg = NS(model_config=NS(hf_config=hf), cache_config=None, quant_config=None,
+             parallel_config=NS(eplb_config=NS(num_redundant_experts=0)))
+    instance = cls.__new__(cls)
+    body(instance, vllm_config=cfg)
+    assert isinstance(instance.layers[0], owned.native.HYV4DecoderLayer)
+    assert instance.num_moe_layers == 0

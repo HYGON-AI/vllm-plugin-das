@@ -58,12 +58,6 @@ class HcuHY4StaticLaunchDecoder(HcuHY4StaticDecoder):
     _forward_ihc = ihc_launch.TunedDecoder._forward_ihc
 
 
-def _static_decoder(*args, **kwargs):
-    cfg = kwargs.get('vllm_config') if 'vllm_config' in kwargs else args[1]
-    cls = HcuHY4StaticLaunchDecoder if ihc_launch.selected(cfg) else HcuHY4StaticDecoder
-    return cls(*args, **kwargs)
-
-
 def _logical_expert_mapping(*args, **kwargs):
     # The static loader owns replica fan-out. Core's dynamic mapping would
     # emit a second set of physical IDs for repeated logical checkpoint keys.
@@ -73,13 +67,24 @@ def _logical_expert_mapping(*args, **kwargs):
 
 class HcuHY4StaticBackbone(HcuHY4CTBackbone):
     __init__ = bind_constructor(native.HYV4Model.__init__,
-        {'HYV4DecoderLayer': _static_decoder, 'HYV4MoEFused': HcuHY4StaticMoE})
+        {'HYV4DecoderLayer': HcuHY4StaticDecoder, 'HYV4MoEFused': HcuHY4StaticMoE})
     get_expert_mapping = bind_constructor(native.HYV4Model.get_expert_mapping,
         {'fused_moe_make_expert_params_mapping': _logical_expert_mapping})
 
 
+class HcuHY4StaticLaunchBackbone(HcuHY4StaticBackbone):
+    # Core also uses HYV4DecoderLayer in isinstance(), so keep a real class.
+    __init__ = bind_constructor(native.HYV4Model.__init__,
+        {'HYV4DecoderLayer': HcuHY4StaticLaunchDecoder, 'HYV4MoEFused': HcuHY4StaticMoE})
+
+
+def make_static_backbone(*, vllm_config, prefix=''):
+    cls = HcuHY4StaticLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4StaticBackbone
+    return cls(vllm_config=vllm_config, prefix=prefix)
+
+
 _OUTER_INIT = bind_constructor(native.HYV4ForCausalLM.__init__,
-                              {'HYV4Model': HcuHY4StaticBackbone})
+                              {'HYV4Model': make_static_backbone})
 
 
 class HcuHY4StaticMTPDecoder(nvidia.HYV4DecoderLayer):
