@@ -102,8 +102,14 @@ def test_worker_binds_target_and_draft_in_initial_pool(monkeypatch, with_draft, 
     worker_cls = load_method(
         "vllm_hcu/v1/worker.py", "HcuGPUWorker", WorkerBase,
         # The extracted body does not inherit module-level imports, so provide
-        # every module-level dependency it reads directly.
-        {"runner_logger": SimpleNamespace(info=lambda *args: None), "os": os},
+        # every module-level dependency it reads directly. The Gemma4 BW1000
+        # switch reports off: this contract is about the weights pool, and the
+        # Gemma4 install paths assert invariants no stub model here satisfies.
+        {
+            "runner_logger": SimpleNamespace(info=lambda *args: None),
+            "os": os,
+            "_gemma4_bw1000_enabled": lambda: False,
+        },
     )
     worker = worker_cls()
     worker.model_runner = runner_cls()
