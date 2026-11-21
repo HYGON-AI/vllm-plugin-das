@@ -1,0 +1,23 @@
+{%- set image_count = namespace(value=0) -%}
+{%- for message in messages -%}
+{%- if loop.first and message['role'] != 'system' -%}
+{{- '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' -}}
+{%- endif -%}
+{{- '<|im_start|>' + message['role'] + '\n' -}}
+{%- if message['content'] is string -%}
+{{- message['content'] -}}
+{%- else -%}
+{%- for content in message['content'] -%}
+{%- if content['type'] == 'image' or 'image' in content or 'image_url' in content -%}
+{%- set image_count.value = image_count.value + 1 -%}
+{{- '<image ' + (image_count.value | string) + '><img><IMG_CONTEXT></img>' -}}
+{%- elif 'text' in content -%}
+{{- content['text'] -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- endif -%}

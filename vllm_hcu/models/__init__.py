@@ -7,6 +7,9 @@ from vllm import ModelRegistry
 
 
 def register_model():
+    from vllm_hcu.models.locateanything import register as register_locateanything
+    register_locateanything()
+
     ModelRegistry.register_model(
         "DeepseekV3ForCausalLM", "vllm_hcu.models.deepseek_v2:DeepseekV3ForCausalLM"
     )
