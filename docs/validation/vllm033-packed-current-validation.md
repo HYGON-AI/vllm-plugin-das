@@ -539,3 +539,46 @@ b53f900a553cf3165b6f377ece81592dbcbdf48b.
 Evidence: `evidence/pr367-online-keep-20261122/online-keep-audit.json`,
 `source-contract.json`, raw phase/pause/step/lifecycle receipts, package/checkpoint
 attestations and `public-provider-tuning-review.json`.
+
+
+## Public provider tuner API repair (snapshot 2026-11-21T18:06:43.609279+00:00)
+
+The public INT4 W4A8 tuner dry-run exits0 and maps the requested TP2/E512/N320/
+K2560/top-k10 geometry to both missing config names. Its first actual run exits1:
+compile-only has2 failures and the first training shard has1 failure because
+`triton.autotune` rejects vendor-only `perf_debug`. No configs are generated;
+no controller signal or owned survivor is present. The dry-run is not a tuning
+or numerical pass.
+
+The narrow repair is [BoltOps #32](https://github.com/HYGON-AI/BoltOPs/pull/32) at
+`1a458763cf2248b94af01e6b779fa2f842b7cc19`, based on current default branch `release/0.1.0`
+`3fa0991395473098651a3d23e9955e01477b0f93`. It uses public autotune arguments and emits the existing
+parser ABI for every candidate count, preserving candidate generation, math and
+measurement policy. Four new real-autotuner CPU contracts use explicitly synthetic
+kernel timings: original source4 errors -> fixed4 passes. Related tools95 pass,
+1 fails at a real device import with GPUs hidden; that one passes with gfx938
+visible but reports the known unmodified upstream torch.library teardown error.
+Original failures remain recorded. This is not native math or throughput proof.
+
+The independent private validation combination retains already-open BoltOps#20;
+replacing it with a plain default-branch wheel would remove that lifecycle fix.
+Combined source `f01549b65aeb20d87bceb7670108fc9bbcc4a23d` yields Python wheel SHA256
+`1d493779d5a0be245840e6a4fadb385f8c38b1e31aceab17d7c3add7d88572b4`. Its900 provider payload files match the original
+installation except the tuner file. Source/wheel/installed payload and RECORDs,
+14 owned packages and shared dependencies pass pre-run checks. No native package
+or FlashAttention rebuild/change occurred; normal private-cache Triton JIT remains
+part of execution. The rejected plain-default wheel and its reason are retained.
+
+At this snapshot the fixed public CLI is live on physicalGPU0 with fresh private
+caches and logs; actual compilation has progressed past the original API error.
+No generated pair, completed tuning/correctness/CSV stage, BF16 independent
+reference/changed-input Graph result, model request or HumanEval generation is
+claimed. This live run is not a release acceptance result. BoltOps#32
+and Plugin#367 stay Draft; existing model output, -31.60% throughput, lifecycle,
+submitted-head CI and remaining release gates stay open. Production/tests/tools/CI
+in this Plugin MR remain `b53f900a553cf3165b6f377ece81592dbcbdf48b`.
+
+Evidence: `evidence/pr367-provider-tuning-20261122/`: first-run/dry-run receipts,
+`tuner-api-red.log`, `tuner-api-final.log`, tools JUnit/recovery log,
+`fixed-candidate.json`, `provider-publication.json`, installed/shared attestations,
+`publication-validation-snapshot.json` and live `tuning-fixed-r1/` receipts.

@@ -175,6 +175,23 @@ filenames; names such as hidden/FFN can map differently to local N and K.
 Keep numerical references and changed-input Graph checks separate from tuning
 scores, especially if the tool has no complete correctness reference.
 
+Check the tuner's actual compiler API before spending a device run. A Triton
+version or reported config-capability family does not establish support for
+vendor-only `autotune` keywords such as `perf_debug`. When repairing the provider's
+tool, preserve candidate generation and measurement policy and emit its parser
+format within that tool; do not inject runtime overrides through the Plugin.
+Track compile-only, training, parsing, correctness and measured CSV export
+separately. A successful dry-run establishes parameter mapping only.
+
+Inspect the current correctness stage rather than relying on an older guide.
+The observed INT4 W4A8 tuner uses FP16 and enables its reference only for
+M<=256; its Torch fallback shares provider activation quantization. That does
+not qualify BF16 serving or larger batches. Check independent signed-INT4 math
+and changing-input Graph execution for the actual serving dtype and shape
+before model/performance acceptance. Retain any existing unmerged provider
+repairs in an explicitly recorded validation combination; replacing that
+combination with the provider's default branch can silently remove a fix.
+
 Persist each child exit code and identity-bound descendant state before port
 or attestation checks that can raise. If the controller loses an unsaved exit
 code, record it as unknown. A later successful bind does not establish immediate
