@@ -118,7 +118,7 @@ def test_cpu_without_candidates_never_touches_the_candidate_kernels():
 def staged_config():
     """Config fixture plus the scheduler view the staging plan reads."""
     cfg = config(ratio=1)
-    cfg.scheduler_config = NS(max_num_seqs=32)
+    cfg.scheduler_config = NS(max_num_seqs=32, max_num_batched_tokens=192)
     return cfg
 
 

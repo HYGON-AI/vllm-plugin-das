@@ -32,8 +32,12 @@ class Providers:
     prefill: object
     decode: object
     native: object
+    native_calls: tuple = ()
+    plan: object = None
+    native_plan: object = None
 
 
+_PLAN_NAME = 'get_paged_mqa_logits_fp4_metadata'
 _CONTRACTS = (
     ('lightop.gemmopt', 'dsv41_gather_index_k_fp4', ('cache', 'slots', 'page_size')),
     ('lightop.gemmopt', 'fp8_fp4_mqa_logits',
@@ -49,14 +53,17 @@ _providers = None
 def load_providers():
     global _providers
     calls = []
+    native_calls = []
     native = import_module('lightop.op')
     for mod, name, parameters in _CONTRACTS:
         fn = getattr(import_module(mod), name, None)
         if not callable(fn) or tuple(inspect.signature(fn).parameters) != parameters:
             raise RuntimeError('FP4 provider ABI changed: ' + mod + '.' + name)
-        if not callable(getattr(native, name, None)):
+        native_fn = getattr(native, name, None)
+        if not callable(native_fn):
             raise RuntimeError('FP4 native symbol missing: ' + name)
         calls.append(fn)
+        native_calls.append(native_fn)
     prefill, decode = inspect.signature(calls[1]), inspect.signature(calls[2])
     if (prefill.parameters['candidate_blocks'].default is not None
             or prefill.parameters['candidate_query_lens'].default is not None
@@ -66,7 +73,20 @@ def load_providers():
             or decode.parameters['out'].default is not None
             or decode.parameters['rows_per_request'].default != 1):
         raise RuntimeError('FP4 provider defaults changed')
-    prepared = Providers(*calls, native)
+    planner = getattr(import_module('lightop.attention.mqa'), _PLAN_NAME, None)
+    native_plan = getattr(native, _PLAN_NAME, None)
+    if callable(planner) and callable(native_plan):
+        try:
+            plan_params = inspect.signature(planner).parameters
+        except (TypeError, ValueError):
+            plan_params = {}
+        if (tuple(plan_params) != ('context_lens', 'block_kv', 'num_sms', 'rows_per_request')
+                or plan_params['rows_per_request'].default != 1):
+            planner = native_plan = None
+    else:
+        planner = native_plan = None
+    prepared = Providers(*calls, native, tuple(native_calls),
+                         plan=planner, native_plan=native_plan)
     if _providers is not None and prepared != _providers:
         raise RuntimeError('FP4 provider ownership changed; start a new process')
     _providers = prepared
@@ -76,6 +96,14 @@ def load_providers():
 def providers():
     if _providers is None:
         raise RuntimeError('FP4 providers not prepared before allocation')
+    # LightOp's Python wrappers resolve these native symbols on each call.
+    # Check identity before dispatch without repeating startup ABI inspection.
+    for (_, name, _), expected in zip(_CONTRACTS, _providers.native_calls):
+        if getattr(_providers.native, name, None) is not expected:
+            raise RuntimeError('FP4 provider ownership changed; start a new process')
+    if (_providers.native_plan is not None
+            and getattr(_providers.native, _PLAN_NAME, None) is not _providers.native_plan):
+        raise RuntimeError('FP4 planner ownership changed; start a new process')
     return _providers
 
 
@@ -114,6 +142,7 @@ STAGING_PAGE_BYTES = 4352
 # would make the second layer's request a shape mismatch, which the workspace
 # manager rejects outright -- a startup failure, not a slow path.
 _reserved_pools: dict[int, object] = {}
+_reserved_fused: set[tuple[object, int]] = set()
 
 
 def decode_rows(cfg):
@@ -127,10 +156,10 @@ def decode_rows(cfg):
         # PCP width. Each owner keeps all verification tokens of its requests.
         width = parallel.prefill_context_parallel_size
         requests = (requests + width - 1) // width
-    return requests * (1 + extra)
+    return min(cfg.scheduler_config.max_num_batched_tokens, requests * (1 + extra))
 
 
-def staging_plan(cfg, max_model_len, compress_ratio):
+def staging_plan(cfg, max_model_len, compress_ratio, *, fused=False):
     """Shapes the decode staging needs at the configured maximum.
 
     Returns ``None`` when the allocator already uses 64-record pages, because
@@ -162,7 +191,9 @@ def staging_plan(cfg, max_model_len, compress_ratio):
     transient += slots * 4         # int32 staging block table
     transient += width * 8         # per-row offsets before broadcasting
     return dict(requests=requests, pages_per_row=pages_per_row,
-                page_records=page_records, transient=transient,
+                page_records=page_records,
+                transient=requests * pages_per_row * 4 if fused else transient,
+                fused=fused,
                 shape=(requests, pages_per_row, STAGING_PAGE_BYTES))
 
 
@@ -204,7 +235,11 @@ def reserve_decode_staging(cfg, max_model_len, compress_ratio, device):
       immediately, which is what makes the peak honest without permanently
       holding the bytes.
     """
-    return reserve_staging_plan(staging_plan(cfg, max_model_len, compress_ratio), device)
+    from hcu_adapter.kernels.fp4_staging_triton import supports_staging_device
+
+    plan = staging_plan(cfg, max_model_len, compress_ratio,
+                        fused=supports_staging_device(device))
+    return reserve_staging_plan(plan, device)
 
 
 def reserve_staging_plan(plan, device):
@@ -215,6 +250,8 @@ def reserve_staging_plan(plan, device):
     probe = torch.empty(plan['transient'], dtype=torch.uint8, device=device)
     del probe
     _reserved_pools[plan['page_records']] = pool
+    if plan.get('fused', False):
+        _reserved_fused.add((pool.device, plan['page_records']))
     return pool
 
 
@@ -242,13 +279,14 @@ def _staging_target(cache, requests, pages_per_row):
     return torch.empty(shape, dtype=torch.uint8, device=cache.device)
 
 
-def stage_decode_pages(cache, block_table, row_ends, max_context_len, gather):
-    """Stage non-64 allocator pages into LightOp's canonical decode pages.
+def stage_decode_pages(cache, block_table, row_ends, max_context_len, gather, *, live_only=False):
+    """Stage live non-64 allocator pages into canonical decode pages.
 
     ``gather`` is the audited ``dsv41_gather_index_k_fp4`` provider.  It
     returns one ``[64]`` payload and one UE8M0 ``int32`` word per requested
-    slot.  Invalid columns use slot zero only as an in-bounds read and are
-    masked by the native scorer through ``row_ends``.
+    slot. With live_only, the device copier visits only live pages. Within
+    the final page, invalid records use slot-zero bytes. The native scorer's
+    live schedule excludes later pages. The gather fallback fills every page.
     """
     page_records = physical_page_records(cache)
     if page_records == 64:
@@ -262,6 +300,18 @@ def stage_decode_pages(cache, block_table, row_ends, max_context_len, gather):
         raise ValueError('FP4 staging row/table count mismatch')
     if block_table.shape[1] < (width + page_records - 1) // page_records:
         raise ValueError('FP4 staging block table is too narrow for requested context')
+    # Native provider identity keeps injected gather collaborators observable.
+    # CPU/unsupported hardware retains the original gather and repack path.
+    if cache.is_cuda and _providers is not None and gather is _providers.gather:
+        from hcu_adapter.kernels.fp4_staging_triton import stage_decode_pages as stage
+        pages = _staging_target(cache, requests, pages_per_row)
+        table = torch.empty((requests, pages_per_row), dtype=torch.int32, device=cache.device)
+        if stage(cache, block_table, row_ends, pages, table, live_only=live_only):
+            flat_pool = pages.reshape(requests * pages_per_row, STAGING_PAGE_BYTES)
+            pool = flat_pool.as_strided((flat_pool.shape[0], 64, 68), (4352, 68, 1))
+            return pool, table
+        if (cache.device, page_records) in _reserved_fused:
+            raise RuntimeError('Profiled Triton FP4 staging contract changed')
     offsets = torch.arange(width, device=cache.device, dtype=torch.int64)
     valid = offsets[None, :] < row_ends.reshape(-1, 1)
     logical_pages = torch.div(offsets, page_records, rounding_mode='floor')
@@ -433,15 +483,26 @@ def execute(layer, hidden, query, weights):
         n = meta.num_decode_tokens
         d = meta.decode
         lengths = d.seq_lens.reshape(-1).contiguous()
+        live_schedule = p.plan is not None and cache.is_cuda
         decode_cache, decode_table = stage_decode_pages(
-            cache, d.block_table.contiguous(), lengths, layer.max_model_len, p.gather
+            cache, d.block_table.contiguous(), lengths, layer.max_model_len, p.gather,
+            live_only=live_schedule,
         )
+        schedule = None
+        if live_schedule:
+            sms = torch.cuda.get_device_properties(cache.device).multi_processor_count
+            schedule = p.plan(lengths, 64, sms)
         logits = p.decode(query[0][:n].unsqueeze(1).contiguous(),
                           query[1][:n].unsqueeze(1).contiguous(),
                           decode_cache.unsqueeze(2), weights[:n].contiguous(),
                           lengths, decode_table.contiguous(),
-                          None, width, 64, None, 1)
+                          schedule, width, 64, None, 1)
+        # Unsupported planners keep the fully staged and masked reader path.
+        # The bounded selector masks unwritten tails when native TopK declines.
+        if not live_schedule:
+            columns = torch.arange(logits.shape[1], dtype=lengths.dtype, device=logits.device)
+            logits.masked_fill_(columns[None, :] >= lengths[:, None], -float('inf'))
         _select(logits, torch.zeros_like(lengths), lengths, out[:n],
                 None if layer.candidate_blocks is None else layer.candidate_blocks[:n],
-                layer.candidate_block_size, layer.candidate_write)
+                layer.candidate_block_size, layer.candidate_write, bounded=live_schedule)
     return layer.topk_indices_buffer

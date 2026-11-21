@@ -227,7 +227,8 @@ def activate_extension(context):
             profile_worker = _profile_policy() if pcp_selected else None
             if pcp_selected:
                 _install_profile_worker()
-                if layout is not None:
+                if profile_worker or layout is not None:
+                    # W4A8 profiling also uses the factory with a replicated KV cache.
                     from .dsa_prefill_runner import install as install_prefill_runner
                     install_prefill_runner()
             if selected and _key(entry) == _NATIVE:

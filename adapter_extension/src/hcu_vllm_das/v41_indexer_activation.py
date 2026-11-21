@@ -50,23 +50,28 @@ def _digest_paths():
     from pathlib import Path
     v41_fp8_indexer = _adapter_module('v41_fp8_indexer')
     triton = _adapter_module('v41_fp8_indexer_triton')
+    from hcu_adapter import kernels
+
+    kernel_dir = Path(kernels.__file__).resolve().parent
     return (
         Path(__file__).with_name('fp4_indexer.py'),
+        Path(__file__).with_name('wo_a_layout.py'),
+        Path(__file__).with_name('qkv_split.py'),
+        Path(__file__).with_name('dspark_post.py'),
         Path(__file__).with_name('fp4_indexer_lightop.py'),
         Path(__file__).with_name('fp4_workspace.py'),
         Path(__file__).with_name('v41_indexer.py'),
         Path(v41_fp8_indexer.__file__),
         Path(triton.__file__),
+        kernel_dir / 'fp4_staging_triton.py',
+        kernel_dir / 'indexer_live_mask_triton.py',
+        kernel_dir / 'indexer_topk_lightop.py',
+        kernel_dir / 'indexer_topk_post_triton.py',
     )
 
 
 def _digest_signature():
-    """Cheap change detector for the pinned files: (path, mtime, size) each.
-
-    Re-hashing five files on every decode step would put file I/O on the hot
-    path, because the FP4 branch asks for health each step. The signature is
-    what gets compared per step; the hash is only recomputed when it moves.
-    """
+    """Check pinned file metadata at lifecycle boundaries before rehashing."""
     signature = []
     for path in _digest_paths():
         stat = path.stat()
@@ -76,15 +81,23 @@ def _digest_signature():
 
 def _compute_digest():
     import hashlib
+    from .qkv_split import _NATIVE_BUILD_MATCHES
+    from .wo_a_layout import _SOURCE_MATCHES
+
     digest = hashlib.sha256()
     for path in _digest_paths():
         digest.update(path.read_bytes())
+    digest.update(str(_SOURCE_MATCHES).encode())
+    digest.update(str(_NATIVE_BUILD_MATCHES).encode())
     return digest.hexdigest()
 
 
 def policy_factor():
     if _state is not None and _state.get('fp4', False):
-        return ('fp4-lightop', _state['digest'])
+        from . import qkv_split, wo_a_layout
+
+        return ('fp4-lightop', _state['digest'], qkv_split.preflight_admitted(),
+                wo_a_layout.preflight_admitted())
     return _state['enabled'] if _state is not None else _flag(_FLAG, default=True)
 
 
@@ -124,6 +137,23 @@ def _prepare_fp4():
         raise RuntimeError('FP4 requires published triton lowering')
     load_providers()
     return _compute_digest(), _digest_signature()
+
+
+def fp4_reader_ready():
+    """Probe the reader for auto selection without publishing FP4 deployment state."""
+    with _lock:
+        if _failure is not None:
+            raise ExtensionCommitError(_failure)
+        try:
+            from .fp4_indexer_lightop import load_providers
+
+            load_providers()
+        except ExtensionCommitError:
+            raise
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            # An explicit MXFP4 request still goes through strict admission.
+            return False
+        return True
 
 
 def _record_fp4():
@@ -167,6 +197,30 @@ def admit_config(cfg):
             _publishing = False
 
 
+def check_fp4_dispatch():
+    """Read the admitted deployment and latched failure before FP4 execution."""
+    if _failure is not None:
+        raise ExtensionCommitError(_failure)
+    state = _state
+    if state is None or state['fp4'] is not True:
+        raise RuntimeError('V41 FP4 indexer requires deployment admission')
+
+
+def check_graph_fp4_provider():
+    state = _state
+    if state is not None and state.get('fp4') is True:
+        from .fp4_indexer_lightop import providers
+
+        check_fp4_dispatch()
+        try:
+            providers()
+        except RuntimeError as error:
+            try:
+                _fatal(str(error))
+            except ExtensionCommitError as refusal:
+                raise refusal from error
+
+
 def check_health():
     with _lock:
         if _failure is not None:
@@ -207,12 +261,8 @@ def check_health():
                 fp4_packer.check_health()
                 load_providers()
                 check_native_contract()
-                # Re-check here, not just at activation: a health check that
-                # only returned the digest captured at activation could not
-                # notice that the source changed afterwards, which made it a
-                # cache key rather than a continuing health guarantee. The stat
-                # signature is compared every call; the hash is recomputed only
-                # when it moves, so no file read lands on the decode hot path.
+                # Detect source drift at lifecycle checks before reusing the
+                # activation digest. FP4 dispatch uses the admitted state only.
                 if _digest_signature() != _state['signature']:
                     if _compute_digest() != _state['digest']:
                         _fatal('V41 FP4 indexer implementation changed since '

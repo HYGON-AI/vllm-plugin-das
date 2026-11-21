@@ -197,8 +197,8 @@ def test_real_mhc_oot_allocation_is_used_by_the_pcp_constructor(monkeypatch):
     # Only the runtime constructor is doubled; real declaration, register_oot
     # and CustomOp.__new__ execute. No kernel/device initialization is needed.
     backend = NS(MhcAiterRuntime=lambda *args: NS())
-    declarations = owner._declare_aiter(mhc, kernels, ir, backend, None, "1")
-    for name, declaration in zip(("MHCPreDelayedOp", "MHCPostOp"), declarations[2:]):
+    declarations, _ = owner._declare_aiter(mhc, kernels, ir, backend, None, "1")
+    for name, declaration in zip(("MHCPreDelayedOp", "MHCPostOp"), declarations[2:4]):
         original = model._DECODER_INIT.__globals__[name]
         original.register_oot(declaration[2])
         assert type(original.__new__(original)) is declaration[2]

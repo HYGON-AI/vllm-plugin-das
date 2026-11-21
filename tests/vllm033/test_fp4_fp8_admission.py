@@ -152,7 +152,7 @@ def test_pending_mxfp4_admission_keeps_provider_and_digest_checks(owners, monkey
     monkeypatch.setattr(owners.indexer, '_digest_signature', lambda: ('signature',))
     owners.indexer.admit_config(owners.cfg)
     assert owners.indexer._state['fp4'] is True
-    assert owners.indexer.policy_factor() == ('fp4-lightop', 'digest')
+    assert owners.indexer.policy_factor() == ('fp4-lightop', 'digest', False, False)
     assert registry.get('vllm_fp4_indexer')['implementation'] == 'lightop'
     assert {'packer', 'providers', 'native'} <= set(calls)
     owners.indexer.check_health()  # Works after leaving a model config context.
@@ -246,7 +246,7 @@ def test_default_after_public_owner_activation(owners, monkeypatch,
     if expected_dtype == 'auto':
         assert owners.cfg.attention_config.resolve_indexer_kv_dtype('fp8') == 'fp8'
         return
-    assert owners.indexer.policy_factor() == ('fp4-lightop', 'digest')
+    assert owners.indexer.policy_factor() == ('fp4-lightop', 'digest', False, False)
     # Once admitted, auto is a real policy change, not another activation wait.
     owners.cfg.attention_config.indexer_kv_dtype = 'auto'
     with pytest.raises(bridge.LatchedVllmRuntimeError, match='ownership/policy changed'):

@@ -26,6 +26,7 @@ class Linear(torch.nn.Module):
     def __init__(self, input_size, output_size, **kwargs):
         super().__init__()
         self.output_size = sum(output_size) if isinstance(output_size, list) else output_size
+        self.weight = torch.empty(0, device='cpu')
         self.calls = []
     def forward(self, x):
         self.calls.append(x)
@@ -67,6 +68,7 @@ def chain(monkeypatch):
     cfg.cache_config.swa_bounded_replay = False
     cfg.cache_config.enable_prefix_caching = False
     cfg.scheduler_config = NS(max_num_batched_tokens=16, max_num_seqs=4)
+    cfg.device_config = NS(device=torch.device('cpu'))
     monkeypatch.setenv('HCU_VLLM_FP4_INDEXER_IMPL', 'lightop')
     monkeypatch.setenv('HCU_VLLM_FP4_PACKER_IMPL', 'triton')
     monkeypatch.setenv('HCU_VLLM_SPARSE_INDEXER_IMPL', 'stock')
@@ -79,9 +81,11 @@ def chain(monkeypatch):
     # This reader/constructor suite doubles owner publication; real deferred
     # admission and its ordering are covered by test_fp4_fp8_admission.
     monkeypatch.setattr(activation, 'admit_config', lambda cfg: None)
+    monkeypatch.setattr(activation, '_state', {'fp4': True})
     monkeypatch.setattr(fp4_packer, 'check_health', lambda: None)
     monkeypatch.setattr(fp4_packer, '_state', dict(mode='triton'))
-    monkeypatch.setattr(impl, 'load_providers', lambda: reader.providers())
+    monkeypatch.setattr(impl, 'load_providers', reader.providers)
+    monkeypatch.setattr(reader, 'load_providers', reader.providers)
     monkeypatch.setattr(impl, 'get_current_vllm_config', lambda: cfg)
     monkeypatch.setattr(scorer, 'current_config', lambda: cfg)
     monkeypatch.setattr(scorer, 'register_splitting_op', lambda cfg: None)
@@ -89,6 +93,7 @@ def chain(monkeypatch):
     monkeypatch.setattr(sparse_layer, 'get_current_vllm_config', lambda: cfg)
     cfg.kernel_config.sparse_indexer_topk_backend = 'torch'
     cfg.parallel_config.pcp_shard_decode_requests = False
+    cfg.parallel_config.use_ubatching = False
     monkeypatch.setattr(impl.common, '_use_v41_mxfp8_kv_record', lambda: False)
     context = NS(attn_metadata={})
     monkeypatch.setattr(impl, 'get_forward_context', lambda: context)
