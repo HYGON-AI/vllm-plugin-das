@@ -42,13 +42,14 @@ gfx938 的原生 DeepSeek V4.1 eager PCP 默认选择 HCU Inverse RoPE 和 PCP Q
 2. 开启组重复同样检查，生成容量绝对增量、倍数和百分比；检查两组生成 Token
    是否一致。容量没有增长、证据缺失或生成 Token 不同则保存失败结果并停止。
    logprob 差值独立报告，不用未约定的容差宣称数值等价。
-3. 两组容量与固定输入检查通过后，只在仍运行的开启组服务上测 HumanEval 前20题。
+3. 两组容量与固定输入检查通过后，只在仍运行的开启组服务上测 HumanEval 前 32 题。
 4. 清理开启组，结束测试；不再运行关闭组的精度测试。
 
 这样完整流程只需两次起服。`--stage capacity` 只做前两步。
-HumanEval 固定前20题（HumanEval/0～19）、temperature=0、并发16、输出上限2048、thinking关闭；
+HumanEval 固定前 32 题（HumanEval/0～31）、temperature=0、并发16、输出上限2048、thinking关闭；
 使用现有 EvalScope 官方 benchmark 的生成和评分方式，报告通过题数、pass@1、失败题和截断。
-这是开启组的20题子集分数，不代表164题全量成绩，也不据此声称相对关闭组精度无回退。
+结果范围为开启组的 32 题子集。正式验收保存原始 predictions、reviews 和逐题
+结果，并用隔离的评测环境保留同一批输出的 normalized 结果和历史失败题。
 未规定质量分数阈值；执行完整性通过不等于模型精度验收通过。HTTP失败、漏题和截断仍检查。
 
 ## 运行方式（容器内）
@@ -58,7 +59,7 @@ W4A8 全功能联测使用 `nmz18_w4a8_dspark.json`、`--stage on` 和
 静态 EPLB32（`locality_fair`）、SWA Bounded Replay、dSpark(5)、MXFP4
 Indexer，以及原生 FlashMLA、AITER mHC、PCP Q RoPE 和反向 RoPE 的配置。
 KV 显存由 vLLM 起服时测算。验收记录包含显存预算、实际 Token 容量、
-32K 输入结果和 HumanEval 前 20 题成绩。
+32K 输入结果和 HumanEval 前 32 题成绩。
 
 ```bash
 cd /workspace/layer_split
@@ -68,14 +69,14 @@ PROFILE=/path/to/profile.json
 # 只看完整计划；不会查询/使用 GPU。
 bash "$SCRIPT" --profile "$PROFILE"
 
-# CPU 准入、源码来源、私有算子哈希、模型文件和前20题数据集检查。
+# CPU 准入、源码来源、私有算子哈希、模型文件和原始 32 题数据检查。
 bash "$SCRIPT" --check --profile "$PROFILE"
 
 # 预约并核对实际卡号后执行。下方0..7仅为示例，不代表当前空闲。
 # 先只测容量：
 bash "$SCRIPT" --run --profile "$PROFILE" --stage capacity --gpus 0,1,2,3,4,5,6,7
 
-# 完整容量对比 → 开启组 HumanEval 20题精度：
+# 完整容量对比和开启组 HumanEval 32 题：
 bash "$SCRIPT" --run --profile "$PROFILE" --stage all --gpus 0,1,2,3,4,5,6,7
 
 # 预算、Replay 可调，但一次对比中的两组必须一致：
@@ -116,7 +117,7 @@ NMZ18 的 W4A8 环境使用 `--profile .../nmz18_w4a8.json`，模型为
 `/llm-models/DeepSeek-V4.1-Flash-Channel-INT4-w4a8`。
 该配置严格检查 CT INT4 权重/动态 INT8 激活，要求 CT W4A8 扩展及 DeepGEMM HIPC 算子，
 显式传递 `--quantization compressed-tensors --dtype bfloat16`；FP4 Indexer、
-SWA bounded replay 及 OFF→ON→ON-only HumanEval20 协议保持一致。
+SWA bounded replay 及 OFF→ON→ON-only HumanEval32 协议保持一致。
 NMZ18 的 W4A8 实测在分配24GiB KV时只剩约19.6GiB显存，
 此节点两组固定使用每卡12GiB KV预算，为32K输入和评测保留运行空间。
 新节点必须先通过 `--check`；模型实际兼容性、显存峰值和精度须等待八卡实测。
@@ -129,7 +130,7 @@ KV 预算。两组都传 `--gpu-memory-utilization 0.9`，各自从预算中扣�
 
 NMZ18 的宿主启动脚本 `launch_dspark_nmz18.sh` 使用 `--stage on`。仅启动 Layer Split
 开启组，记录 vLLM 实际给出的 KV Token 容量，发一次恰好 32768 Token 的输入并验证
-16 个输出 Token。通过后在同一个服务上运行 HumanEval 前 20 题。
+16 个输出 Token。通过后在同一个服务上运行 HumanEval 前 32 题。
 
 ```bash
 HCU_ADAPTER_HOST=none VLLM_PLUGINS=__disabled__ \
@@ -138,5 +139,5 @@ python3 -B vllm-plugin-das/tests/vllm033/layer_split_acceptance/test_controller.
 ```
 
 覆盖不增容/证据缺失的拒绝、假空闲、重复卡号、漏题/HTTP失败/截断、分数与逐题结果不一致、
-单组20题与起服顺序，以及容量失败时不启动精度测试和清理顺序。测试中的分数是构造数据，
+单组 32 题与起服顺序，以及容量失败时不启动精度测试和清理顺序。测试中的分数是构造数据，
 不属于实际模型成绩。

@@ -13,6 +13,9 @@ from pathlib import Path
 import sys
 
 
+HUMANEVAL_TASKS = 32
+
+
 def sample_results(output, expected_count):
     """Verify every judged task and retain HTTP/truncation evidence separately."""
     rows = {}
@@ -96,7 +99,7 @@ def main():
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--limit", type=int, default=HUMANEVAL_TASKS)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.batch_size, args.max_tokens, args.limit) < 1 or args.limit > 164:

@@ -51,3 +51,37 @@ def test_config_is_strict_and_does_not_read_legacy_env(monkeypatch):
     assert not layer_split_enabled(SimpleNamespace(additional_config={}))
     with pytest.raises(ValueError, match='boolean'):
         layer_split_enabled(SimpleNamespace(additional_config={KEY: {'enabled': '1'}}))
+
+
+def test_missing_companion_leaves_legacy_policy_and_refuses_layer_split(monkeypatch):
+    from hcu_vllm_das import inverse_rope_policy, layer_split_config, v41_pcp
+
+    monkeypatch.setattr(inverse_rope_policy, 'optional_adapter_module', lambda _: None)
+    monkeypatch.setattr(layer_split_config, 'optional_adapter_module', lambda _: None)
+    operators = {}
+    config = inverse_rope_policy.adapter_module('hcu_config')
+    monkeypatch.setattr(config, 'load', lambda: {'ops': operators, 'overrides': {}})
+    monkeypatch.setenv('HCU_DISABLE_OPS', '')
+    monkeypatch.setenv('VLLM_HCU_DSV41_PCP_ATTENTION', '1')
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+    assert register_cli() is None
+    assert inverse_rope_policy.selected_mode() == 'stock'
+    operators['vllm_inverse_rope'] = 'hcu'
+    assert inverse_rope_policy.selected_mode() == 'hcu'
+    monkeypatch.setenv('HCU_DISABLE_OPS', 'vllm_inverse_rope')
+    assert inverse_rope_policy.selected_mode() == 'stock'
+    with pytest.raises(ValueError, match='companion HCU Adapter'):
+        v41_pcp.validate_layer_split_policy(SimpleNamespace(
+            additional_config={KEY: {'enabled': True}}))
+
+
+def test_optional_companion_does_not_hide_an_inner_import_failure(monkeypatch):
+    from hcu_vllm_das.adapter_api import importlib, optional_adapter_module
+
+    def import_module(name):
+        raise ModuleNotFoundError(name='missing_inner_dependency')
+
+    monkeypatch.setattr(importlib, 'import_module', import_module)
+    with pytest.raises(ModuleNotFoundError) as error:
+        optional_adapter_module('hcu_adapter.bridges.vllm_cli')
+    assert error.value.name == 'missing_inner_dependency'

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-node FP4 P-capability test, followed by ON-only HumanEval-20. Default: plan only."""
+"""Single-node FP4 P-capability test with ON-only HumanEval/0–31. Default: plan only."""
 import argparse
 import contextlib
 import hashlib
@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 
+from evaluate_humaneval import HUMANEVAL_TASKS
 from gpu_guard import inventory, select, snapshot, require_idle
 
 HERE = Path(__file__).resolve().parent
@@ -120,7 +121,7 @@ def evaluator_command(args, output):
     return [args.profile['eval_python'], '-B', str(HERE/'evaluate_humaneval.py'),
         '--api-url', f'http://127.0.0.1:{args.port}/v1', '--model', MODEL_NAME,
         '--data', args.profile['data'], '--batch-size', '16', '--max-tokens', '2048',
-        '--limit', '20', '--output', str(output)]
+        '--limit', str(HUMANEVAL_TASKS), '--output', str(output)]
 
 
 def source_state(args):
@@ -507,18 +508,18 @@ def run_stages(args, proof):
 
 
 def summarize_accuracy(value):
-    expected = {'HumanEval/'+str(i) for i in range(20)}
-    if (value['num_tasks'] != 20 or set(value['task_results']) != expected
+    expected = {f'HumanEval/{i}' for i in range(HUMANEVAL_TASKS)}
+    if (value['num_tasks'] != HUMANEVAL_TASKS or set(value['task_results']) != expected
             or value['http_errors'] or any(type(v) is not bool for v in value['task_results'].values())):
-        raise RuntimeError('Incomplete HumanEval-20 coverage or HTTP errors')
+        raise RuntimeError(f'Incomplete HumanEval/0–{HUMANEVAL_TASKS-1} coverage or HTTP errors')
     passed = sum(value['task_results'].values())
-    if not math.isfinite(value['pass_at_1']) or abs(value['pass_at_1']-passed/20) > 1e-9:
+    if not math.isfinite(value['pass_at_1']) or abs(value['pass_at_1']-passed/HUMANEVAL_TASKS) > 1e-9:
         raise RuntimeError('HumanEval score differs from per-task results')
-    return dict(layer_split=True, num_tasks=20, passed=passed,
+    return dict(layer_split=True, num_tasks=HUMANEVAL_TASKS, passed=passed,
         pass_at_1=value['pass_at_1'], failed_task_ids=sorted(k for k,v in value['task_results'].items() if not v),
         truncated_task_ids=value['truncated_task_ids'], dataset_sha256=value['dataset_sha256'],
         evaluation_valid=not value['truncated_task_ids'], accuracy_regression_assessed=False,
-        quality_threshold=None, scope='HumanEval/0 through HumanEval/19; ON-only subset, not full-suite accuracy')
+        quality_threshold=None, scope=f'HumanEval/0 through HumanEval/{HUMANEVAL_TASKS-1}; ON-only')
 
 
 def plan(args):
@@ -534,7 +535,9 @@ def plan(args):
         gpu_memory_utilization=float(GPU_MEMORY_UTILIZATION),
         kv_budget_overrides_gpu_memory_utilization=args.kv_bytes is not None,
         input_tokens=list(lengths), output_tokens=OUTPUT, warmups_per_length=warmups,
-        humaneval=dict(tasks=20, layer_split=True, task_ids='HumanEval/0..19', temperature=0, concurrency=16, max_output_tokens=2048),
+        humaneval=dict(tasks=HUMANEVAL_TASKS, layer_split=True,
+            task_ids=f'HumanEval/0..{HUMANEVAL_TASKS-1}', temperature=0,
+            concurrency=16, max_output_tokens=2048),
         server_command=server_command(args), output=str(args.output),
         no_pd=True, no_dspark=not args.profile.get('dspark', False), no_prefix_cache=True,
         no_eplb=args.expert_map is None,

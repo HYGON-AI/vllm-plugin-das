@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-independent Layer Split startup option."""
 
+from .adapter_api import optional_adapter_module
+
 KEY = 'hcu_layer_split'
 FLAG = '--enable-layer-split'
 
@@ -26,9 +28,18 @@ def _validate_config(config):
             raise ValueError('Layer Split requires PCP>1 and KV source layers')
 
 
-def register_cli():
-    from hcu_adapter.bridges.vllm_cli import register_config_switch
+def adapter_hooks():
+    cli = optional_adapter_module('hcu_adapter.bridges.vllm_cli')
+    layout = optional_adapter_module('hcu_adapter.bridges.vllm_kv_cache')
+    return (cli, layout) if cli is not None and layout is not None else None
 
-    register_config_switch(FLAG, KEY,
-                           help='Shard DeepSeek V4.1 KV cache layers across PCP ranks.',
-                           validate=_validate_config)
+
+def register_cli():
+    hooks = adapter_hooks()
+    if hooks is None:
+        return None
+    cli, layout = hooks
+    cli.register_config_switch(FLAG, KEY,
+                               help='Shard DeepSeek V4.1 KV cache layers across PCP ranks.',
+                               validate=_validate_config)
+    return layout

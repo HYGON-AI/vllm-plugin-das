@@ -32,19 +32,20 @@ def startup(split=False, replay=True, count=1000):
 
 
 def score():
-    tasks = {'HumanEval/'+str(i): True for i in range(20)}
-    return dict(num_tasks=20, task_results=tasks, pass_at_1=1.0, dataset_sha256='dataset',
+    tasks = {'HumanEval/'+str(i): True for i in range(32)}
+    return dict(num_tasks=32, task_results=tasks, pass_at_1=1.0, dataset_sha256='dataset',
                 http_errors=0, truncated_task_ids=[], completion_sha256={k: 'same' for k in tasks})
 
 
 class ControllerTests(unittest.TestCase):
-    def test_dspark_profile_adds_native_speculation_and_keeps_twenty_task_protocol(self):
+    def test_dspark_profile_uses_the_original_thirty_two_task_cohort(self):
         args = controller.parse_args(['--profile', str(HERE/'nmz18_w4a8_dspark.json')])
         command = controller.server_command(args)
         spec = json.loads(command[command.index('--speculative-config')+1])
         self.assertEqual(spec, dict(method='dspark', num_speculative_tokens=5, moe_backend='deep_gemm'))
         self.assertFalse(controller.plan(args)['no_dspark'])
-        self.assertEqual(controller.plan(args)['humaneval']['tasks'], 20)
+        self.assertEqual(controller.plan(args)['humaneval']['tasks'], 32)
+        self.assertEqual(controller.plan(args)['humaneval']['task_ids'], 'HumanEval/0..31')
         self.assertIsNone(args.kv_bytes)
         self.assertEqual(controller.plan(args)['kv_budget_mode'], 'auto')
         self.assertFalse(controller.plan(args)['kv_budget_overrides_gpu_memory_utilization'])
@@ -157,7 +158,7 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn('--speculative-config', command)
         self.assertNotIn('--kv-transfer-config', command)
         evaluator = controller.evaluator_command(args, args.output)
-        self.assertEqual(evaluator[evaluator.index('--limit')+1], '20')
+        self.assertEqual(evaluator[evaluator.index('--limit')+1], '32')
         self.assertNotIn('humaneval_off', controller.plan(args)['order'])
 
     def test_run_requires_explicit_eight_cards(self):
@@ -223,16 +224,16 @@ class ControllerTests(unittest.TestCase):
     def test_on_only_subset_reports_score_and_failures_without_regression_claim(self):
         value = score()
         value['task_results']['HumanEval/1'] = False
-        value['pass_at_1'] = 0.95
+        value['pass_at_1'] = 31/32
         result = controller.summarize_accuracy(value)
-        self.assertEqual(result['passed'], 19)
+        self.assertEqual(result['passed'], 31)
         self.assertEqual(result['failed_task_ids'], ['HumanEval/1'])
         self.assertFalse(result['accuracy_regression_assessed'])
         self.assertTrue(result['evaluation_valid'])
 
     def test_wrong_coverage_and_inconsistent_scores_refused(self):
         for mutate in (lambda r: r.__setitem__('pass_at_1', .99),
-                       lambda r: r['task_results'].pop('HumanEval/0')):
+                       lambda r: r['task_results'].pop('HumanEval/31')):
             value = score()
             mutate(value)
             with self.assertRaises(RuntimeError):
@@ -341,7 +342,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertNotIn('capacity_off', run_plan['order'])
                 summary = json.loads((args.output/'summary.json').read_text())
                 self.assertEqual(summary['capacity']['tokens'], 2000)
-                self.assertEqual(summary['accuracy']['num_tasks'], 20)
+                self.assertEqual(summary['accuracy']['num_tasks'], 32)
                 self.assertFalse((args.output/'capacity_off').exists())
                 self.assertFalse((args.output/'capacity_comparison.json').exists())
                 self.assertFalse((args.output/'smoke_comparison.json').exists())

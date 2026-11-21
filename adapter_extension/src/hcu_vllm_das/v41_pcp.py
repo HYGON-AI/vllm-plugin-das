@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys
 
 from hcu_adapter.kernels import pcp_fork
-from .layer_split_config import layer_split_enabled as layer_split_selected
+from .layer_split_config import adapter_hooks, layer_split_enabled as layer_split_selected
 
 def validate_config(cfg):
     validate_layer_split_policy(cfg)
@@ -38,6 +38,8 @@ def validate_layer_split_policy(cfg):
         raise ValueError('Layer Split requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
     if pcp_fork.selected_mode() != 'native':
         raise ValueError('Layer Split requires native PCP; stock/kill-switch cannot shard caches')
+    if adapter_hooks() is None:
+        raise ValueError('Layer Split requires the companion HCU Adapter CLI and KV layout hooks')
 
 
 def _validate_transfer(cfg):
@@ -106,7 +108,9 @@ def bind_adapter_classes() -> None:
 
     pcp_fork.set_indexer_reference(reference.indexer)
     pcp_fork.set_engram_validator(validate_engram_config)
-    pcp_fork.set_kv_transfer_validator(_validate_transfer)
+    transfer = getattr(pcp_fork, 'set_kv_transfer_validator', None)
+    if transfer is not None:
+        transfer(_validate_transfer)
     from .inverse_rope_policy import selected_mode
     if selected_mode() == "hcu":
         from .inverse_rope_pcp import prepare_forward_mqa

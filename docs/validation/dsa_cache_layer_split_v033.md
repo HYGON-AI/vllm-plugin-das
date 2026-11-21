@@ -1,8 +1,9 @@
 # DeepSeek V4.1 layer split on vLLM 0.33
 
 The current candidate targets eager standalone PCP with TP/PP/DP/DCP set to
-one. Set `VLLM_HCU_DSV41_LAYER_SPLIT=1` before startup. The project launcher
-already exposes this as `LAYER_SPLIT=1`. The default is disabled.
+one. Use `--enable-layer-split` with `vllm serve` and the companion Adapter.
+The switch writes `"hcu_layer_split":{"enabled":true}` to the engine's
+`additional_config`. The default is disabled.
 
 The implementation follows the owner-plus-scratch design from HYGON-AI
 vllm-plugin-das PR #370 at `279aeee` and PR #243 at `8c827d9`. DeepSeek V4.1

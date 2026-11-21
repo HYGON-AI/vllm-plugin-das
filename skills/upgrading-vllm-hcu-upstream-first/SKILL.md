@@ -80,6 +80,30 @@ KV, check shared-allocation accounting and retained layer/offset/stride metadata
 through the real builder, conversion, connector and block pool. Keep independent
 backings, device copies and model acceptance separate from this CPU coverage.
 
+### DeepSeek V4.1 Layer Split paired upgrade
+
+- Pair the Plugin with the Adapter commit that exposes the vLLM parser,
+  platform KV-builder selection and worker-localization hooks. Keep Core's
+  scheduler and worker lifecycle. The Plugin owns cache-group geometry,
+  per-layer main/SWA placement and scratch/transfer semantics. Check the
+  companion APIs in actual installs before merging the Plugin.
+- Run discovery with the older supported Adapter package. Ordinary startup
+  keeps its existing policy. An explicit Layer Split request requires the
+  companion hooks. Test both CLI/JSON merging and startup before model
+  construction. The target's CLI setting stays out of the PCP1 dSpark draft
+  configuration; retain the draft's own replicated SWA pool.
+- For the final pair, bind the Adapter/Plugin/Core, native providers, model,
+  route and launch parameters to each artifact. Check independent group
+  budgets, owner scratch reuse, empty ranks and live-page-only Mooncake RDMA.
+  Measure the original performance and operator comparisons with the same
+  requests, backend and prefix/replay policies. Report Graph and prefix per
+  admitted topology, including explicit rejection where the path is eager
+  only. Preserve normal service exit and device release as separate results.
+- Keep the original ordered HumanEval/0–31 requests and scoring protocol.
+  Retain raw predictions, reviews, finish reasons, and normalized per-task
+  outcomes from the isolated scorer. Preserve historical failures and identify
+  earlier CPU/replay or hardware runs by their original heads.
+
 ## Run a static preflight
 
 The companion script reads committed trees without checking out refs,

@@ -37,12 +37,12 @@ Official Core is not modified. No provider packages are replaced or rebuilt.
 Keep the existing model configuration and select the combination explicitly:
 
 ```bash
-export VLLM_HCU_DSV41_LAYER_SPLIT=1
 export VLLM_HCU_DSV41_PCP_ATTENTION=1
 export HCU_VLLM_PCP_IMPL=native
 export HCU_VLLM_FP4_INDEXER_IMPL=lightop
 export HCU_VLLM_FP4_PACKER_IMPL=triton
 # Set attention_config.indexer_kv_dtype=mxfp4 in the serving configuration.
+# Add --enable-layer-split to vllm serve.
 # Add --swa-bounded-replay only for the replay-enabled test arm.
 ```
 

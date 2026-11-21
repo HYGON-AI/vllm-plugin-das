@@ -69,7 +69,7 @@ FP4 PCP PRs #125/#426 and does not modify official Core.
 | Model publication and profile worker | Plugin; merge both official profile policy and Layer Split policy | Activation, immutable health checks and compilation factor; existing publication tests |
 | Stock/kill switch and FP4 | Preserve rollback; reject incompatible Layer Split requests | Actual model selector and activation; explicit negative tests |
 
-Layer Split is opt-in with `VLLM_HCU_DSV41_LAYER_SPLIT=1`,
+Layer Split is opt-in with `vllm serve --enable-layer-split`,
 `VLLM_HCU_DSV41_PCP_ATTENTION=1`, `HCU_VLLM_PCP_IMPL=native`.
 The indexer remains FP8. TP/DP/PP/DCP=1, PCP>1, eager, no dSpark remain
 the migrated scope. SWA bounded decode replay and owner-aware transfer retain
