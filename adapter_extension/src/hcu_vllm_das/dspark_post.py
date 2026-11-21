@@ -131,6 +131,8 @@ def _has_final_post_seam(native, original_post):
 @lru_cache(maxsize=8)
 @torch.inference_mode()
 def _qualify_post(pid, device, original):
+    from triton.errors import TritonError
+
     from hcu_adapter.kernels import mhc_post_5120_triton as post
 
     with torch.cuda.device(device):
@@ -154,6 +156,10 @@ def _qualify_post(pid, device, original):
                         or expected.dtype != actual.dtype
                         or not torch.equal(expected.contiguous().view(torch.uint8), actual.view(torch.uint8))):
                     return False
+        except TritonError as error:
+            logging.getLogger('vllm.' + __name__).warning(
+                'HCU draft final Post preflight unavailable: %s', error)
+            return False
         except (AttributeError, OSError, TypeError, ValueError, RuntimeError):
             return False
     logging.getLogger('vllm.' + __name__).info('HCU draft final Post admitted after native preflight')

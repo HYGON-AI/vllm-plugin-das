@@ -105,6 +105,8 @@ def qualify_markov(model, spec):
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             return False
+        from triton.errors import TritonError
+
         try:
             steps = spec.num_speculative_steps
             if type(steps) is not int or not 1 <= steps <= 7:
@@ -146,7 +148,7 @@ def qualify_markov(model, spec):
                 if not torch.equal(expected, probe.draft_tokens):
                     _LOG.warning('HCU greedy Markov preflight differs from the native sampling loop')
                     return False
-        except (AttributeError, OSError, TypeError, ValueError, RuntimeError) as error:
+        except (AttributeError, OSError, TypeError, ValueError, RuntimeError, TritonError) as error:
             _LOG.warning('HCU greedy Markov preflight unavailable: %s', error)
             return False
     model._hcu_markov_preflight = (os.getpid(), native_spec._sample_sequential, steps)

@@ -12,6 +12,7 @@ import logging
 import os
 
 import torch
+from triton.errors import TritonError
 from vllm.triton_utils import tl, triton
 
 from hcu_adapter.operator_contracts import supports_operator_contract
@@ -144,7 +145,7 @@ def qualify_qkv_split(device):
                             _declined_devices.add(device)
                             _LOG.warning('HCU Q/KV split preflight differs from the installed fused op')
                             return False
-        except (AttributeError, OSError, TypeError, ValueError, RuntimeError) as error:
+        except (AttributeError, OSError, TypeError, ValueError, RuntimeError, TritonError) as error:
             _declined_devices.add(device)
             _LOG.warning('HCU Q/KV split preflight unavailable: %s', error)
             return False
