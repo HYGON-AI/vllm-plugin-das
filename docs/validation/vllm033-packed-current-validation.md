@@ -487,3 +487,55 @@ Evidence: `evidence/pr367-fixed-enqueue-20261122/recovery-audit.json`,
 `recovery-protocol.json`, `model-r1` failed attempt, `model-r2` raw paired
 requests/outputs/queues/step windows/process receipts,
 `existing-profile-cost-review.json` and `provider-config-source-review.json`.
+
+### Online keep-pause control (2026-11-22)
+
+A new diagnostic retains official HTTP/AsyncLLM/EngineCoreProc and the same
+checkpoint, TP2/BF16/device PLE, physical GPU0/1, default Graph/prefix and
+budgets. Each arm executes single-before → grouped4 → single-after, resetting
+prefix between phases. All phases use the official dev-router
+`/pause?mode=keep&clear_cache=false`, `/is_paused` and `/resume`.
+Pause/resume HTTP receipts and raw iteration windows are retained. The two-second
+settling interval and pending frontend future are not evidence of Core queue depth;
+actual admission is assessed from post-resume iteration logs. No step is logged
+before resume in the saved windows. This is twelve new eight-token completions
+(six per arm), with unchanged temperature zero and top5/token-ID response settings.
+
+| Paired online phase | Token sequences equal | Whole returned logprobs equal | Aggregate steps equal |
+| --- | ---: | ---: | --- |
+| single-before | 1/1 | 1/1 | True |
+| batch4 | 4/4 | 4/4 | True |
+| single-after | 1/1 | 1/1 | True |
+
+All expected fixed batches observed: **True**. All context tokens accounted for: **True**.
+Across the six pairs, all 48 returned token-position probability structures equal: **True**.
+Reported probabilities and aggregate counts do not establish full-vocabulary
+logits, per-layer input equality or every actual padded GPU layout.
+
+- old: per-phase actual fixed batch flags `[True, True, True]`; same-process before/after tokens equal `True`; first grouped/single divergence `2`.
+- old lifecycle: exit `0`, signals `[{'pid': 1504945, 'signal': 'SIGINT'}]`, original15s shutdown gate `True`, owned alive `[]`, clean lifecycle `False`, teardown `{'nanobind': True, 'weakref': False, 'engine_dead': False, 'internal_worker_sigterm': True}`; immediate bare bind `False`, refusals `86`.
+- new: per-phase actual fixed batch flags `[True, True, True]`; same-process before/after tokens equal `True`; first grouped/single divergence `2`.
+- new lifecycle: exit `0`, signals `[{'pid': 1537445, 'signal': 'SIGINT'}]`, original15s shutdown gate `True`, owned alive `[]`, clean lifecycle `False`, teardown `{'nanobind': True, 'weakref': False, 'engine_dead': False, 'internal_worker_sigterm': True}`; immediate bare bind `False`, refusals `91`.
+
+Checkpoint pre/post seals still match144 assets/127135690592bytes. Both arms
+retain pre/post installed/shared-package attestations and all-rank storage checks.
+The provider tuning guide and CLI were inspected without import or execution:
+`int4int8_channel`, TP2, experts512, CLI hidden-size-default640, FFN-hidden-size2560,
+top-k10 and silu map to the two missing E512/N320/K2560/gfx938 config filenames.
+The CLI writes beside its installed provider; future tuning needs a private physical
+installation and independent numerical/Graph checks. No tuning or gain is claimed.
+
+**Keep Draft.** Original96-request round0/32 text agreement, -31.60% throughput,
+online teardown, submitted-head device CI and remaining quality/topology/PLE/update
+gates remain open. This short controlled diagnostic does not replay or qualify that
+benchmark or any HumanEval cohort. The prior harness exit1, incomplete offline
+before/after protocol and older unknown child exit remain as originally recorded.
+No Core/Adapter/FlashAttention source change or rebuild; vendor source is unchanged.
+Normal private-cache vendor JIT compilation still occurs during startup; the earlier
+no-rebuild statement concerns package/source rebuilding, not these runtime JIT artifacts.
+No DeepSeek V4.1 checkpoint test. Production/tests/tools/CI remain
+b53f900a553cf3165b6f377ece81592dbcbdf48b.
+
+Evidence: `evidence/pr367-online-keep-20261122/online-keep-audit.json`,
+`source-contract.json`, raw phase/pause/step/lifecycle receipts, package/checkpoint
+attestations and `public-provider-tuning-review.json`.

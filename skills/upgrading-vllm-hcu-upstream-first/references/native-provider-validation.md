@@ -147,6 +147,14 @@ Observe Core's real mapping; do not compare opaque IDs directly or strip a
 suffix by guesswork. Preserve a harness failure and its completed requests when
 repairing diagnostics, and disclose any changed phase order or lost controls.
 
+For online control, inspect the target's public pause API and router registration.
+The inspected v0.33 dev router supports `pause?mode=keep&clear_cache=false`,
+`is_paused` and `resume`: keep accepts requests while scheduling is paused.
+Abort/wait reject new requests and are not equivalent. Retain every pause-state
+receipt, raw request/response and iteration window. A pending frontend future
+or settling interval does not prove Core queue depth; verify actual admission
+after resume. Preserve the engine mode and phase-order controls in both arms.
+
 Check the target's reproducibility contract separately. Core v0.33 does not
 guarantee default online reproducibility; its beta `VLLM_BATCH_INVARIANT` mode
 is a separate capability requiring architecture/provider validation. Do not
@@ -159,6 +167,13 @@ Separate selected profiler-event duration sums from benchmark throughput and
 critical-path latency. If the real shape uses a provider's default launch
 configuration, investigate that provider's supported tuning path; a missing
 shape file proves neither a correctness defect nor a performance improvement.
+
+Use the provider's documented tuning entry when available, in a private physical
+installation with private logs and caches: it may write configs beside its
+installed source. Confirm CLI parameter mapping against both runtime GEMM
+filenames; names such as hidden/FFN can map differently to local N and K.
+Keep numerical references and changed-input Graph checks separate from tuning
+scores, especially if the tool has no complete correctness reference.
 
 Persist each child exit code and identity-bound descendant state before port
 or attestation checks that can raise. If the controller loses an unsaved exit
