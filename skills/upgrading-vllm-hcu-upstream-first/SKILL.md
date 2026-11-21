@@ -27,6 +27,12 @@ under a distinct model type, preserve foreign registrations and verify real
 references/standalone-draft-config.md); config support does not qualify MTP
 execution.
 
+For optional Qwen4 dense-QSA mode, first check whether the official decoder
+already selects dense attention from the text config. Preserve that constructor
+and adapt only unused checkpoint indexer weights when necessary. See
+[Qwen4 dense checkpoint migration](references/hybrid-prefix.md) for the public
+override boundary and the separate device/model gates.
+
 Compare the actual baseline and target implementations before retaining,
 rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names

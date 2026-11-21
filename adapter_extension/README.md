@@ -88,6 +88,12 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## Optional Qwen4 dense checkpoint loading
+
+For the separate, explicit Qwen4 dense-QSA checkpoint capability, see
+[Qwen4 dense checkpoint loading](../docs/qwen4_dense_checkpoint.md). It retains
+official model execution and has separate device/model acceptance gates.
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
