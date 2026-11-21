@@ -129,7 +129,7 @@ import torch
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.utils import config
-from vllm_hcu.models.hy_v4_flash.runtime import _validate_fp8_config
+from vllm_hcu.models.hy_v4_flash.runtime import validate_flash_quant_config
 
 
 @config
@@ -188,7 +188,7 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         if target.quantization not in (None, "fp8", "compressed-tensors"):
             raise ValueError("Unsupported HCU DFly target quantization")
         if target.quantization is not None:
-            _validate_fp8_config(target.model_arch_config.quantization_config)
+            validate_flash_quant_config(target.model_arch_config.quantization_config)
         derived = derive_flash_dfly_config(target.hf_config)
         for size in (derived.num_attention_heads, derived.dfly_intermediate_size,
                      derived.hidden_correction_intermediate_size):

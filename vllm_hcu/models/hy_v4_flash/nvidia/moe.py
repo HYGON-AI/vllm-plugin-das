@@ -63,6 +63,10 @@ class HYV4FlashMoE(HYV4MoEFused):
                 quant_config=quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
+        if config.flash_w4a8_backend == "adapter_reference":
+            from .w4a8 import HYV4FlashW4A8Config
+
+            quant_config = HYV4FlashW4A8Config.for_moe(quant_config)
         super().__init__(
             config,
             quant_config=quant_config,

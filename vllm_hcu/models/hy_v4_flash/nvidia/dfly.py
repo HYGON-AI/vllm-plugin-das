@@ -75,7 +75,7 @@ class HYV4DFlyQuantizationConfig(CompressedTensorsConfig):
         if scheme is not None:
             weights = scheme["weights"]
             if not isinstance(weights, QuantizationArgs) or weights.num_bits != 8:
-                raise ValueError("HYV4 DFly draft layers require BF16 or supported W8A8 FP8")
+                raise ValueError("HYV4 DFly draft layers require BF16 or supported W8A8 FP8/INT8")
         return scheme
 
 
