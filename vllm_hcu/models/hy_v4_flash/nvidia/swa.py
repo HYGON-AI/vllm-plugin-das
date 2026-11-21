@@ -10,7 +10,11 @@ from torch import nn
 from vllm.forward_context import get_forward_context
 from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseBackend
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadataBuilder
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    FlashMLASparseMetadata,
+    FlashMLASparseMetadataBuilder,
+)
+from vllm_hcu.models.hy_v4_flash.runtime import is_hcu_platform
 
 
 class FlashSparseMetadataBuilder(FlashMLASparseMetadataBuilder):
@@ -20,6 +24,20 @@ class FlashSparseMetadataBuilder(FlashMLASparseMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # The direct paged kernel never gathers evicted SWA history.
         self.fp8_use_mixed_batch = True
+
+    def _build_fp8_mixed_decode_prefill(self):
+        if not is_hcu_platform():
+            return super()._build_fp8_mixed_decode_prefill()
+        # Core's imported factory belongs to the NVIDIA extension. Pair the
+        # HCU kernel with its own scheduler object without rebinding Core.
+        from vllm_hcu.v1.attention.ops.flashmla import get_mla_metadata
+
+        scheduler, _ = get_mla_metadata()
+        return FlashMLASparseMetadata.FP8KernelMetadata(
+            scheduler_metadata=scheduler,
+            cache_lens=self.max_model_len_tensor[:1],
+            dummy_block_table=self.dummy_block_table[:1],
+        )
 
 
 class FlashSparseBackend(HYV4FlashMLASparseBackend):

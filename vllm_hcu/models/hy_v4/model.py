@@ -394,6 +394,9 @@ class HYV4DecoderLayer(nn.Module):
     otherwise it uses the standard single-stream residual.
     """
 
+    attention_cls = HYV4MLAAttention
+    feed_forward_cls = HYV4FeedForward
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -411,7 +414,7 @@ class HYV4DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
 
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = HYV4MLAAttention(
+        self.self_attn = self.attention_cls(
             vllm_config=vllm_config,
             config=config,
             hidden_size=self.hidden_size,
@@ -430,7 +433,7 @@ class HYV4DecoderLayer(nn.Module):
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_idx] == "dense":
-            self.mlp = HYV4FeedForward(
+            self.mlp = self.feed_forward_cls(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,

@@ -34,6 +34,7 @@ class IndexPoolMetadataBuilder(AttentionMetadataBuilder[IndexPoolMetadata]):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.max_model_len = vllm_config.model_config.max_model_len
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         cm = common_attn_metadata
@@ -44,6 +45,11 @@ class IndexPoolMetadataBuilder(AttentionMetadataBuilder[IndexPoolMetadata]):
             num_actual_tokens=cm.num_actual_tokens,
             max_seq_len=cm.max_seq_len,
         )
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        """Reserve scoring width for replay beyond the dummy's short context."""
+        metadata = self.build(0, common_attn_metadata)
+        return replace(metadata, max_seq_len=self.max_model_len)
 
 
 class IndexPoolBackend(DeepseekV32IndexerBackend):

@@ -63,10 +63,13 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
     spec = vllm_config.speculative_config
     if spec is not None:
         method = getattr(spec, "method", None)
-        raise NotImplementedError(
-            "HYV4 Flash on the vLLM 0.33 plugin path does not support "
-            f"speculative decoding (requested method={method!r})"
-        )
+        if method != "dfly":
+            raise NotImplementedError(
+                "HYV4 Flash on the vLLM 0.33 plugin path does not support "
+                f"speculative decoding (requested method={method!r})"
+            )
+        from vllm_hcu.models.hy_v4_flash.dfly_compat import validate_dfly_runtime
+        validate_dfly_runtime(vllm_config)
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_ds_mla"):
         raise ValueError("HYV4 Flash requires BF16 or fp8_ds_mla KV storage")
     if config.index_topk % 128 or config.index_topk < config.sliding_window:
@@ -78,9 +81,9 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
             raise ValueError(f"{field} must be divisible by tensor_parallel_size")
     quantization = vllm_config.model_config.quantization
     if quantization == "compressed-tensors":
-        from vllm_hcu.models.hy_v4_flash.runtime import _validate_block_fp8_config
+        from vllm_hcu.models.hy_v4_flash.runtime import _validate_fp8_config
 
-        _validate_block_fp8_config(
+        _validate_fp8_config(
             vllm_config.model_config.model_arch_config.quantization_config
         )
     elif quantization == "fp8":
@@ -134,12 +137,8 @@ class HYV4FlashDecoderLayer(HYV4DecoderLayer):
         mlp_cls = HYV4FlashFeedForward if dense else HYV4FlashMoE
         self.mlp = mlp_cls(config, quant_config, f"{prefix}.mlp")
         self.block_type = "feedforward" if dense else "moe"
-        self.hc_attn_layer = HYV4HCLayer(
-            config, self.layer_idx, prefix=f"{prefix}.hc_attn_layer"
-        )
-        self.hc_mlp_layer = HYV4HCLayer(
-            config, self.layer_idx, prefix=f"{prefix}.hc_mlp_layer"
-        )
+        self.hc_attn_layer = HYV4HCLayer(config, self.layer_idx)
+        self.hc_mlp_layer = HYV4HCLayer(config, self.layer_idx)
 
 
 class HYV4FlashModel(HYV4Model):
@@ -147,6 +146,10 @@ class HYV4FlashModel(HYV4Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.dfly_enabled = (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.method == "dfly"
+        )
         self.loaded_parts: dict[str, set[Any]] = {}
         self.engram_hash = None
         if self.config.engram_layer_ids:
@@ -165,6 +168,13 @@ class HYV4FlashModel(HYV4Model):
         self.token_lookback_depth = (
             self.config.engram_max_ngram_size - 1 if self.engram_hash is not None else 0
         )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Keep -1 in the runner batch for forced rejection; only embedding
+        # lookup gets safe ids, as in the pinned public target implementation.
+        if self.dfly_enabled:
+            input_ids = input_ids.clamp_min(0)
+        return super().embed_input_ids(input_ids)
 
     def forward(
         self,

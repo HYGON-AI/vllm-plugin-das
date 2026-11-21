@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.triton_utils import tl, triton
+from vllm_hcu.models.hy_v4_flash.runtime import is_hcu_platform
 
 INDEX_DIM = 128
 FP8_MAX = 448.0
@@ -15,6 +16,15 @@ FP8_MAX = 448.0
 def fwht_quantize(vectors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if vectors.ndim != 2 or vectors.shape[1] != INDEX_DIM:
         raise ValueError("IndexPool quantization requires [rows, 128] vectors")
+    if vectors.is_cuda and vectors.dtype == torch.bfloat16 and is_hcu_platform():
+        from .indexpool_triton import fwht_quantize_triton
+
+        return fwht_quantize_triton(vectors)
+    return _fwht_quantize_torch(vectors)
+
+
+def _fwht_quantize_torch(vectors):
+    """Unchanged arithmetic oracle, also used on CPU and non-HCU platforms."""
     x = vectors.float()
     stride = 1
     while stride < INDEX_DIM:
@@ -75,6 +85,31 @@ def rotate_indexer(x, positions, rope_dim, parameters):
 
 
 def expand_groups(group_ids, positions, ratio, active=None):
+    if (
+        group_ids.is_cuda
+        and is_hcu_platform()
+        and group_ids.ndim == 2
+        and positions.ndim == 1
+        and positions.shape[0] == group_ids.shape[0]
+        and positions.device == group_ids.device
+        and group_ids.dtype in (torch.int32, torch.int64)
+        and positions.dtype in (torch.int32, torch.int64)
+        and (active is None or (
+            active.shape == positions.shape
+            and active.device == positions.device
+            and active.dtype == torch.bool
+        ))
+        and isinstance(ratio, int)
+        and ratio > 0
+        and (group_ids.shape[1] + 1) * ratio <= 8192
+    ):
+        from .indexpool_triton import expand_groups_triton
+
+        return expand_groups_triton(group_ids, positions, ratio, active)
+    return _expand_groups_torch(group_ids, positions, ratio, active)
+
+
+def _expand_groups_torch(group_ids, positions, ratio, active=None):
     offsets = torch.arange(ratio, device=group_ids.device)
     upper = positions // ratio
     live = positions >= 0
@@ -93,6 +128,18 @@ def expand_groups(group_ids, positions, ratio, active=None):
         valid.sum(-1, keepdim=True) + (~valid).long().cumsum(-1) - 1,
     )
     return torch.empty_like(candidates).scatter(-1, destinations, candidates)
+
+
+
+def unpruned_indices(positions, width, active=None):
+    """All causal tokens, only when every completed group fits the budget."""
+    columns = torch.arange(width, device=positions.device)
+    live = positions >= 0
+    if active is not None:
+        live = live & active
+    return torch.where(
+        live[:, None] & (columns[None] <= positions[:, None]), columns, -1
+    ).int()
 
 
 def select_groups(logits, upper, budget):

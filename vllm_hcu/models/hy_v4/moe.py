@@ -128,6 +128,10 @@ class HYV4MoEFused(nn.Module):
         prefix: str = "",
         enable_eplb: bool = False,
         vllm_config: VllmConfig | None = None,
+        *,
+        routed_hidden_size: int | None = None,
+        routed_input_transform: nn.Module | None = None,
+        routed_output_transform: nn.Module | None = None,
     ) -> None:
         super().__init__()
         if vllm_config is None:
@@ -217,11 +221,25 @@ class HYV4MoEFused(nn.Module):
             if raw_swiglu_limit and float(raw_swiglu_limit) > 0
             else None
         )
+        # Register projections before the runner references them so checkpoint
+        # names stay mlp.routed_expert_{down,up}_proj, not runner aliases.
+        if routed_input_transform is not None:
+            self.routed_expert_down_proj = routed_input_transform
+        if routed_output_transform is not None:
+            self.routed_expert_up_proj = routed_output_transform
+        # Core applies a routed transform before its runner-owned gate. Latent
+        # MoE therefore computes logits on the original full-width input here,
+        # as in vLLM's NemotronH path, and passes them to a gate-less runner.
+        self._router_before_transform = routed_input_transform is not None
         self.experts = FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
+            hidden_size=(
+                config.hidden_size if routed_hidden_size is None else routed_hidden_size
+            ),
             intermediate_size=config.expert_hidden_dim,
+            routed_input_transform=routed_input_transform,
+            routed_output_transform=routed_output_transform,
             renormalize=config.route_norm,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -234,7 +252,7 @@ class HYV4MoEFused(nn.Module):
             routed_scaling_factor=getattr(config, "router_scaling_factor", 1.0),
             e_score_correction_bias=self.expert_bias,
             n_shared_experts=config.num_shared_experts,
-            gate=self.gate,
+            gate=None if self._router_before_transform else self.gate,
             shared_experts=self.shared_experts,
             swiglu_limit=swiglu_limit,
             router_logits_dtype=torch.float32,
@@ -249,11 +267,15 @@ class HYV4MoEFused(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        # The runner owns the gate and computes logits after shared-expert
-        # stream synchronization, before dispatch. Do not project twice.
+        # Non-latent HYV4 keeps runner-owned routing. Latent Flash must route
+        # before compression; projecting its 1536-wide input with the 3072-wide
+        # router is invalid and would also change the model's routing semantics.
+        router_logits = None
+        if self._router_before_transform:
+            router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            router_logits=None,
+            router_logits=router_logits,
         )
         return final_hidden_states.view(original_shape)
 

@@ -188,12 +188,21 @@ class HYV4FlashAttention(HYV4MLAAttention):
     @eager_break_during_capture
     def _indexer_and_attn(self, hidden_states, q_c, positions, q, kv_c_normed,
                           k_pe, out):
-        # v0.33 HYV4's inherited method signals a ROCm-AITER-only top-k
-        # event. FlashMLA consumes this stream's buffer directly and has no
-        # record_logical_topk_ready hook; keep the eager capture boundary,
-        # not the unrelated backend's event protocol.
+        # Core's sparse index group remaps on a side stream. Publish this
+        # stream's logical indices before that consumer can read the shared
+        # buffer, including when externally supplied top-k skips the indexer.
         if self.indexer is not None and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            if self.topk_snapshot is not None:
+                # DFly reuses logical indices from this target layer. Snapshot
+                # before attention can remap/overwrite the shared top-k buffer.
+                assert self.topk_indices_buffer is not None
+                num_rows = hidden_states.shape[0]
+                self.topk_snapshot[:num_rows].copy_(
+                    self.topk_indices_buffer[:num_rows]
+                )
+        if self.is_sparse:
+            self.mla_attn.impl.record_logical_topk_ready()
         out.copy_(self.mla_attn(q, kv_c_normed, k_pe, output_shape=out.shape))
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):

@@ -7,7 +7,10 @@ from vllm.platforms import current_platform
 
 def is_hcu_platform() -> bool:
     """Return whether vLLM is using the HCU out-of-tree platform."""
-    return type(current_platform).__module__ == "vllm_hcu.platforms.hcu"
+    return type(current_platform).__module__ in {
+        "vllm_hcu.platforms.hcu",
+        "hcu_adapter.bridges.vllm",
+    }
 
 
 def get_paged_mqa_provider():
@@ -45,11 +48,12 @@ def validate_flash_platform() -> None:
         )
 
 
-def _validate_block_fp8_config(config: object) -> None:
-    """Validate the vLLM 0.33 compressed-tensors FP8 contract."""
+def _validate_fp8_config(config: object) -> None:
+    """Validate supported vLLM FP8 contracts without changing checkpoint scales."""
     error = (
-        "HYV4 Flash requires compressed-tensors W8A8 FP8 with 128x128 "
-        "weight blocks, dynamic group-128 activations, and no KV-cache "
+        "HYV4 Flash requires W8A8 FP8 with 128x128 weight blocks and "
+        "dynamic group-128 activations, or channel weights and dynamic "
+        "per-token activations, and no KV-cache "
         "scheme or transforms"
     )
     if not isinstance(config, dict) or (
@@ -75,12 +79,20 @@ def _validate_block_fp8_config(config: object) -> None:
     groups = config.get("config_groups")
     if not isinstance(groups, dict) or not groups:
         raise ValueError(error)
-    expected_weight = dict(
+    block_weight = dict(
         num_bits=8, type="float", strategy="block",
         block_structure=[128, 128], symmetric=True, dynamic=False,
     )
-    expected_activation = dict(
+    block_activation = dict(
         num_bits=8, type="float", strategy="group", group_size=128,
+        symmetric=True, dynamic=True,
+    )
+    channel_weight = dict(
+        num_bits=8, type="float", strategy="channel",
+        symmetric=True, dynamic=False,
+    )
+    token_activation = dict(
+        num_bits=8, type="float", strategy="token",
         symmetric=True, dynamic=True,
     )
     for group in groups.values():
@@ -91,9 +103,37 @@ def _validate_block_fp8_config(config: object) -> None:
         if (
             not isinstance(weights, dict)
             or not isinstance(activations, dict)
-            or any(weights.get(k) != v for k, v in expected_weight.items())
-            or any(activations.get(k) != v for k, v in expected_activation.items())
+            or not any(
+                all(weights.get(k) == v for k, v in weight.items())
+                and all(activations.get(k) == v for k, v in activation.items())
+                and (
+                    weight is block_weight
+                    or (
+                        weights.get("block_structure") is None
+                        and weights.get("group_size") is None
+                        and activations.get("block_structure") is None
+                        and activations.get("group_size") is None
+                    )
+                )
+                for weight, activation in (
+                    (block_weight, block_activation),
+                    (channel_weight, token_activation),
+                )
+            )
             or group.get("output_activations") is not None
             or group.get("format") not in (None, "float-quantized")
         ):
             raise ValueError(error)
+
+
+def get_engram_cpu_offload(storage: object | None) -> bool:
+    """Absent Core Engram settings mean TP-local device tables for Flash."""
+    if storage is None:
+        return False
+    if any(getattr(storage, name, False) for name in (
+        "disk_offload", "embedding_across_dp", "dp_shared_memory",
+    )):
+        raise ValueError(
+            "Flash Engram supports TP-local tables, not DP or disk offload"
+        )
+    return storage.cpu_offload

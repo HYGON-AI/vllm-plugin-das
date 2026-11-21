@@ -23,6 +23,7 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm_hcu.models.hy_v4_flash.runtime import get_engram_cpu_offload
 
 logger = init_logger(__name__)
 
@@ -158,7 +159,12 @@ class FlashNgramHashState(NgramHashState):
 
     def prepare_hashes(self, input_ids, lookback, metadata):
         tokens = input_ids.numel()
-        if metadata is None or tokens == 0:
+        if (
+            metadata is None
+            or tokens == 0
+            or metadata.num_actual_tokens == 0
+            or metadata.seq_lens.numel() == 0
+        ):
             return input_ids.new_full(
                 (len(self.layout.layer_ids), tokens, self.offsets.shape[1]),
                 -1,
@@ -345,22 +351,14 @@ class FlashEngram(nn.Module):
         config = vllm_config.model_config.hf_text_config
         index = layout.layer_ids.index(layer_id)
         sizes = [p for order in layout.primes[index] for p in order]
-        storage = vllm_config.engram_config
-        if (
-            storage.disk_offload
-            or storage.embedding_across_dp
-            or storage.dp_shared_memory
-        ):
-            raise ValueError(
-                "Flash Engram supports TP-local tables, not DP or disk offload"
-            )
+        cpu_offload = get_engram_cpu_offload(vllm_config.engram_config)
         dtype = None
         if vllm_config.load_config.load_format == "dummy":
             dtype = (
                 torch.float8_e4m3fn if config.engram_fp8_embedding else torch.bfloat16
             )
         self.multi_head_embedding = FlashEmbedding(
-            sizes, layout.head_dim, dtype, storage.cpu_offload
+            sizes, layout.head_dim, dtype, cpu_offload
         )
         self.hidden_size, self.hc_mult = config.hidden_size, config.hc_mult
         local = (

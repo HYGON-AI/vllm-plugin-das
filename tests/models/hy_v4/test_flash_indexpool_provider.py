@@ -7,9 +7,17 @@ import torch
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU/CUDA and companion adapter-das")
-def test_flash_pool_writer_matches_adapter_fp32_reader():
+@pytest.mark.parametrize("backend", ["emu", "triton"])
+def test_flash_pool_writer_matches_adapter_fp32_reader(monkeypatch, backend):
     from hcu_adapter.bridges.vllm_paged_mqa import get_paged_mqa_provider
     from vllm_hcu.models.hy_v4_flash.nvidia.indexpool_ops import fwht_quantize, write_pool
+
+    from hcu_adapter import hcu_config
+    monkeypatch.setattr(hcu_config, "load", lambda: {"ops": {
+        "vllm_paged_mqa_logits": backend}, "overrides": {}})
+    if backend == "triton":
+        from vllm.v1.worker import workspace
+        monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(torch.device("cuda")))
 
     torch.manual_seed(33)
     device = "cuda"

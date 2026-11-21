@@ -28,6 +28,7 @@ from .indexpool_ops import (
     gated_pool,
     rotate_indexer,
     select_groups,
+    unpruned_indices,
     write_pool,
 )
 from .indexpool_prepare import prepare_groups, write_tails
@@ -144,6 +145,21 @@ class FlashCompressedIndexer(nn.Module):
         write_tails(
             keys, positions, tail, tm.block_table, km.query_start_loc, km.seq_lens
         )
+        # With no group pruning the sorted group expansion is exactly the
+        # causal range [0, position]. Keep ALL cache writes above this branch:
+        # a later decode can cross the boundary and need the scoring path.
+        # FULL graph replay must use the static capture bound, not the first
+        # replay's sequence length. No GPU lengths are copied to the host.
+        max_seq_len = (
+            self.max_model_len
+            if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+            else km.max_seq_len
+        )
+        if max_seq_len <= (self.group_budget + 1) * self.ratio:
+            output[:tokens].copy_(
+                unpruned_indices(logical, output.shape[1], active=live)
+            )
+            return output
         query = self.query_projection(q_c)[0][:tokens].reshape(
             tokens, self.num_heads, 128
         )
@@ -166,11 +182,6 @@ class FlashCompressedIndexer(nn.Module):
         mx_scales = None
         if self.use_mx_scales:
             mx_scales, weights = mqa_logits_mx_inputs(quant_q, None, weights)
-        max_seq_len = (
-            self.max_model_len
-            if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
-            else km.max_seq_len
-        )
         width = max(
             POOL_PAGE_SIZE,
             cdiv(max_seq_len, self.ratio * POOL_PAGE_SIZE) * POOL_PAGE_SIZE,

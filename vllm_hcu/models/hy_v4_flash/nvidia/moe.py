@@ -10,6 +10,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm_hcu.models.hy_v4.moe import HYV4FeedForward, HYV4MoEFused
 from vllm_hcu.models.hy_v4_flash.configs import HYV4FlashConfig
+from vllm_hcu.models.hy_v4_flash.runtime import is_hcu_platform
 
 
 class HYV4FlashFeedForward(HYV4FeedForward):
@@ -72,6 +73,10 @@ class HYV4FlashMoE(HYV4MoEFused):
         )
         self.routed_expert_down_proj = down
         self.routed_expert_up_proj = up
+        if is_hcu_platform():
+            from .router import HYV4FlashStableRouter
+
+            self.experts.router = HYV4FlashStableRouter.from_router(self.experts.router)
         self.combine_output_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.sandwich_norm
