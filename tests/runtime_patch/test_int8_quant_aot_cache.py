@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 import torch
@@ -96,6 +97,12 @@ def test_int8_quant_fx_cache_loads_in_fresh_process(tmp_path):
         encoding="utf-8",
     )
     env = {**os.environ, "VLLM_PLUGINS": "__disabled__"}
+    # The script lives outside the checkout. Prefer the PR source over an older
+    # installed wheel even if CI puts site-packages first in PYTHONPATH.
+    source_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (source_root, env.get("PYTHONPATH")) if path
+    )
     for mode in ("save", "load", "load"):
         result = subprocess.run(
             [sys.executable, str(script), str(tmp_path), mode],
