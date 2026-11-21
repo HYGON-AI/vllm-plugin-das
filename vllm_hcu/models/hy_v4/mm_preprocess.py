@@ -74,12 +74,14 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         factor = processor.patch_size * processor.merge_size
         maximum = options.get("max_pixels", processor.size["longest_edge"])
         minimum = options.get("min_pixels", processor.size["shortest_edge"])
-        cells = max(1, maximum // factor**2)
+        cells = maximum // factor**2
         candidates = []
         for rows in range(1, math.isqrt(cells * 200) + 1):
             cols = min(cells // rows, rows * 200)
-            if cols and rows <= cols * 200:
+            if cols and rows <= cols * 200 and rows * cols * factor**2 >= minimum:
                 candidates.append((rows * (cols + 1), rows, cols))
+        if not candidates:
+            raise ValueError("No image shape satisfies pixel bounds and patch alignment")
         _, rows, cols = max(candidates)
         height, width = smart_resize(
             rows * factor, cols * factor, factor, minimum, maximum
