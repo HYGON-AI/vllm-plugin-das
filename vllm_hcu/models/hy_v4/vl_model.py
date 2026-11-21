@@ -321,13 +321,17 @@ class HYV4VLForConditionalGeneration(
                 positions[2, begin:end] = torch.arange(cols).repeat(rows) + start_index
                 start_index += max(rows, cols)
                 if is_video and frame + 1 < frames:
-                    bridge_start = ends[mm_index + frame]
-                    bridge_end = starts[mm_index + frame + 1] + 1
+                    # Include this frame's trailing extra embedding and the
+                    # next frame's leading extra embedding in sequential RoPE.
+                    bridge_start = end
+                    bridge_end = starts[mm_index + frame + 1] + 1 + extra
                     positions[:, bridge_start:bridge_end] = (
                         torch.arange(bridge_end - bridge_start) + start_index
                     )
                     start_index += bridge_end - bridge_start
-            start_pos = ends[mm_index + frames - 1] if is_video else pos + count
+            # Start trailing text at the last grid's end, not after its extra
+            # embedding; no visual slot may retain the initial absolute arange.
+            start_pos = ends[mm_index + frames - 1] - extra if is_video else pos + count
             mm_index += frames
         if start_pos < len(input_tokens):
             positions[:, start_pos:] = (
