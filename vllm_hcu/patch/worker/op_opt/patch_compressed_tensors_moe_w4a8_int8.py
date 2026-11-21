@@ -75,6 +75,28 @@ def apply_to_module(module: ModuleType) -> bool:
                 or getattr(layer, "apply_router_weight_on_input", False)
             ):
                 raise
+            # Native v0.28 checks expert 0 only. This owner cannot execute
+            # heterogeneous/partly ignored experts or output quantization.
+            # Keep native selection first, then reject before storage creation.
+            for expert in range(layer.moe_config.num_logical_experts):
+                for projection in ("gate", "up", "down"):
+                    candidate = quant_config.get_scheme_dict(
+                        layer, f"{layer_name}.{expert}.{projection}_proj"
+                    )
+                    candidate_format = candidate.get("format") if candidate else None
+                    candidate_format = getattr(candidate_format, "value", candidate_format)
+                    if (
+                        candidate_format != "pack-quantized"
+                        or not runtime.supports_channel_w4a8(
+                            candidate.get("weights"), candidate.get("input_activations"),
+                            layer.moe_config,
+                        )
+                        or candidate.get("output_activations") is not None
+                    ):
+                        raise ValueError(
+                            "HCU W4A8 requires uniform channel INT4/token INT8 "
+                            "schemes without output quantization for every expert projection"
+                        )
             from vllm.logger import init_logger
 
             init_logger(__name__).info_once(

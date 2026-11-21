@@ -17,7 +17,7 @@ def _scheme():
         dynamic=False, strategy="channel", group_size=-1, actorder=None)
     activation = SimpleNamespace(num_bits=8, type="int", symmetric=True,
         dynamic=True, strategy="token", group_size=None)
-    moe = SimpleNamespace(has_bias=False, activation="silu")
+    moe = SimpleNamespace(num_logical_experts=2, has_bias=False, activation="silu")
     return weight, activation, moe
 
 
