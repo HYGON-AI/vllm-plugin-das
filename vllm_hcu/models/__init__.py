@@ -56,6 +56,14 @@ def register_model():
     )
 
     ModelRegistry.register_model("HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP")
+    ModelRegistry.register_model(
+        "HYV4FlashForCausalLM",
+        "vllm_hcu.models.hy_v4_flash:HYV4FlashForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "HYV4FlashVLForConditionalGeneration",
+        "vllm_hcu.models.hy_v4_flash:HYV4FlashVLForConditionalGeneration",
+    )
 
     ModelRegistry.register_model(
         "DSparkDraftModel",

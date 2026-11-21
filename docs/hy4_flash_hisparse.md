@@ -1,0 +1,70 @@
+# HY4 Flash HiSparse on HCU: experimental integration
+
+**Status: Draft; not device/model/installation qualified.** This is a separate
+HiSparse workstream, stacked on the Flash and Channel W4A8 support changes.
+Existing DFly inference without HiSparse remains unchanged.
+
+## Scope and upstream evidence
+
+HiSparse is host-resident sparse-MLA KV plus a GPU hot cache. Selecting
+`FLASHMLA_SPARSE` alone does not enable it. The explicit entry point is
+`HiSparseConnector` with Core-resolved `attention.hisparse_config`.
+
+Upstream vLLM PR #69026 (`0f92ded` head, merged 2026-11-21) excludes sliding
+window attention from HiSparse cache ownership and admits HiSparseConnector.
+This plugin implements the same ownership rule with a **model-scoped window
+index-group builder**, instead of rewriting Core or globally patching its
+builder. Indexed layers continue to use Core's normal HiSparse registration;
+window layers continue to use the window manager.
+
+Upstream #69057 (`2f459ea` head inspected, still Draft on 2026-11-21) additionally
+packs valid attention indices and changes DFly slot mappings and shared-hot
+cache ownership/stride. It is **not** a configuration-only change. The pinned
+v0.33 runtime lacks that owner-binding ABI. This first integration deliberately
+rejects HiSparse with speculative decoding, including DFly, rather than
+aliasing host tensors with independent/stale GPU residency metadata. Its
+shared-hot-cache backport and real DFly5 acceptance remain follow-up gates.
+
+## Admission and companion adapter
+
+- Ordinary inference does not import/load the HiSparse adapter extension.
+- Only direct `HiSparseConnector` is admitted. NIXL, Mooncake, MultiConnector,
+  and other P/D connectors are not enabled by this change.
+- Core must resolve HiSparseConfig; an orphan config/connector fails early.
+- Initial lane is target-only and `enforce_eager`; Graph is not qualified.
+- HCU explicitly calls `hcu_adapter.kernels.hisparse.ensure_hisparse_ops()` from
+  the companion adapter change. Older adapters fail with a dependency error.
+- All four `_C_cache_ops` names **and CUDA/HIP dispatch kernels** must exist;
+  schema-only registration and CPU fallback are not accepted as support.
+- CUDA uses its Core-native operators and does not load the HCU extension.
+- Existing Flash TP/EP, parallelism, BF16-compute, LoRA, quantization and KV
+  dtype checks remain in force. This change does not certify every combination.
+
+The current test container's installed vLLM 0.33 ROCm extension had none of the
+four native HiSparse operators when probed on 2026-11-21. This is why simply
+relaxing the Flash runtime guards would not make HiSparse run.
+
+## Validation and release gates
+
+```sh
+python -m pytest --noconftest tests/models/hy_v4/test_flash_hisparse.py
+```
+
+The tests execute production admission/window-registration code. Native
+extension/dispatch checks use explicit doubles. Optional installed-Core AST
+checks execute its real registration/dataclass code with real Torch CPU
+tensors; streams/events are inert. These are not GPU/native operator tests.
+
+Before Ready/merge: isolated adapter HIP build; HCU pinned-host byte copies,
+hit/miss/eviction/rewrite invalidation, resident-only and mixed prefill/decode,
+multiple requests, padded block strides, sinks, BF16/FP8 KV; actual installed
+Core/plugin/adapter profile/serve; independent FP8 and Channel W4A8 model
+accuracy. DFly requires its owner/stride and hole-packing backport first, then
+`num_speculative_tokens=5`, `FLASHMLA_SPARSE` and complete HumanEval164 with
+`max_model_len=8192` (prompt + thinking + final). Graph needs changing-input
+replay qualification separately. Measure host DMA volume, GPU memory, TTFT
+and TPOT before advertising a performance benefit at length 8192.
+
+Do not replace an active evaluation's source or installed packages. CPU/source
+checks and isolated builds may run concurrently; device tests must wait until
+the existing accuracy job exits naturally.
