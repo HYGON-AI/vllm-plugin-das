@@ -210,6 +210,15 @@ For a private Core image candidate, use the guide's
 [publisher and credential boundaries](../../docs/validation/vllm033-ci-coverage.md#publish-a-private-core-candidate-image);
 inspect embedded architectures before changing a shared CI image.
 
+Candidate-wheel and installed-image inspection must follow the same Adapter
+namespace choice as runtime imports. An infra namespace selects relocated
+owners; missing new-layout files cannot fall back to stale legacy copies.
+Check the full current companion set (including PCP policy and CLI seams),
+and require installed seams in hashed RECORD entries before native inspection.
+One repaired catalog entry or a newer image date does not establish that the
+remaining interfaces or both native architectures are present. Keep inspection
+free of package imports and retain the complete device/aggregate gates.
+
 For a newly published image, prefer a trusted single-run candidate input when
 the target workflow provides one; see [candidate CI qualification](../../docs/validation/vllm033-ci-coverage.md#qualify-a-candidate-image-for-one-pr).
 Verify the live PR/head, dispatch actor, immutable approved image and concurrency
