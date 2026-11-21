@@ -119,14 +119,15 @@ def route(monkeypatch):
     tree.body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
     vars(mod).update(torch=torch, ops=NS(scaled_int8_quant=quant), ColumnParallelLinear=Column,
                      ReplicatedLinear=Replicated, CompressedTensorsW8A8Int8=Scheme,
-                     HcuDSV41Int8LinearMethod=Method, triton=NS(TritonInt8ScaledMMLinearKernel=Kernel),
+                     adapter_module={'dsv41_int8_linear': NS(HcuDSV41Int8LinearMethod=Method)}.__getitem__,
+                      triton=NS(TritonInt8ScaledMMLinearKernel=Kernel),
                      CompilationMode=NS(NONE='NONE'), CUDAGraphMode=NS(
                          NONE='NONE', FULL_AND_PIECEWISE='FULL_AND_PIECEWISE',
                          FULL_DECODE_ONLY='FULL_DECODE_ONLY'),
                      get_forward_context=lambda: context,
                      is_forward_context_available=Mock(return_value=True),
                      current_platform=NS(is_rocm=lambda: True, device_name='hcu'),
-                     init_logger=lambda _: NS(warning_once=Mock()),
+                     init_logger=lambda _: NS(info_once=Mock(), warning_once=Mock()),
                      version=lambda _: mod._CORE_WHEEL,
                      DeepseekV32IndexerMetadata=DecodeMeta, hashlib=hashlib, inspect=inspect)
     exec(compile(tree, str(_SRC / 'int8_wq_b.py'), 'exec'), vars(mod))
@@ -139,6 +140,7 @@ def route(monkeypatch):
     monkeypatch.setitem(sys.modules, env.__name__, env)
     env_key = 'VLLM_HCU_DSV41_INT8_WQ_B'
     monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv('HCU_DSV41_WQ_B_INT8_DIRECT', '0')
 
     seen = []
     native_qr_scale = NS(value=None)
@@ -151,6 +153,11 @@ def route(monkeypatch):
             self.wq_b = layer(Column, 32768)
             self.n_local_heads, self.head_dim, self.q_lora_rank = 64, 512, 1280
             self.use_pcp = False
+            self.kv_mxfp8 = False
+            self.accepts_unnormed_unroped_query = False
+            self.padded_heads = self.n_local_heads
+            self.rotary_emb = NS(cos_sin_cache=q)
+            self.wo_a = NS(weight=q)
             self._prepare_and_attn = Mock()
             self._prepare_and_attn_fn = self._prepare_and_attn
 
@@ -186,7 +193,8 @@ def route(monkeypatch):
               common=NS(DeepseekV4Indexer=NativeIndexer, fused_indexer_q_rope_quant=index_q),
               rocm=NS(DeepseekV41ROCMAiterMLAAttention=NativeAttention),
               _Fp4CommonAttention=object, Fp4Query=lambda *args: args,
-              rotate_bf16=lambda *_: 'bf16')
+              rotate_bf16=lambda *_: 'bf16', qualify_qkv_split=lambda _: False,
+              wo_a_layout=NS(configured=lambda *_: False))
     exec(compile(ast.Module(body=list(definitions.values()), type_ignores=[]), str(source), 'exec'), ns)
     Fp4Attention, Fp4Indexer = ns['Fp4Attention'], ns['Fp4Indexer']
     mm.side_effect = lambda qr, weight, *args: Tensor((qr.shape[0], weight.shape[1]), 'bfloat16')

@@ -4,12 +4,58 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import statistics
 import sys
 import traceback
 
 import torch
 
-from benchmark_ct_w4a8_hints import exact, guarded_scale, timing
+# Helpers from the original CT W4A8 runtime-capacity probe.
+def exact(a, b, message):
+    if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
+        raise AssertionError(message)
+
+
+def timing(call, warmup=15, repeats=80):
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    # Ten native launches in each replay amortize Python/event submission.
+    # This is also the execution mode used for the captured serving fragments.
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(10):
+            call()
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(20):
+        graph.replay()
+    torch.cuda.synchronize()
+    values = []
+    for _ in range(repeats):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        values.append(start.elapsed_time(end) * 1000 / 10)
+    ordered = sorted(values)
+    return {'median_us': statistics.median(values),
+            'p10_us': ordered[int(len(ordered) * .1)],
+            'p90_us': ordered[int(len(ordered) * .9)], 'samples_us': values,
+            'method': 'CUDA events around graph replay; 10 native launches per replay'}
+
+
+def guarded_scale(shape, value, device):
+    # Match serving's HIPC channel-scale allocation/read-ahead contract.
+    size = 1
+    for extent in shape:
+        size *= extent
+    storage = torch.zeros(size + (2 * 1024 * 1024) // 4, device=device, dtype=torch.float32)
+    result = storage[:size].view(shape)
+    result.fill_(value)
+    return result
 
 
 def run(args, report):

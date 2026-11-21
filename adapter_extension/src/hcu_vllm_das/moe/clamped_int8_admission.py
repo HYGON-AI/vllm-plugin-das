@@ -37,7 +37,12 @@ def _verified_provider():
 @torch.inference_mode()
 def _matches_native(native, device, experts, masked):
     """Qualify the loaded provider once before capture on this worker."""
-    from .clamped_int8_triton import clamped_int8_2304
+    try:
+        from triton.errors import TritonError
+        from .clamped_int8_triton import clamped_int8_2304
+    except (ImportError, OSError) as error:
+        _LOG.warning('HCU live-row INT8 preflight unavailable; using native activation: %s', error)
+        return False
 
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
@@ -86,7 +91,11 @@ def _matches_native(native, device, experts, masked):
                     _LOG.warning('HCU live-row INT8 differs from installed LightOp; using native activation')
                     return False
                 del baseline, candidate
-        except (torch.OutOfMemoryError, TypeError, ValueError) as error:
+        except (RuntimeError, TritonError, TypeError, ValueError) as error:
+            # A launch failure can leave a sticky device error. Only decline the
+            # candidate if the worker can still use this device.
+            if isinstance(error, RuntimeError):
+                torch.cuda.synchronize(device)
             _LOG.warning('HCU live-row INT8 preflight unavailable; using native activation: %s', error)
             return False
     return True

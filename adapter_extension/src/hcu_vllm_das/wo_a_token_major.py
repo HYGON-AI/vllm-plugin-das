@@ -10,9 +10,8 @@ from threading import RLock
 
 from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
 
+from .environment import WO_A_TOKEN_MAJOR_SWITCH as _SWITCH
 from .environment import _flag
-
-_SWITCH = "HCU_VLLM_WO_A_TOKEN_MAJOR"
 _CAPABILITY = "dsv41-wo-a-token-major"
 _PHASE_ROWS = "_das_wo_a_eager_decode_rows"
 _LOCK = RLock()

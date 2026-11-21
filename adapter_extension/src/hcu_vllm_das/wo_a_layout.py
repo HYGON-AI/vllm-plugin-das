@@ -57,6 +57,11 @@ def preflight_admitted():
 
 
 def configured(config, device):
+    from .environment import WO_A_TOKEN_MAJOR_SWITCH, _flag
+
+    if not _flag(WO_A_TOKEN_MAJOR_SWITCH, default=True):
+        return False
+
     from .quantization.ct_w4a8 import HcuDSV41CTW4A8Config
     if _BLAS_OVERRIDDEN or not isinstance(config.quant_config, HcuDSV41CTW4A8Config):
         return False
