@@ -34,12 +34,18 @@ Resolver = Callable[[], Callable | None]
 TRITON = "triton"
 BOLTOPS = "hcu-boltops"
 AITER = "hcu-aiter"
-BACKENDS = (TRITON, BOLTOPS, AITER)
+# Opt-in native CK path: one ck_gdn_prefill call replaces the FLA pipeline
+# (patch_gdn_ck_prefill) and ck_gdn_decode replaces non-speculative decode
+# (_ck_gdn_decode).  An explicit request never falls back: unavailable CK or
+# unsupported inputs raise.  Speculative decoding is rejected at startup.
+AITER_CK = "hcu-aiter-ck"
+BACKENDS = (TRITON, BOLTOPS, AITER, AITER_CK)
 DEFAULT_BACKEND = AITER
 _FALLBACK_CHAINS = {
     TRITON: (TRITON,),
     BOLTOPS: (BOLTOPS, TRITON),
     AITER: (AITER, BOLTOPS, TRITON),
+    AITER_CK: (AITER, BOLTOPS, TRITON),
 }
 _LEGACY_ENV = "VLLM_HCU_USE_CUSTOM_AITER_FLA"
 _UPSTREAM_AUTO = "auto"
@@ -126,6 +132,19 @@ def requested_backend(stage: Stage) -> str:
     return _decode_backend()
 
 
+def check_ck_decode_supported(vllm_config: object) -> None:
+    """Fail fast when hcu-aiter-ck decode is combined with speculative decoding."""
+
+    if requested_backend("decode") != AITER_CK:
+        return
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        raise ValueError(
+            "VLLM_HCU_GDN_DECODE_BACKEND=hcu-aiter-ck does not support "
+            "speculative decoding; disable speculative decoding or set "
+            "VLLM_HCU_GDN_DECODE_BACKEND=hcu-aiter"
+        )
+
+
 def make_provider_selector(
     stage: Stage,
     op: str,
@@ -207,15 +226,17 @@ def aiter_input_fallback(
 
 __all__ = [
     "AITER",
+    "AITER_CK",
     "BACKENDS",
     "BOLTOPS",
     "DEFAULT_BACKEND",
     "TRITON",
     "aiter_input_fallback",
+    "check_ck_decode_supported",
     "make_provider_selector",
     "record_prefill_backend",
     "requested_backend",
     "requested_prefill_backend",
 ]
 
-assert set(HCU_GDN_PREFILL_BACKENDS) == {BOLTOPS, AITER}
+assert set(HCU_GDN_PREFILL_BACKENDS) == {BOLTOPS, AITER, AITER_CK}
