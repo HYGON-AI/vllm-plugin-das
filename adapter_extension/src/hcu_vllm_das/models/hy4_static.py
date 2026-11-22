@@ -16,6 +16,7 @@ from ..hy4_constructor import bind_constructor
 from ..hy4_static_plan import load_hy4_plan
 from ..hy4_prefill_workspace import make_attention
 from .. import hy4_ihc_launch as ihc_launch
+from .. import hy4_dense_fusion as dense_fusion
 from .hy4_ct import HcuHY4CTBackbone, HcuHY4CTMTP
 
 
@@ -80,7 +81,7 @@ class HcuHY4StaticLaunchBackbone(HcuHY4StaticBackbone):
 
 def make_static_backbone(*, vllm_config, prefix=''):
     cls = HcuHY4StaticLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4StaticBackbone
-    return cls(vllm_config=vllm_config, prefix=prefix)
+    return dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config)
 
 
 _OUTER_INIT = bind_constructor(native.HYV4ForCausalLM.__init__,
@@ -186,6 +187,7 @@ class HcuHY4StaticMTP(_StaticProtocol, HcuHY4CTMTP):
     def __init__(self, *, vllm_config, prefix=''):
         plan = _preflight(vllm_config, draft=True)
         _MTP_INIT(self, vllm_config=vllm_config, prefix=prefix)
+        dense_fusion.attach(self.model, vllm_config)
         self._hcu_static_cfg = vllm_config
         self._hcu_static_expected_plan = plan
         _publish_protocol(self, [layer.mtp_block.mlp for layer in self.model.layers.values()],

@@ -26,4 +26,11 @@ class HcuHY4CTW4A8Config(HcuDSV41CTW4A8Config):
             raise ValueError('hcu_hy4_ct_w4a8 requires a HY4 model configuration')
         # Keep parsed scheme matching, native loader, INT8 dense layers, packed
         # HIPC weights, modular HT/LL and the model's SwiGLU clamp unchanged.
-        return super().get_quant_method(layer, prefix)
+        method = super().get_quant_method(layer, prefix)
+        from .. import hy4_dense_fusion
+        from .dsv41_int8_linear import HcuDSV41Int8LinearMethod
+        if (type(method) is HcuDSV41Int8LinearMethod
+                and hy4_dense_fusion.enabled(get_current_vllm_config())):
+            from ..adapter_api import adapter_module
+            return adapter_module('lightop_int8_linear').HcuLightopInt8LinearMethod(self)
+        return method
