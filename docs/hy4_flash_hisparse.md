@@ -1,6 +1,6 @@
 # HY4 Flash HiSparse on HCU: experimental integration
 
-**Status: Draft; not device/model/installation qualified.** This is a separate
+**Status: Draft; plugin model/installation/Graph not qualified.** This is a separate
 HiSparse workstream, stacked on the Flash and Channel W4A8 support changes.
 Existing DFly inference without HiSparse remains unchanged.
 
@@ -41,7 +41,8 @@ shared-hot-cache backport and real DFly5 acceptance remain follow-up gates.
 - Core must resolve HiSparseConfig; an orphan config/connector fails early.
 - Initial lane is target-only and `enforce_eager`; Graph is not qualified.
 - HCU explicitly calls `hcu_adapter.kernels.hisparse.ensure_hisparse_ops()` from
-  the companion adapter change. Older adapters fail with a dependency error.
+  the companion adapter [Draft #159](https://github.com/HYGON-AI/adapter-das/pull/159).
+  Older adapters fail with a dependency error.
 - All four `_C_cache_ops` names **and CUDA/HIP dispatch kernels** must exist;
   schema-only registration and CPU fallback are not accepted as support.
 - CUDA uses its Core-native operators and does not load the HCU extension.
@@ -76,15 +77,37 @@ extension/dispatch checks use explicit doubles. Optional installed-Core AST
 checks execute its real registration/dataclass code with real Torch CPU
 tensors; streams/events are inert. These are not GPU/native operator tests.
 
-Before Ready/merge: isolated adapter HIP build; HCU pinned-host byte copies,
-hit/miss/eviction/rewrite invalidation, resident-only and mixed prefill/decode,
-multiple requests, padded block strides, sinks, BF16/FP8 KV; actual installed
-Core/plugin/adapter profile/serve; independent FP8 and Channel W4A8 model
-accuracy. DFly requires its owner/stride and hole-packing backport first, then
-`num_speculative_tokens=5`, `FLASHMLA_SPARSE` and complete HumanEval164 with
-`max_model_len=8192` (prompt + thinking + final). Graph needs changing-input
-replay qualification separately. Measure host DMA volume, GPU memory, TTFT
-and TPOT before advertising a performance benefit at length 8192.
+### Recorded source and isolated native evidence (2026-11-22)
+
+- Immutable Linux plugin source snapshot at tree
+  `91c10ceeb75d6f2bf191383130e4fb944ae2dc12`: **282 passed /
+  15 accelerator-only skipped**, with14 Torch deprecation warnings. This is
+  source/CPU coverage, not installed plugin support.
+- Windows source/package/runtime/HiSparse lane: **106 passed /2 optional
+  Torch+installed-Core skipped**. A separate45-case probe imported the actual
+  pinned-Core specification methods/dataclasses and common-block selector with
+  lightweight heavyweight-constructor shells; it does not allocate or bind KV.
+- Companion adapter #159: fresh isolated gfx938 HIP build from exact source
+  `371360626b16`,922 tracked source files verified; fresh binary SHA256
+  `db27ecdb0b1dac6713590299b2aaa99191081b710625d85d234832b66002f48f`.
+  **44 real HCU eager native tests passed /0 failed /0 skipped** (21.04s).
+  Covers resolve/LRU/state/stats, invalidation/recopy, holes, multi-request,
+  resident/mixed/padding, pinned interior offsets, physical pitch/guards,
+  block64/128/256 and plan/compact copies. Eight added cases verify BF16 and
+  opaque FP8-DS byte-copy layout only, not attention/quantization numerics.
+- These native results do not establish this plugin's active model delivery,
+  cache-to-attention replay, clean installation, full-model accuracy, Graph,
+  DFly or performance. No running service was hot-patched or package installed.
+
+Before Ready/merge: paired clean Core/plugin/adapter installation and model
+registration/profile/serve; full cache-to-attention backend replay including
+sinks, state ownership and stream/host lifetime; independent FP8 and Channel
+W4A8 model accuracy. DFly requires its owner/stride and hole-packing backport
+first, then `num_speculative_tokens=5`, `FLASHMLA_SPARSE` and complete
+HumanEval164 with `max_model_len=8192` (prompt + thinking + final). Graph needs
+changing-input replay qualification separately. Measure host DMA volume, GPU
+memory, TTFT and TPOT before advertising a performance benefit at length8192.
+The normal non-HiSparse DFly main lane is a separate acceptance target.
 
 Do not replace an active evaluation's source or installed packages. CPU/source
 checks and isolated builds may run concurrently; device tests must wait until
