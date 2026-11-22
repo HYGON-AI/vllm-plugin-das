@@ -118,7 +118,19 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
             or vllm_config.parallel_config.use_ubatching
         ):
             raise ValueError("DFly does not support LoRA or microbatching")
-        super().__init__(vllm_config, device)
+        # A target step can admit max_num_seqs short prefills, but DFly
+        # expands every request into K+1 simultaneous queries. Size *all*
+        # inherited draft buffers and the draft model/attention configuration
+        # for that expansion before the Core constructor allocates them.
+        # Never widen the target scheduler or its token admission budget.
+        draft_vllm_config = copy(vllm_config)
+        draft_vllm_config.scheduler_config = copy(vllm_config.scheduler_config)
+        draft_vllm_config.scheduler_config.max_num_batched_tokens = max(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_seqs
+            * (spec.num_speculative_tokens + 1),
+        )
+        super().__init__(draft_vllm_config, device)
         config = copy(super().attn_vllm_config)
         config.model_config = copy(self.draft_model_config)
         config.parallel_config = copy(vllm_config.parallel_config)
@@ -474,11 +486,14 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
-        batch = input_batch.num_reqs
+        # Core's dummy target step is capped by the target token budget.
+        # Profile the independent worst-case draft shape, including temporary
+        # activations/workspaces, rather than only those target dummy requests.
+        batch = self.max_num_reqs if dummy_run and is_profile else input_batch.num_reqs
         query_width = self.num_query_per_req
         count = batch * query_width
-        if count > self.max_num_tokens:
-            raise ValueError("DFly query block exceeds max_num_batched_tokens")
+        if batch > self.max_num_reqs or count > self.max_num_tokens:
+            raise ValueError("DFly query block exceeds allocated draft capacity")
         result = self.draft_tokens[:batch]
         if batch == 0 or num_speculative_tokens == 0:
             return result.fill_(-1)
@@ -491,6 +506,8 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         padded_count = descriptor.num_tokens
         assert padded_count % query_width == 0
         padded_batch = padded_count // query_width
+        if padded_batch > self.max_num_reqs or padded_count > self.max_num_tokens:
+            raise ValueError("DFly padded query block exceeds allocated draft capacity")
         if not dummy_run and not self._storage_validated:
             self.reuse.validate_storage()
             self._storage_validated = True
@@ -517,7 +534,10 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         draft_slots = None
         if with_attn:
             upper_bound = torch.zeros(padded_batch, dtype=torch.int32, device="cpu")
-            upper_bound[:batch].copy_(input_batch.seq_lens_cpu_upper_bound[:batch])
+            target_batch = input_batch.num_reqs
+            upper_bound[:target_batch].copy_(
+                input_batch.seq_lens_cpu_upper_bound[:target_batch]
+            )
             self.draft_max_seq_len = min(
                 int(upper_bound.max()) + query_width, self.max_model_len
             )
