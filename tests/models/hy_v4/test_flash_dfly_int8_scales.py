@@ -92,7 +92,7 @@ def test_other_int8_scale_dtypes_still_fail(dtype):
 
 
 @pytest.mark.parametrize("weight_dtype,ct", [
-    (torch.bfloat16, True), (torch.float8_e4m3fn, True), (torch.int8, False),
+    (torch.bfloat16, True), (torch.int8, False),
 ])
 def test_bf16_promotion_is_limited_to_ct_int8_weights(weight_dtype, ct):
     loader = draft(weight_dtype, ct)
