@@ -45,11 +45,13 @@ def test_dummy_video_search_uses_supported_shapes(spatial, budget):
     ns = _processor_functions()
     fn = _compile(_node(MODEL / "hy_v4/mm_preprocess.py", "get_dummy_video_shape"), ns)
     vision = NS(patch_size=16, spatial_merge_size=2, spatial_patch_size=spatial,
-                temporal_patch_size=2, cat_extra_token=True, use_image_newline_token=True)
-    processor = NS(size={"longest_edge": 1024**2}, max_frames=4,
+                temporal_patch_size=2, cat_extra_token=True, use_image_newline_token=True,
+                use_2d_rope=False)
+    processor = NS(size={"longest_edge": 1024**2}, max_frames=4, do_resize=True,
                    video_max_image_size=128, timestamp_token_per_frame=2,
                    timestamp_token_reserve=0)
-    info = NS(get_hf_processor=lambda: NS(video_processor=processor),
+    info = NS(get_hf_processor=lambda: NS(video_processor=processor,
+                  tokenizer=NS(encode=lambda text, **kw: list(text))),
               get_hf_config=lambda: NS(vision_config=vision),
               _merge_and_resolve_mm_processor_kwargs=lambda _: {})
     frames, height, width = fn(info, budget, {"video": 1})

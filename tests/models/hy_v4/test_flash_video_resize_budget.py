@@ -269,6 +269,55 @@ class PublicVideoResizeBudgetTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "align"):
                             process(False)
 
+    def test_short_context_profile_shape_matches_real_hf_dispatch(self):
+        # The processing-info context below is an explicit shell; the method,
+        # tokenizer, wrapper, resize and CPU tensors are real. This does not
+        # replace the installed Core encoder-profile or GPU-memory lane.
+        from types import SimpleNamespace
+        from vllm_hcu.models.hy_v4.mm_preprocess import HYV4VLProcessingInfo
+
+        for spatial in (1, 2):
+            with self.subTest(spatial=spatial):
+                _, wrapper = self.make_processors(spatial)
+                options = dict(
+                    max_pixels=33554432,
+                    max_frames=100,
+                    video_max_image_size=1024,
+                    timestamp_token_reserve=2000,
+                    timestamp_token_per_frame=4,
+                )
+                info = SimpleNamespace(
+                    get_hf_processor=lambda: wrapper,
+                    get_hf_config=lambda: wrapper.config,
+                    _merge_and_resolve_mm_processor_kwargs=lambda _: {
+                        "videos_kwargs": options,
+                    },
+                )
+                shape = HYV4VLProcessingInfo.get_dummy_video_shape(
+                    info, 512, {"video": 1}
+                )
+                count, height, width = shape
+                metadata = dict(
+                    fps=2.0,
+                    duration=count / 2,
+                    total_num_frames=count,
+                    frames_indices=list(range(count)),
+                    do_sample_frames=False,
+                )
+                output = wrapper(
+                    videos=[(self.frames(count, height, width), metadata)],
+                    videos_kwargs=self.options(return_tensors="pt", **options),
+                )
+                self.check_output(output, count, height, width, spatial)
+                tokens = wrapper.get_replacement(
+                    "video", output["video_grid_thw"][0], output["video_timestamps"]
+                )
+                self.assertLessEqual(2 + len(tokens), 512)
+                self.assertGreaterEqual(
+                    output["pixel_values_videos"].shape[0],
+                    2304 if spatial == 2 else 1024,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

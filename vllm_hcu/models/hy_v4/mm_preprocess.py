@@ -29,7 +29,6 @@ from vllm.multimodal.processing.processor import replace_token_matches
 from vllm_hcu.models.hy_v4.config import HYV4VLConfig
 from vllm_hcu.models.hy_v4.processor import (
     HYV4VLProcessor,
-    adaptive_resize,
     smart_resize,
     vision_token_count,
 )
@@ -172,7 +171,8 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         return ImageSize(width=width, height=height)
 
     def get_dummy_video_shape(self, seq_len, mm_counts):
-        processor = self.get_hf_processor().video_processor
+        hf_processor = self.get_hf_processor()
+        processor = hf_processor.video_processor
         options = self._merge_and_resolve_mm_processor_kwargs({}).get(
             "videos_kwargs", {}
         )
@@ -180,36 +180,97 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         maximum = options.get("max_pixels", processor.size["longest_edge"])
         max_frames = options.get("max_frames", processor.max_frames)
         side = options.get("video_max_image_size", processor.video_max_image_size)
+        resize = options.get("do_resize", processor.do_resize)
+        timestamp_reserve = options.get(
+            "timestamp_token_reserve", processor.timestamp_token_reserve
+        )
+        timestamp_per_frame = options.get(
+            "timestamp_token_per_frame", processor.timestamp_token_per_frame
+        )
         available = max(1, seq_len // max(1, sum(mm_counts.values())))
-        # Spatially compressed video has no single-frame encoding. Search
-        # only legal shapes, including when the available token budget is tiny.
         min_frames = 2 if config.spatial_patch_size != 1 else 1
         if max_frames < min_frames:
-            raise ValueError("Video max_frames cannot represent the vision configuration")
-        factor = config.patch_size * config.spatial_merge_size * config.spatial_patch_size
-        best = (0, min_frames, factor, factor)
-        for frames in range(min_frames, min(max_frames, available) + 1):
-            height, width = adaptive_resize(
-                side,
-                side,
-                frames,
-                config.patch_size,
-                config.spatial_merge_size * config.spatial_patch_size,
-                maximum,
-                side,
-                options.get(
-                    "timestamp_token_per_frame", processor.timestamp_token_per_frame
-                ),
-                options.get(
-                    "timestamp_token_reserve", processor.timestamp_token_reserve
-                ),
+            raise ValueError(
+                "Video max_frames cannot represent the vision configuration"
             )
-            grid = (frames, height // config.patch_size, width // config.patch_size)
-            count = vision_token_count(grid, config, "video")
-            overhead = frames * (processor.timestamp_token_per_frame + 2) + 2
-            if count + overhead <= available and count > best[0]:
-                best = (count, frames, height, width)
-        return best[1:]
+        factor = (
+            config.patch_size * config.spatial_merge_size * config.spatial_patch_size
+        )
+        max_cells = maximum // factor**2
+        newline = int(config.use_image_newline_token)
+        extra = 2 * int(bool(config.cat_extra_token))
+        # The optional vision 2D RoPE uses a fixed position-edge cache.
+        max_edge = None
+        if config.use_2d_rope:
+            max_edge = (config.max_image_size // config.patch_size + 1) // (
+                config.spatial_merge_size * config.spatial_patch_size
+            )
+        best = None
+        timestamp_lengths = {}
+        # Jointly search temporal length and aligned spatial grids. Maximizing
+        # ViT input patches (not only compressed LLM tokens) avoids severe
+        # underprofiling when no full-resolution video fits a short context.
+        for frames in range(min_frames, min(max_frames, max_cells) + 1):
+            tau = config.temporal_patch_size
+            indices = list(range(frames))
+            indices += [indices[-1]] * (-frames % tau)
+            timestamps = [
+                sum(indices[i : i + tau]) / tau / 2 for i in range(0, len(indices), tau)
+            ]
+            # Match the dummy builder's fps=2 metadata and the processor's
+            # formatted, temporally merged timestamps. Include frame delimiters
+            # and the two outer video tokens, not a guessed tokens/frame count.
+            overhead = 2 + 2 * len(timestamps)
+            for timestamp in timestamps:
+                text = f"<{timestamp:.1f} seconds>"
+                if text not in timestamp_lengths:
+                    timestamp_lengths[text] = len(
+                        hf_processor.tokenizer.encode(text, add_special_tokens=False)
+                    )
+                overhead += timestamp_lengths[text]
+            visual_cells = (available - overhead) // len(timestamps) - extra
+            frame_cells = max_cells // frames
+            if resize:
+                frame_cells = min(frame_cells, side**2 // factor**2)
+                resize_budget = (
+                    max(1, max_cells - timestamp_reserve - timestamp_per_frame * frames)
+                    // frames
+                )
+            else:
+                resize_budget = None
+            # Swapping portrait to landscape preserves patch count and resize
+            # limits while never increasing newline tokens, so rows <= cols
+            # suffices. Enumerating rows and solving cols visits the maximum
+            # area for every possible row count, without a pixel-size scan.
+            row_limit = math.isqrt(max(0, min(frame_cells, visual_cells)))
+            if max_edge is not None:
+                row_limit = min(row_limit, max_edge)
+            for rows in range(1, row_limit + 1):
+                cols = min(frame_cells // rows, visual_cells // rows - newline)
+                if max_edge is not None:
+                    cols = min(cols, max_edge)
+                if resize_budget is not None:
+                    cols = min(cols, resize_budget // (rows + 1))
+                if cols < rows:
+                    continue
+                height, width = rows * factor, cols * factor
+                patches = frames * rows * cols
+                candidate = (patches, rows * cols, frames, height, width)
+                if best is None or candidate > best:
+                    best = candidate
+            # adaptive_resize clamps both dimensions to at least one cell even
+            # if its reserved token budget is exhausted. Keep that legal edge
+            # candidate too, but never let it replace a larger fitting grid.
+            minimum_tokens = len(timestamps) * (1 + newline + extra) + overhead
+            if minimum_tokens <= available:
+                candidate = (frames, 1, frames, factor, factor)
+                if best is None or candidate > best:
+                    best = candidate
+        if best is None:
+            # No complete video placeholder fits at all; retain the smallest
+            # legal encoder shape for the existing tiny-context profile ABI.
+            return min_frames, factor, factor
+        return best[2:]
 
     def get_mm_max_tokens_per_item(self, seq_len, mm_counts):
         config = self.get_hf_config().vision_config
