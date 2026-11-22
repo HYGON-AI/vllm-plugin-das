@@ -44,6 +44,8 @@ layouts. Producer and consumer are both in this file, so the layout is ours to p
 """
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -1317,6 +1319,7 @@ def _region_topk_pack_resident_kernel(
     WRITE_LOGICAL_IDS: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    EXACT_EMIT: tl.constexpr = False,
 ) -> None:
     """Register-resident ``_region_topk_pack_kernel`` for prefill rows.
 
@@ -1377,7 +1380,10 @@ def _region_topk_pack_resident_kernel(
             above = keys >= mid.to(tl.int32)
             count = tl.sum(above.to(tl.int32))
             if count == budget:
-                lo = tl.min(tl.where(above, keys, 2147483647)).to(tl.int64)
+                if EXACT_EMIT:
+                    lo = mid
+                else:
+                    lo = tl.min(tl.where(above, keys, 2147483647)).to(tl.int64)
                 done = 1
             elif count > budget:
                 lo = mid
@@ -1387,14 +1393,19 @@ def _region_topk_pack_resident_kernel(
                 c_hi = count.to(tl.float32)
             bisect = ((hi - lo) * 2 > span).to(tl.int32)
         threshold = lo.to(tl.int32)
-        greater = live & (keys > threshold)
-        tied = live & (keys == threshold)
-        prefix = tl.cumsum(greater.to(tl.int32) | (tied.to(tl.int32) << 16), axis=0)
-        greater_incl = prefix & 0xFFFF
-        tied_incl = prefix >> 16
-        remaining = budget - tl.max(greater_incl)
-        selected = greater | (tied & (tied_incl <= remaining))
-        positions = greater_incl + tl.minimum(tied_incl, remaining) - 1
+        if EXACT_EMIT and done != 0:
+            # The exact count already includes every tie at the pivot.
+            selected = live & (keys >= threshold)
+            positions = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+        else:
+            greater = live & (keys > threshold)
+            tied = live & (keys == threshold)
+            prefix = tl.cumsum(greater.to(tl.int32) | (tied.to(tl.int32) << 16), axis=0)
+            greater_incl = prefix & 0xFFFF
+            tied_incl = prefix >> 16
+            remaining = budget - tl.max(greater_incl)
+            selected = greater | (tied & (tied_incl <= remaining))
+            positions = greater_incl + tl.minimum(tied_incl, remaining) - 1
 
     safe_regions = tl.where(selected, regions, 0)
     pages = tl.load(
@@ -1426,6 +1437,7 @@ _RESIDENT_TOPK_MAX_REGIONS = 16384
 # wider cap.  The prefill pack path keeps the original 16384 threshold: its rows
 # are many (one per query token) and were not measured.
 _RESIDENT_TOPK_IDS_MAX_REGIONS = 17408
+_PREFILL_TOPK_EXACT_EMIT = os.environ.get("HCU_STEP5_DSA_TOPK_EXACT_EMIT") == "1"
 
 
 def region_topk_ids(
@@ -1561,6 +1573,9 @@ def region_topk_pack(
             WRITE_LOGICAL_IDS=_logical_out is not None,
             BLOCK_R=block_r,
             BLOCK_TOPK=triton.next_power_of_2(int(topk)),
+            EXACT_EMIT=(
+                _PREFILL_TOPK_EXACT_EMIT and block_r == _RESIDENT_TOPK_MAX_REGIONS
+            ),
             # Many rows at prefill: fewer warps per row keeps more rows in flight
             # (8K regions: w2 8.3, w4 6.7, w8 8.6 ms; 4K: w2 2.9, w4 3.1 ms).
             num_warps=2 if block_r <= 4096 else 4,
