@@ -8,6 +8,7 @@ from ..hy4_constructor import bind_constructor
 from ..hy4_indexer_loader import load_indexer_wk
 from .. import hy4_ihc_launch as ihc_launch
 from .. import hy4_dense_fusion as dense_fusion
+from .. import hy4_dp_metadata
 
 
 class HcuHY4CTBackbone(native.HYV4Model):
@@ -21,6 +22,7 @@ class HcuHY4CTLaunchBackbone(HcuHY4CTBackbone):
 
 
 def make_ct_backbone(*, vllm_config, prefix=''):
+    hy4_dp_metadata.prepare(vllm_config)
     cls = HcuHY4CTLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4CTBackbone
     return dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config)
 

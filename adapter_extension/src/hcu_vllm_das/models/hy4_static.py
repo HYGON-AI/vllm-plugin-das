@@ -17,6 +17,7 @@ from ..hy4_static_plan import load_hy4_plan
 from ..hy4_prefill_workspace import make_attention
 from .. import hy4_ihc_launch as ihc_launch
 from .. import hy4_dense_fusion as dense_fusion
+from .. import hy4_dp_metadata
 from .hy4_ct import HcuHY4CTBackbone, HcuHY4CTMTP
 
 
@@ -80,6 +81,7 @@ class HcuHY4StaticLaunchBackbone(HcuHY4StaticBackbone):
 
 
 def make_static_backbone(*, vllm_config, prefix=''):
+    hy4_dp_metadata.prepare(vllm_config)
     cls = HcuHY4StaticLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4StaticBackbone
     return dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config)
 
