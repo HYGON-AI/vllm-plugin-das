@@ -118,7 +118,29 @@ class MooncakeConnector(native.MooncakeConnector):
     # Retain Core's connector identifier so its configuration compatibility
     # guards (including auxiliary output exclusion) still recognize Mooncake.
     # The explicit external module path selects this class, not a registry edit.
-    # Reuse the complete native constructor and every scheduler/transport
-    # method, substituting just this worker class in a private namespace.
+    # Reuse the complete native constructor and transport, substituting this
+    # worker class in a private namespace.
     __init__ = bind_native(native.MooncakeConnector.__init__,
                           {'MooncakeConnectorWorker': HY4PCPMooncakeWorker})
+
+    def bind_connector_metadata(self, connector_metadata):
+        self._early_send_metadata = None
+        super().bind_connector_metadata(connector_metadata)
+        worker = self.connector_worker
+        if worker is not None and worker.is_kv_producer and not worker.is_kv_consumer:
+            # MRV2 defers async start_load_kv until post_forward. On P this
+            # would hold the previous completed requests' ready notifications
+            # behind another long prefill. Submit those notifications at bind;
+            # the native worker still owns transfer, ACK and block lifetime.
+            worker.start_load_kv(connector_metadata)
+            self._early_send_metadata = connector_metadata
+
+    def start_load_kv(self, forward_context, **kwargs):
+        metadata = self._connector_metadata
+        if metadata is not None and metadata is getattr(self, '_early_send_metadata', None):
+            return
+        return super().start_load_kv(forward_context, **kwargs)
+
+    def clear_connector_metadata(self):
+        super().clear_connector_metadata()
+        self._early_send_metadata = None
