@@ -211,12 +211,12 @@ def adaptive_resize(
         - timestamp_token_reserve
         - timestamp_token_per_frame * num_frames,
     )
+    scale = 1.0
     if frame_tokens * num_frames > budget:
         scale = math.sqrt(budget / (frame_tokens * num_frames))
-    elif height * width > video_max_image_size**2:
-        scale = video_max_image_size / math.sqrt(height * width)
-    else:
-        scale = 1.0
+    if height * width > video_max_image_size**2:
+        # The total-token budget and per-frame area cap apply together.
+        scale = min(scale, video_max_image_size / math.sqrt(height * width))
     return (
         max(factor, int(height * scale) // factor * factor),
         max(factor, int(width * scale) // factor * factor),
