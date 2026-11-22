@@ -19,6 +19,7 @@ from ..hy4_indexer_workspace import make_indexer
 from .. import hy4_ihc_launch as ihc_launch
 from .. import hy4_dense_fusion as dense_fusion
 from .. import hy4_dp_metadata
+from .. import hy4_fused_routing as fused_routing
 from .hy4_ct import HcuHY4CTBackbone, HcuHY4CTMTP
 
 
@@ -84,7 +85,8 @@ class HcuHY4StaticLaunchBackbone(HcuHY4StaticBackbone):
 def make_static_backbone(*, vllm_config, prefix=''):
     hy4_dp_metadata.prepare(vllm_config)
     cls = HcuHY4StaticLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4StaticBackbone
-    return dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config)
+    return fused_routing.attach(
+        dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config), vllm_config)
 
 
 _OUTER_INIT = bind_constructor(native.HYV4ForCausalLM.__init__,

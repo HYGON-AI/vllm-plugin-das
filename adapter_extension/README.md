@@ -591,6 +591,34 @@ Restart with `HCU_VLLM_HY4_LL_TUNING=0` to disable this policy, or
 `VLLM_HCU_USE_CUSTOM_OPS=0` for the master rollback. P-side HT/static EPLB is
 unaffected.
 
+## Optional HY4 fused routing
+
+```bash
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export HCU_VLLM_HY4_FUSED_ROUTING=1
+```
+
+This defaults to off. The owned HY4 backbone and MTP routers reuse Core's
+`fused_topk_bias` for sigmoid routing with one expert group, renormalization,
+256 experts and top-k8. The original `GroupedTopKRouter` class, routing method,
+parameters, callbacks and `select_experts` remain unchanged.
+
+Admission requires text HY4 BF16 H6144 on gfx938, MRV2, compilation mode 0,
+DP16/EP16 with TP/PP/PCP/DCP1 and DeepEP LL. LoRA, online EPLB, elastic EP,
+DBO, multiple ubatches, batch-invariant mode and AITER MoE retain native routing.
+Unsupported tensor metadata also retains native routing. P-side HT/static EPLB
+is unaffected.
+
+Core consumes the device padding mask: padded expert IDs become -1 while
+their normalized/scaled weights remain unchanged. Single-device operator and
+changing-input Graph checks passed; actual 16-rank LL dispatch, experts,
+combine and whole-model validation remain outstanding. Component speedups
+are not serving throughput or TTFT measurements.
+
+Restart with `HCU_VLLM_HY4_FUSED_ROUTING=0` to disable this policy, or
+`VLLM_HCU_USE_CUSTOM_OPS=0` for the master rollback. Changing a captured policy
+requires restarting the service.
+
 ## Adapter directory layouts
 
 Adapter's root-module and `infra`/`features` layouts use the same Plugin entry
