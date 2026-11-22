@@ -44,6 +44,19 @@ The current test container's installed vLLM 0.33 ROCm extension had none of the
 four native HiSparse operators when probed on 2026-11-21. This is why simply
 relaxing the Flash runtime guards would not make HiSparse run.
 
+## Compressed IndexPool block units
+
+The pinned Core resolves HiSparse before generic cache-group planning. Its
+sparse and indexer MLA specifications must already have the same scheduler
+block size at that point. Flash's pool page holds 64 **compressed states**;
+with compression ratio 4 this is 256 original tokens, whereas ordinary sparse
+MLA defaults to 64 tokens. The model-scoped `FlashMLAAttention` specification
+uses `lcm(requested_block_size, ratio * 64)` only for HiSparse indexed layers,
+matching IndexPool's specification before Core resolution. It does not mutate
+the shared CacheConfig or change SWA/non-HiSparse specs. Core then selects the
+common kernel size; IndexPool still binds exactly 64-state physical pages.
+This source-contract correction is not installed-runtime qualification.
+
 ## Validation and release gates
 
 ```sh

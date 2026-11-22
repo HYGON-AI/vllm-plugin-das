@@ -3,6 +3,8 @@
 """Per-layer MLA projections with Flash's SWA/IndexPool selection."""
 
 from copy import deepcopy
+from dataclasses import replace
+from math import lcm
 
 import torch
 from torch import nn
@@ -23,12 +25,36 @@ from vllm_hcu.models.hy_v4_flash.configs import SLIDING_ATTENTION
 from vllm_hcu.models.hy_v4_flash.runtime import validate_flash_platform
 
 from .compressed_indexer import FlashCompressedIndexer
+from .indexpool_cache import POOL_PAGE_SIZE
 from .swa import (
     FlashSparseBackend,
     FlashSWABackend,
     FlashWindowIndexer,
     FlashWindowIndexGroupBuilder,
 )
+
+
+class FlashMLAAttention(MLAAttention):
+    """Match sparse host-KV blocks to compressed IndexPool token blocks.
+
+    Core resolves HiSparse before generic cache-group planning and requires
+    identical scheduler block sizes for its sparse and indexer specs. A pool
+    page has 64 compressed states, not 64 original tokens. Window-owned pages
+    and ordinary inference retain their existing specifications.
+    """
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if (
+            self.sliding_window is None
+            and vllm_config.attention_config.hisparse_config is not None
+        ):
+            config = vllm_config.model_config.hf_text_config
+            ratio = config.compressed_indexer_compress_ratio
+            return replace(
+                spec, block_size=lcm(spec.block_size, ratio * POOL_PAGE_SIZE)
+            )
+        return spec
 
 
 class HYV4FlashAttention(HYV4MLAAttention):
@@ -162,7 +188,7 @@ class HYV4FlashAttention(HYV4MLAAttention):
             self.num_local_heads, torch.float32
         )
         self._force_sparse_mqa()
-        self.mla_attn = MLAAttention(
+        self.mla_attn = FlashMLAAttention(
             num_heads=self.num_local_heads,
             scale=self.scaling,
             qk_nope_head_dim=self.qk_nope_head_dim,

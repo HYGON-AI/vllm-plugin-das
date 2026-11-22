@@ -166,7 +166,7 @@ def test_window_builder_never_gives_hisparse_ownership(producing, enabled):
 @pytest.mark.parametrize("window", [True, False])
 def test_attention_only_installs_window_builder_for_window_layers(window):
     tree = ast.parse((FLASH / "nvidia/attention.py").read_text())
-    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "MLAAttention")
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "FlashMLAAttention")
     expression = next(k.value for k in call.keywords if k.arg == "index_group_builder")
     buffer = object()
     result = eval(compile(ast.Expression(expression), "<window-wiring>", "eval"), {
@@ -232,3 +232,66 @@ def test_window_registration_with_installed_core_builder_cpu(enabled):
     if enabled:
         with pytest.raises(AssertionError, match="HiSparse ownership"):
             ns["SparseMLAIndexGroupBuilder"](indices).register_layer(True, cfg)
+
+
+@pytest.mark.parametrize("block_size", [16, 64, 96, 256, 512])
+@pytest.mark.parametrize("ratio", [2, 4, 8])
+@pytest.mark.parametrize("enabled,window", [(True, False), (False, False), (True, True)])
+def test_hisparse_sparse_specs_match_pool_token_blocks(block_size, ratio, enabled, window):
+    """Execute production spec methods with explicit CPU/framework doubles.
+
+    These check scheduler token units, not native storage/copy correctness.
+    In particular, ratio4/default64 used to produce sparse64 versus pool256.
+    """
+    from dataclasses import dataclass, replace
+    from math import lcm
+
+    @dataclass(frozen=True)
+    class Spec:
+        block_size: int
+        tokens_per_state: int = 1
+        cache_role: str = "sparse"
+
+    original = Spec(block_size)
+    class MLA:
+        def get_kv_cache_spec(self, cfg):
+            return original
+    class Indexer:
+        def get_kv_cache_spec(self, cfg):
+            return Spec(block_size, cache_role="indexer")
+
+    attention = ast.parse((FLASH / "nvidia/attention.py").read_text())
+    cls = next(n for n in attention.body if isinstance(n, ast.ClassDef) and n.name == "FlashMLAAttention")
+    ns = {"MLAAttention": MLA, "replace": replace, "lcm": lcm, "POOL_PAGE_SIZE": 64}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "<flash-spec>", "exec"), ns)
+    layer = ns["FlashMLAAttention"]()
+    layer.sliding_window = 128 if window else None
+    cfg = config("HiSparseConnector" if enabled else None, enabled)
+    cfg.model_config.hf_text_config = NS(compressed_indexer_compress_ratio=ratio)
+    cfg.num_speculative_tokens = 0
+    spec = layer.get_kv_cache_spec(cfg)
+
+    pool_source = ast.parse((FLASH / "nvidia/indexpool_cache.py").read_text())
+    pool_class = next(n for n in pool_source.body if isinstance(n, ast.ClassDef) and n.name == "IndexPoolCache")
+    # Only get_kv_cache_spec is needed. Execute the actual non-tail branch.
+    pool_class = ast.ClassDef(name=pool_class.name, bases=pool_class.bases, keywords=[], body=[
+        n for n in pool_class.body if isinstance(n, ast.FunctionDef) and n.name == "get_kv_cache_spec"
+    ], decorator_list=[])
+    ast.fix_missing_locations(pool_class)
+    pool_ns = {"DeepseekV32IndexerCache": Indexer, "replace": replace, "lcm": lcm,
+               "POOL_PAGE_SIZE": 64, "AttentionSpec": Spec,
+               "tail_ring_size": lambda r, tokens: r}
+    exec(compile(ast.Module(body=[pool_class], type_ignores=[]), "<pool-spec>", "exec"), pool_ns)
+    pool = pool_ns["IndexPoolCache"]()
+    pool.ratio, pool.tail, pool.cache_config = ratio, False, NS(block_size=block_size)
+    pool_spec = pool.get_kv_cache_spec(cfg)
+    if enabled and not window:
+        assert spec.block_size == pool_spec.block_size == lcm(block_size, ratio * 64)
+        assert spec.tokens_per_state == 1
+        assert pool_spec.tokens_per_state == ratio
+        # The backend selects ratio*64 token blocks -> exactly 64 pool states.
+        assert (ratio * 64) // pool_spec.tokens_per_state == 64
+    else:
+        assert spec is original
+    assert cfg.model_config.hf_text_config.compressed_indexer_compress_ratio == ratio
+    assert pool.cache_config.block_size == block_size
