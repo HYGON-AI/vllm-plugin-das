@@ -4,6 +4,14 @@
 HiSparse workstream, stacked on the Flash and Channel W4A8 support changes.
 Existing DFly inference without HiSparse remains unchanged.
 
+**Delivery caveat (2026-11-22):** this branch preserves the latest #493
+Adapter-extension baseline. Its active wheel currently delivers Flash config
+metadata, not the legacy `vllm_hcu` model implementations or their registrations.
+The integration below is therefore a source candidate until the model is
+ported to `hcu_vllm_das` through the Adapter lifecycle. Neither adding this
+checkout to `PYTHONPATH` nor restoring the retired root build closes that gate.
+See `docs/hy4_flash.md` for the separate model-delivery blocker.
+
 ## Scope and upstream evidence
 
 HiSparse is host-resident sparse-MLA KV plus a GPU hot cache. Selecting
