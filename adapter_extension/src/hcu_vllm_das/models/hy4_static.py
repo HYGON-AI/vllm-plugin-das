@@ -15,6 +15,7 @@ from .. import static_eplb_runtime as runtime
 from ..hy4_constructor import bind_constructor
 from ..hy4_static_plan import load_hy4_plan
 from ..hy4_prefill_workspace import make_attention
+from ..hy4_indexer_workspace import make_indexer
 from .. import hy4_ihc_launch as ihc_launch
 from .. import hy4_dense_fusion as dense_fusion
 from .. import hy4_dp_metadata
@@ -46,7 +47,7 @@ class HcuHY4StaticMoE(moe.HYV4MoEFused):
 
 class HcuHY4StaticAttention(attention.HYV4MLAAttention):
     __init__ = bind_constructor(attention.HYV4MLAAttention.__init__,
-                               {'MLAAttention': make_attention})
+                               {'MLAAttention': make_attention, 'Indexer': make_indexer})
 
 
 class HcuHY4StaticDecoder(native.HYV4DecoderLayer):
