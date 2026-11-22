@@ -479,10 +479,24 @@ class HYV4DFlyForCausalLM(nn.Module):
                             f"shape={tuple(weight.shape)}"
                         )
                     if (
-                        name.endswith(".weight_scale_inv")
-                        and required[name] == torch.float32
+                        required[name] == torch.float32
                         and weight.dtype == torch.bfloat16
+                        and (
+                            name.endswith(".weight_scale_inv")
+                            or (
+                                name.endswith(".weight_scale")
+                                and isinstance(
+                                    getattr(self.model, "quant_config", None),
+                                    CompressedTensorsConfig,
+                                )
+                                and required.get(name.removesuffix("_scale"))
+                                == torch.float8_e4m3fn
+                            )
+                        )
                     ):
+                        # CT may retain the original BF16 dtype for FP8 linear
+                        # scales. Promote only these scales to Core's FP32 ABI;
+                        # keep non-scale parameters under strict dtype checks.
                         weight = weight.float()
                     if weight.dtype != required[name]:
                         raise ValueError(
