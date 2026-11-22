@@ -95,6 +95,14 @@ tensors; streams/events are inert. These are not GPU/native operator tests.
   resident/mixed/padding, pinned interior offsets, physical pitch/guards,
   block64/128/256 and plan/compact copies. Eight added cases verify BF16 and
   opaque FP8-DS byte-copy layout only, not attention/quantization numerics.
+- Separate strengthened IndexPool/provider source lane: **37 passed /0 failed /
+  0 skipped** (3 CPU,34 HCU cases;14 Torch deprecation warnings). The long
+  ratio4/8192-equivalent compressed pool test explicitly selects both emu and
+  Triton, calls the real Core paged-MQA launcher through a pass-through trace,
+  and requires exactly one native launch for Triton. FWHT/FP8 quantization,
+  group expansion, changed-input Graph and pool writer/reader parity are
+  covered. The adapter config import uses its current `infra` owner. This is
+  explicit operator selection, not installed model/platform dispatch proof.
 - These native results do not establish this plugin's active model delivery,
   cache-to-attention replay, clean installation, full-model accuracy, Graph,
   DFly or performance. No running service was hot-patched or package installed.
