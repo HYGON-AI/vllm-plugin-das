@@ -1,0 +1,461 @@
+{
+  "target": "v0.33.0",
+  "checked_utc": "2026-11-06T21:40:07.047348+00:00",
+  "model": "/model/Qwen3.5-35B-A3B",
+  "total_parameter_scope": "35B; no under7B waiver",
+  "scope": "Three disjoint TP2 quality arms with BF16weights/BF16-or-E5M2KV, MTP3/default combo/autoGraph,maxseq4,batch1024,maxlen8192, qwen3 reasoning parser. No cross-card performance claim.",
+  "core_version": "0.33.0+das.da8b48faa.dtk2610",
+  "plugin_runtime_commit": "65493627ac2c6b34f3e747c5490bd3a039d3c1d9",
+  "payload_files_checked": {
+    "core": 3656,
+    "adapter": 213,
+    "plugin": 15
+  },
+  "independent_review_sha256": "d1e2e7bf3444c317919a79246eb6471c746f9a212587c540d4d6532de3b47edf",
+  "native_postrun": {
+    "status": "ALL_195_NATIVE_PROVIDER_FILES_BYTE_IDENTICAL",
+    "generated_utc": "2026-11-06T21:37:49.822645+00:00",
+    "label": "quality",
+    "baseline_sha256": "1c71a0e994600b6c01ce12de5e9284f739aca36d63bbdc333e8928032caf9f98",
+    "file_count": 195,
+    "scope": "Matches files whose actual mapped DSOs were checked before quality requests; loading is not dispatch proof."
+  },
+  "native_before_quality_sha256": "1c71a0e994600b6c01ce12de5e9284f739aca36d63bbdc333e8928032caf9f98",
+  "arms": {
+    "flash-on": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "quality": {
+        "raw": {
+          "passed": 30,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/16"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "humaneval_finish_reasons": {
+        "stop": 32
+      },
+      "humaneval_completion_tokens": [
+        186,
+        213,
+        97,
+        152,
+        177,
+        149,
+        211,
+        107,
+        151,
+        156,
+        267,
+        160,
+        160,
+        102,
+        79,
+        87,
+        81,
+        228,
+        166,
+        240,
+        292,
+        185,
+        114,
+        48,
+        113,
+        212,
+        113,
+        53,
+        65,
+        102,
+        134,
+        208
+      ],
+      "sampled_graph_dispatch_windows": {
+        "FULL": 1314,
+        "PIECEWISE": 39,
+        "NONE": 80
+      },
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "clean_lifecycle": false,
+      "speculative_metrics": {
+        "num_draft_tokens": 3804.0,
+        "num_accepted_tokens": 3646.0
+      },
+      "cache_observations": [
+        {
+          "attention_specs": [
+            {
+              "class": "FullAttentionSpec",
+              "block_size": 1088,
+              "page_size_bytes": 1114112,
+              "repr": "FullAttentionSpec(block_size=1088, dcp_sharded=True, block_stride_alignment=MultipleOf(64), is_draft=False, max_tp_shards=None, num_kv_heads=1, head_size=256, dtype=torch.bfloat16, head_size_v=256, kv_quant_mode=<KVQuantMode.NONE: 0>, page_size_padded=None, num_head_slots=None, state_content_bytes=None, tokens_per_state=1, sliding_window=None, attention_chunk_size=None, non_causal=False)"
+            }
+          ],
+          "cache_tensor_dtypes": [
+            "torch.bfloat16",
+            "torch.int8"
+          ]
+        },
+        {
+          "attention_specs": [
+            {
+              "class": "FullAttentionSpec",
+              "block_size": 1088,
+              "page_size_bytes": 1114112,
+              "repr": "FullAttentionSpec(block_size=1088, dcp_sharded=True, block_stride_alignment=MultipleOf(64), is_draft=False, max_tp_shards=None, num_kv_heads=1, head_size=256, dtype=torch.bfloat16, head_size_v=256, kv_quant_mode=<KVQuantMode.NONE: 0>, page_size_padded=None, num_head_slots=None, state_content_bytes=None, tokens_per_state=1, sliding_window=None, attention_chunk_size=None, non_causal=False)"
+            }
+          ],
+          "cache_tensor_dtypes": [
+            "torch.bfloat16",
+            "torch.int8"
+          ]
+        }
+      ],
+      "artifact_sha256": {
+        "result.json": "2e3215d6819df5d79ef84ebac131301d0b05767c23d1e176c9185c2c3d030854",
+        "server.log": "c78c7500e3fc3b1da9d327b27b8df3ce7b1fcb92016434be04b29c7f7af8eb9f",
+        "hybrid-cache.json": "5d7bb06134139ccb9d7747db6fcf8070e26f2d224a0e049403f1e4344e9b91f1",
+        "prefill-gather-policy.json": "65b762063eac664c22489e98b134a66c55c9a52617adb66ad1c812368b114a12",
+        "semantic-prefix-responses.json": "01284328fc38d4ca3fc211d210296aa24e4bc7d910bbedd111b0995dc9b367db",
+        "humaneval32/complete.json": "368ea639ded72b1f8d5b7e1fe494d22844705bafc83bd0a2ad0cf701e5f4bda3"
+      },
+      "accepted_tokens_per_position": {
+        "0": 1251.0,
+        "1": 1219.0,
+        "2": 1176.0
+      },
+      "manager_page": 1088,
+      "fine_grained_prefix_hits": [
+        1152,
+        2240
+      ],
+      "worker_count": 2,
+      "worker_policies": [
+        {
+          "normal_env_hash": "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+          "aot_hash_factors": [
+            "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+            "6caea2d865"
+          ],
+          "effective_prefill_factor": true,
+          "target_and_draft_layers": 11
+        },
+        {
+          "normal_env_hash": "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+          "aot_hash_factors": [
+            "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+            "6caea2d865"
+          ],
+          "effective_prefill_factor": true,
+          "target_and_draft_layers": 11
+        }
+      ]
+    },
+    "official-triton": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "quality": {
+        "raw": {
+          "passed": 29,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/16",
+            "HumanEval/24"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "humaneval_finish_reasons": {
+        "stop": 32
+      },
+      "humaneval_completion_tokens": [
+        186,
+        213,
+        97,
+        152,
+        177,
+        149,
+        211,
+        107,
+        151,
+        156,
+        268,
+        160,
+        160,
+        102,
+        79,
+        87,
+        81,
+        228,
+        166,
+        240,
+        292,
+        190,
+        114,
+        48,
+        147,
+        212,
+        113,
+        53,
+        65,
+        102,
+        134,
+        208
+      ],
+      "sampled_graph_dispatch_windows": {
+        "FULL": 1328,
+        "PIECEWISE": 39,
+        "NONE": 80
+      },
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "clean_lifecycle": false,
+      "speculative_metrics": {
+        "num_draft_tokens": 3840.0,
+        "num_accepted_tokens": 3670.0
+      },
+      "cache_observations": [
+        {
+          "attention_specs": [
+            {
+              "class": "FullAttentionSpec",
+              "block_size": 1088,
+              "page_size_bytes": 1114112,
+              "repr": "FullAttentionSpec(block_size=1088, dcp_sharded=True, block_stride_alignment=None, is_draft=False, max_tp_shards=None, num_kv_heads=1, head_size=256, dtype=torch.bfloat16, head_size_v=256, kv_quant_mode=<KVQuantMode.NONE: 0>, page_size_padded=None, num_head_slots=None, state_content_bytes=None, tokens_per_state=1, sliding_window=None, attention_chunk_size=None, non_causal=False)"
+            }
+          ],
+          "cache_tensor_dtypes": [
+            "torch.bfloat16",
+            "torch.int8"
+          ]
+        },
+        {
+          "attention_specs": [
+            {
+              "class": "FullAttentionSpec",
+              "block_size": 1088,
+              "page_size_bytes": 1114112,
+              "repr": "FullAttentionSpec(block_size=1088, dcp_sharded=True, block_stride_alignment=None, is_draft=False, max_tp_shards=None, num_kv_heads=1, head_size=256, dtype=torch.bfloat16, head_size_v=256, kv_quant_mode=<KVQuantMode.NONE: 0>, page_size_padded=None, num_head_slots=None, state_content_bytes=None, tokens_per_state=1, sliding_window=None, attention_chunk_size=None, non_causal=False)"
+            }
+          ],
+          "cache_tensor_dtypes": [
+            "torch.bfloat16",
+            "torch.int8"
+          ]
+        }
+      ],
+      "artifact_sha256": {
+        "result.json": "2da5660fda43f718a74054d05ca03aae94cdaa11d5d48aba52543e5b023afa97",
+        "server.log": "bd9716636cdded60b6d7a3286950f04cc4444083948119d4e61918e8855315e0",
+        "hybrid-cache.json": "eba73433aec96436a6d6fbb0b5d775d2b21777a5a0e57fe452cea7a2b06bb14a",
+        "prefill-gather-policy.json": "9651699cea4cfaad6899dc66cabc94a9a094405baafe33397723096985941930",
+        "semantic-prefix-responses.json": "1e277a8519f97973f07a2debcb6c73db92bc8120cc8b2619870308befcc1b1c5",
+        "humaneval32/complete.json": "67556ae46fa520a5bf4b26a1419e4a93d6a05625717902da8e9623661730354d"
+      },
+      "accepted_tokens_per_position": {
+        "0": 1262.0,
+        "1": 1227.0,
+        "2": 1181.0
+      },
+      "manager_page": 1088,
+      "fine_grained_prefix_hits": [
+        1152,
+        2240
+      ],
+      "worker_count": 2,
+      "worker_policies": [
+        {
+          "normal_env_hash": "d403cea47c6b435188e8b855f029eae6fc74812923384704da5f5805f124e477",
+          "aot_hash_factors": [
+            "d403cea47c6b435188e8b855f029eae6fc74812923384704da5f5805f124e477",
+            "9eab050f60"
+          ],
+          "effective_prefill_factor": false,
+          "target_and_draft_layers": 11
+        },
+        {
+          "normal_env_hash": "d403cea47c6b435188e8b855f029eae6fc74812923384704da5f5805f124e477",
+          "aot_hash_factors": [
+            "d403cea47c6b435188e8b855f029eae6fc74812923384704da5f5805f124e477",
+            "9eab050f60"
+          ],
+          "effective_prefill_factor": false,
+          "target_and_draft_layers": 11
+        }
+      ]
+    },
+    "flash-e5m2-flag-on": {
+      "status": "COMPLETE",
+      "server_exit": 0,
+      "quality": {
+        "raw": {
+          "passed": 30,
+          "failed": [
+            "HumanEval/2",
+            "HumanEval/24"
+          ]
+        },
+        "normalized": {
+          "passed": 32,
+          "failed": []
+        }
+      },
+      "humaneval_finish_reasons": {
+        "stop": 32
+      },
+      "humaneval_completion_tokens": [
+        186,
+        213,
+        97,
+        152,
+        177,
+        149,
+        211,
+        107,
+        151,
+        156,
+        263,
+        160,
+        160,
+        102,
+        79,
+        87,
+        76,
+        228,
+        166,
+        240,
+        295,
+        185,
+        114,
+        48,
+        147,
+        284,
+        113,
+        53,
+        65,
+        102,
+        134,
+        208
+      ],
+      "sampled_graph_dispatch_windows": {
+        "FULL": 1347,
+        "PIECEWISE": 38,
+        "NONE": 92
+      },
+      "lifecycle_markers": {
+        "EngineDeadError": 0,
+        "resource_tracker": 3,
+        "force-kill": 0,
+        "workers still running after grace period": 0
+      },
+      "clean_lifecycle": false,
+      "speculative_metrics": {
+        "num_draft_tokens": 3900.0,
+        "num_accepted_tokens": 3713.0
+      },
+      "cache_observations": [
+        {
+          "attention_specs": [
+            {
+              "class": "FullAttentionSpec",
+              "block_size": 2176,
+              "page_size_bytes": 1114112,
+              "repr": "FullAttentionSpec(block_size=2176, dcp_sharded=True, block_stride_alignment=MultipleOf(64), is_draft=False, max_tp_shards=None, num_kv_heads=1, head_size=256, dtype=torch.uint8, head_size_v=256, kv_quant_mode=<KVQuantMode.FP8_PER_TENSOR: 1>, page_size_padded=None, num_head_slots=None, state_content_bytes=None, tokens_per_state=1, sliding_window=None, attention_chunk_size=None, non_causal=False)"
+            }
+          ],
+          "cache_tensor_dtypes": [
+            "torch.int8",
+            "torch.uint8"
+          ]
+        },
+        {
+          "attention_specs": [
+            {
+              "class": "FullAttentionSpec",
+              "block_size": 2176,
+              "page_size_bytes": 1114112,
+              "repr": "FullAttentionSpec(block_size=2176, dcp_sharded=True, block_stride_alignment=MultipleOf(64), is_draft=False, max_tp_shards=None, num_kv_heads=1, head_size=256, dtype=torch.uint8, head_size_v=256, kv_quant_mode=<KVQuantMode.FP8_PER_TENSOR: 1>, page_size_padded=None, num_head_slots=None, state_content_bytes=None, tokens_per_state=1, sliding_window=None, attention_chunk_size=None, non_causal=False)"
+            }
+          ],
+          "cache_tensor_dtypes": [
+            "torch.int8",
+            "torch.uint8"
+          ]
+        }
+      ],
+      "artifact_sha256": {
+        "result.json": "4d09698a5b8a74b6ff159b37a31a0c11eac5f4171744b27da4d22a40ae8d9cde",
+        "server.log": "d3db472f4de72a34a7646d8f9f861c7b03c856c5546e16635e0f0c9ca3ba8354",
+        "hybrid-cache.json": "ad15c4177751d24f740c1dc3ebe55bb8fece4707946638808c1b69edc3dd8701",
+        "prefill-gather-policy.json": "ffff9feb0330a4c6801e117ecb1a2cce785413b36cac9efa2780109a223be3e3",
+        "semantic-prefix-responses.json": "b820fa6b936fc121442345a5e9f53bc19cbed56670e6a23776b1ab974ff04441",
+        "humaneval32/complete.json": "8a7c9b3176351a75d90e166ebfa3fcba3908edd1fced56dd9f85b87937bcf5af"
+      },
+      "accepted_tokens_per_position": {
+        "0": 1278.0,
+        "1": 1241.0,
+        "2": 1194.0
+      },
+      "manager_page": 2176,
+      "fine_grained_prefix_hits": [
+        2240,
+        4416
+      ],
+      "worker_count": 2,
+      "worker_policies": [
+        {
+          "normal_env_hash": "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+          "aot_hash_factors": [
+            "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+            "389dda04ad"
+          ],
+          "effective_prefill_factor": true,
+          "target_and_draft_layers": 11
+        },
+        {
+          "normal_env_hash": "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+          "aot_hash_factors": [
+            "57a47b79b2f699d858de1f973df70916625b2766b4e8e0e7cd5638b8216f083b",
+            "389dda04ad"
+          ],
+          "effective_prefill_factor": true,
+          "target_and_draft_layers": 11
+        }
+      ]
+    }
+  },
+  "decisions": {
+    "functional_and_original32task_quality": "PASS_SCOPED_CURRENT_PROTOCOL",
+    "clean_lifecycle": "HOLD_SHARED_MEMORY_TRACKER_WARNING",
+    "performance": "SEPARATE_SAME_GPU_TP2_THREE_ARM_RUN_IN_PROGRESS",
+    "fp8_gather_execution": "NOT_CLAIMED; original E5M2 path retained"
+  },
+  "last_good": false,
+  "limits": [
+    "Total35B: no under7B accuracy waiver. Compare current official failed sets and retain original scores.",
+    "Parallel quality on different cards; no throughput comparison or 35B performance acceptance.",
+    "Frozen flag ON with E5M2 is not evidence that BF16-only gather executed on E5M2.",
+    "Graph dispatch logs are sampled windows, not exhaustive per-request route proof.",
+    "Historical checkpoint/protocol identity does not transfer historical installed-runtime acceptance.",
+    "Each arm logs one leaked shared_memory object on shutdown; exit0/resource release is not clean lifecycle.",
+    "Frozen ON target/draft policy is not35B actual gather kernel proof; post-timing profiler belongs to separate performance run.",
+    "Only specified Flash/Lightop mapped DSOs and195 provider files are bound by supplemental native audit; not every system DSO."
+  ]
+}

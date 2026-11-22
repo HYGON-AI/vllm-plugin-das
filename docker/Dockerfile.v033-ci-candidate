@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Context contains the validated Core wheel, optional paired Adapter/native
+# wheels, and this file. All wheels install together without dependency lookup.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY core/*.whl /tmp/v033-core/
+RUN HCU_ADAPTER_HOST=none python3 -m pip install --no-index --no-deps \
+    --no-build-isolation --force-reinstall /tmp/v033-core/*.whl \
+    && rm -rf /tmp/v033-core

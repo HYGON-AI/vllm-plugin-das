@@ -1,0 +1,220 @@
+{
+  "target": "v0.33.0",
+  "checked_utc": "2026-11-03T16:05:52.536921+00:00",
+  "official_sha": "4ba787ec9959e566d3b587a796dff07673324da5",
+  "change": "Remove private INT8 oracle integration; preserve official INT8 model routing",
+  "production_provenance": {
+    "plugin_build_source_sha": "6c2152e49295cb64d23c6842d4980c7eba5f81dc",
+    "plugin_wheel": "/data/models/vllm033-upgrade-20261103/wheels/official-ownership-plugin/hcu_vllm_das_plugin-0.3.0.dev0-py3-none-any.whl",
+    "plugin_wheel_sha256": "6a71808eddedf310136bb50f60b08b674bf897297d1df0a37b1dd14e5ca6bbec",
+    "exact_python_files": 14,
+    "both_installed_environments": [
+      ".venv-acceptance",
+      ".venv-plugin-review"
+    ],
+    "files": [
+      {
+        "path": "hcu_vllm_das/__init__.py",
+        "sha256": "71b746268fa5a31439aa6511d8d79f60a90d7ff3f7a6913ed558e74ca82bd84b"
+      },
+      {
+        "path": "hcu_vllm_das/attention/__init__.py",
+        "sha256": "8d5108ef92b53f9ba457042d1c10724f70bab75caef6c737f309399b6f8dcf46"
+      },
+      {
+        "path": "hcu_vllm_das/attention/e5m2_cache.py",
+        "sha256": "57f9e1f6e2b9091a8c46ed732a850fba49b306d1d771aad1e95cd748b9eba56c"
+      },
+      {
+        "path": "hcu_vllm_das/attention/e5m2_scales.py",
+        "sha256": "1fa6dae52b64f601ba17b47d5a0210b74f452c5c5e7954b93d8f5f88e5ac75f6"
+      },
+      {
+        "path": "hcu_vllm_das/attention/flash_attn.py",
+        "sha256": "a6a28694a3aa918e531c4bf9d380222bfe817fd3275b9ca7ac1b57a05d9139e5"
+      },
+      {
+        "path": "hcu_vllm_das/environment.py",
+        "sha256": "519bd00e243af5ec58a1a112bb440ec2048c6c9b4d12231738b26d9585120c62"
+      },
+      {
+        "path": "hcu_vllm_das/extension.py",
+        "sha256": "7938aeb236c6f1c2003d97c88743e6227924d85931054f4d081c44d3e648138a"
+      },
+      {
+        "path": "hcu_vllm_das/flash_activation.py",
+        "sha256": "5cc858150111ca77c2ff651f0291e0e23088802e088415eb51daf27981bcd2ed"
+      },
+      {
+        "path": "hcu_vllm_das/moe/__init__.py",
+        "sha256": "07ef819fcc489a7c711f0d707c25b9ff7a2fc107b994f515b4c9e6a54f1b2d6a"
+      },
+      {
+        "path": "hcu_vllm_das/moe/fused_moe_aiter.py",
+        "sha256": "598b8ac6b0febd22ff6293a6c1c31f772c320bae5b58f57e0bcabcfa3c17501a"
+      },
+      {
+        "path": "hcu_vllm_das/moe/int8_asm.py",
+        "sha256": "f1a9ad90aa174d81de0747e2d151d3da65bfce3817dc9fe22760d478d0aa4304"
+      },
+      {
+        "path": "hcu_vllm_das/moe/int8_oracle.py",
+        "sha256": "6538934872ff6929c6af9c3774ae82141fa367aa27b2b113447a5a5ba69a7dc3"
+      },
+      {
+        "path": "hcu_vllm_das/rms_norm.py",
+        "sha256": "a51593a859ff7a24fa2313b45890c2af0c5ef1f6a66eb4689d047d772e0708b0"
+      },
+      {
+        "path": "hcu_vllm_das/version.py",
+        "sha256": "0433fc8fc76eeb871e411bdfcef0e8d1fe34710322663c29d985242065ff1351"
+      }
+    ],
+    "change": "Retire private INT8 oracle rebinding and false model capability; preserve official INT8 auto/triton",
+    "core_adapter_provenance": "final033-build-provenance.json"
+  },
+  "before": "2 new regressions fail",
+  "portable": "263 passed,66 skipped",
+  "focused": "62 extension/prototype +14 verifier tests passed",
+  "installed_identity_probe": {
+    "status": "PASS",
+    "python": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/bin/python",
+    "plugin_origin": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/lib/python3.12/site-packages/hcu_vllm_das/extension.py",
+    "official_origin": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/int8.py",
+    "symbols": [
+      "Int8MoeBackend",
+      "map_int8_backend",
+      "backend_to_kernel_cls",
+      "select_int8_moe_backend",
+      "convert_to_int8_moe_kernel_format",
+      "make_int8_moe_quant_config",
+      "make_int8_moe_kernel"
+    ],
+    "all_seven_identities_unchanged": true,
+    "backend": "TRITON",
+    "experts": [
+      "vllm.model_executor.layers.fused_moe.experts.triton_moe.TritonExperts"
+    ],
+    "advertised_capabilities": [
+      "lightop-rms-norm"
+    ],
+    "explicit_aiter_rejected": "moe_backend='aiter' is not supported for Int8 MoE. Expected one of ['triton', 'humming'].",
+    "retired_install_rejected": "HCU AITER INT8 model integration requires a public expert registration API unavailable in vLLM 0.33; use official INT8 auto/triton. No official oracle was modified.",
+    "required_capability_rejected": "requested capabilities missing from active extensions: capability 'aiter-int8-moe'",
+    "cuda_initialized": true,
+    "model_or_kernel_acceptance_claimed": false
+  },
+  "installed_attestation": {
+    "adapter": {
+      "bridge_origin": "/data/models/vllm033-upgrade-20261103/.venv-acceptance/lib/python3.12/site-packages/hcu_adapter/bridges/vllm.py",
+      "module_origin": "/data/models/vllm033-upgrade-20261103/.venv-acceptance/lib/python3.12/site-packages/hcu_adapter/extensions.py",
+      "record_sha256": "c8f79e928718d31219f99cd4fe2d008cf46b8b03bdae9f458e5ca27eb27168b5",
+      "version": "0.1.0"
+    },
+    "extension": {
+      "capabilities": [
+        "lightop-rms-norm"
+      ],
+      "entry_point": "das_hcu",
+      "name": "das-hcu",
+      "status": "active"
+    },
+    "int8_moe": {
+      "aiter_integration": "unsupported: no public INT8 expert registry",
+      "backend": "TRITON",
+      "experts_class": "vllm.model_executor.layers.fused_moe.experts.triton_moe.TritonExperts",
+      "official_symbols_unchanged": true,
+      "oracle_module_origin": "/data/models/vllm033-upgrade-20261103/.venv-acceptance/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/oracle/int8.py"
+    },
+    "oot_classes": {
+      "RMSNorm": "hcu_vllm_das.rms_norm.HcuRMSNorm"
+    },
+    "platform": "hcu_adapter.bridges.vllm.HcuPlatform",
+    "plugin": {
+      "module_origin": "/data/models/vllm033-upgrade-20261103/.venv-acceptance/lib/python3.12/site-packages/hcu_vllm_das/extension.py",
+      "record_sha256": "1274f32e1fecb3762dad0832e5990892e279f295253c46ba9539fad9d2ebdcce",
+      "version": "0.3.0.dev0"
+    },
+    "schema_version": 4,
+    "vllm": {
+      "module_origin": "/data/models/vllm033-upgrade-20261103/.venv-acceptance/lib/python3.12/site-packages/vllm/__init__.py",
+      "record_sha256": "f9ba083e8f0d5c7790de947f85be192605f8d32c94ee16a53923af6da1133967",
+      "version": "0.33.0+das.da8b48faa.dtk2610"
+    }
+  },
+  "cli": {
+    "exit_code": 1,
+    "required_capability": "aiter-int8-moe",
+    "failure_boundary": "CLI argument-parser/general-plugin initialization",
+    "model_or_engine_started": false,
+    "port": 18165,
+    "failure_expected": true
+  },
+  "official_int8_owners": [
+    "selector",
+    "backend priority",
+    "conversion",
+    "quantization",
+    "kernel construction"
+  ],
+  "aiter_int8_model_integration": "unsupported; no public INT8 expert registry; standalone operator prototype only",
+  "previous_native_model_results_transferred": false,
+  "current_model_or_kernel_quality_accepted": false,
+  "core_runtime_changed": false,
+  "adapter_production_changed": false,
+  "skill_updated": true,
+  "skill_validation": "quick_validate passed",
+  "warnings_retained": "Installed logs report HIP runtime discovery warning; metadata/activation only, no native-kernel claim. Torch CUDA initialized during imports.",
+  "migration_counts": {
+    "not-run": 101,
+    "partial": 46,
+    "passed": 1
+  },
+  "cleanup": {
+    "owned_jobs_terminal": true,
+    "owned_ports_closed": [
+      18161,
+      18162,
+      18163,
+      18164,
+      18165
+    ],
+    "all_eight_gpu_vram_mib": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "protected_gpu5_6_untouched": true,
+    "device_reset": false
+  },
+  "artifact_sha256": {
+    "evidence/official-reuse-before.log": "d2ef703e5e101b4fc53365d77a3552566c6a7a07ac7dfa41b30c96f3d1a8d417",
+    "evidence/official-reuse-focused.log": "d0745c80a83a1d43b4bea471e0124769b2951ce07bd2933dc3137320ddb20a44",
+    "evidence/official-reuse-verifier.log": "b2bb7c736fd764c58b5c084c02be00c2655a150d19312641f7648c97349df7df",
+    "evidence/official-reuse-portable.log": "6bbb6c8fc072456b88b5fd6bcdc409a41d0a2b70bf646f6096b35ce6d8aad009",
+    "evidence/official-ownership-build.log": "54f52dcbb37a7676775f203e8b55d73766db787d5e0ca34aacef87d7c7da7b1d",
+    "evidence/official-ownership-install-review.log": "61108128eaa3f963ada4d21e2af5e910eeff4788c85546e90fecd5f3d6399a33",
+    "evidence/official-ownership-install-acceptance.log": "d4751197c1337c33392b8e3812cc89b2298b355e6594202ccf05e091a15f5091",
+    "evidence/official-ownership-installed-review.log": "37e701c5c16b99d70710a13494460d619916536945dc2c3b4614b62c6f685ef9",
+    "evidence/official-ownership-installed-attestation.log": "b8e8b74d00a591e67c7a3c89e408510ac8814e0bcbb178cbe07e5f67b3fc0c5a",
+    "evidence/official-ownership-required-cli.log": "b08c7955a76dbb6f9e2c0ee16f2941c815dc52889e4cbb0ca168f831a6cb7714",
+    "evidence/official-ownership-required-cli-exit.json": "ab69b8bba38a16223f52d701aa2545154e765f4d9700be42ee5ed71e95e6c88c",
+    "probe-installed-official-int8-ownership.py": "712e3a623249c05f55cb6aa1c77b42788fdbc459b7dd1f6646992c2f6ff77d07",
+    "official-ownership-plugin-build-provenance.json": "595e7d3d863bfda7fa5962cd54e91623e1e5ab7feb2d22373e8744a76f680562",
+    "plugin/validation/v0.33.0/hybrid-quality-gfx936-candidate.json": "86a695250fc6b8b8c06e08e6a8bf848820050e5523c27af2b5310fa2a430159b",
+    "/data/models/upgrading-vllm-hcu-upstream-first/references/attention-kv.md": "71428bf94781d3ca41535bb85cbbd34b11bb1e37f72653a5b2a5c0ee3548ecea",
+    "/data/models/upgrading-vllm-hcu-upstream-first/references/aiter-moe-allreduce.md": "365ab03f662206528865a9e0849fe13c51cc43324d7dce89eba09f7703b3b66d"
+  },
+  "repository_heads": {
+    "core": "da8b48faa58bf4adfb9ba6ed2eee634e6d88ede2",
+    "adapter": "7e1a6db70670649e2a9f53a63696057929b9b9e9"
+  },
+  "goal_status": "active",
+  "last_good": false,
+  "decision": "HOLD PR330: active Flash hybrid/E5M2 quality failures remain; retired AITER integration and standalone vendor-Triton numerical limits explicit"
+}

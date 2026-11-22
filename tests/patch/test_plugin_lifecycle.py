@@ -869,14 +869,16 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
             self.vllm_config = vllm_config
             self.upstream_init = (vllm_config, device)
 
-        def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        def prepare_inputs(
+            self, scheduler_output, batch_req_state, batch_desc, num_active_loras
+        ):
             prepared_inputs.append(
-                (scheduler_output, batch_req_state, batch_desc)
+                (scheduler_output, batch_req_state, batch_desc, num_active_loras)
             )
             return SimpleNamespace(is_prefilling_np=[False, False])
 
         def execute_model(self):
-            self.prepare_inputs("scheduler", "batch_state", "batch_desc")
+            self.prepare_inputs("scheduler", "batch_state", "batch_desc", 0)
             from vllm_hcu.forward_context_runtime import (
                 get_deepep_auto_request_phase,
             )
@@ -897,7 +899,7 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
     assert runner.upstream_init == (config, device)
     assert runner.pcp_manager is None
     assert runner.execute_model() == [False, False]
-    assert prepared_inputs == [("scheduler", "batch_state", "batch_desc")]
+    assert prepared_inputs == [("scheduler", "batch_state", "batch_desc", 0)]
     from vllm_hcu.forward_context_runtime import get_deepep_auto_request_phase
 
     assert get_deepep_auto_request_phase() is None

@@ -4,20 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hcu-vllm-das-plugin"
-version = "0.2.0.dev0"
-description = "Optional DAS optimizations for adapter-das and vLLM 0.32"
+version = "0.33.0"
+description = "Optional DAS optimizations for adapter-das and vLLM 0.33"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11,<3.15"
 dependencies = [
-  "sgl-kernel>=0.1.0",
+  "hcu-adapter>=0.5.22",
   "packaging>=23",
 ]
 
 [project.entry-points."hcu_adapter.extensions"]
 das_hcu = "hcu_vllm_das.extension:extension_spec"
+das_hcu_flash = "hcu_vllm_das.flash_activation:extension_spec"
+das_hcu_slimquant = "hcu_vllm_das.slimquant_activation:extension_spec"
+das_hcu_aiter_int8 = "hcu_vllm_das.int8_activation:extension_spec"
+das_hcu_dsv41 = "hcu_vllm_das.dsv41_activation:extension_spec"
+das_hcu_ct_w4a8 = "hcu_vllm_das.ct_w4a8_activation:extension_spec"
+das_hcu_v41_indexer = "hcu_vllm_das.v41_indexer_activation:extension_spec"
+das_hcu_v41_pcp = "hcu_vllm_das.v41_pcp_activation:extension_spec"
+das_hcu_fp4_packer = "hcu_vllm_das.fp4_packer:extension_spec"
+das_hcu_step5_config = "hcu_vllm_das.step5_activation:extension_spec"
+das_hcu_hyv4_flash_config = "hcu_vllm_das.hyv4_flash_config_activation:extension_spec"
+minimax31_slimquant = "hcu_vllm_das.quantization.minimax31_activation:extension_spec"
+minimax31_pcp_ep = "hcu_vllm_das.parallel.minimax31_pcp_activation:extension_spec"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["hcu_vllm_das", "hcu_vllm_das.*"]
+
+[tool.setuptools.package-data]
+hcu_vllm_das = ["csrc/*.cpp", "csrc/*.cu"]

@@ -155,6 +155,14 @@ def cpu_flashmla(monkeypatch):
         monkeypatch,
         "vllm.v1.kv_cache_interface",
         AttentionSpec=type("AttentionSpec", (), {}),
+        is_quantized_kv_cache=lambda cache_dtype: str(cache_dtype).startswith(
+            "fp8"
+        ),
+    )
+    _install_stub(
+        monkeypatch,
+        "vllm.v1.worker.workspace",
+        current_workspace_manager=lambda: None,
     )
     _install_stub(
         monkeypatch,

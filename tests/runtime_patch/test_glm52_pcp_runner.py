@@ -11,7 +11,7 @@ import inspect
 import sys
 import textwrap
 from dataclasses import dataclass
-from types import FunctionType, MethodType, ModuleType, SimpleNamespace
+from types import FunctionType, ModuleType, SimpleNamespace
 from typing import NamedTuple
 
 import numpy as np
@@ -104,10 +104,13 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
                     cp_interleave=1,
                 )
 
-        def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+        def prepare_inputs(
+            self, scheduler_output, batch_req_state, batch_desc, num_active_loras
+        ):
             events.append("super.prepare_inputs")
             assert scheduler_output == "scheduler-output"
             assert batch_req_state == "batch-req-state"
+            assert num_active_loras == 0
             input_batch = self.global_batch
             if getattr(self, "pcp_manager", None) is not None:
                 return self.pcp_manager.partition_batch(
@@ -279,6 +282,7 @@ def test_pcp_runner_orders_lifecycle_and_restores_sampling_state(
         "scheduler-output",
         "batch-req-state",
         SimpleNamespace(num_tokens=17),
+        0,
     )
     assert prepared is local_batch
     assert runner.prepare_attn(prepared) == ("local-blocks", "gathered-slots")
@@ -699,6 +703,7 @@ def test_pcp_one_preserves_the_existing_runner_event_path(
             "scheduler-output",
             "batch-req-state",
             SimpleNamespace(num_tokens=17),
+            0,
         )
         is global_batch
     )
@@ -1283,69 +1288,13 @@ def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
     """PCP target shrinks; MTP propose/prefill keeps the full global batch."""
 
     runner_module, _ = pcp_runner_module
-    speculator_module = importlib.import_module(
-        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator"
-    )
     prefill_tokens: list[int] = []
     target_profile_tokens: list[int] = []
 
-    class ConcreteSpeculator(speculator_module.AutoRegressiveSpeculator):
-        def load_draft_model(self, target_model):
-            raise NotImplementedError
+    def propose(**kwargs):
+        prefill_tokens.append(int(kwargs["input_batch"].num_tokens))
 
-    speculator = object.__new__(ConcreteSpeculator)
-    speculator.num_speculative_steps = 1
-    speculator.max_model_len = 4096
-    speculator.max_num_reqs = 16
-    speculator.hidden_states = torch.zeros((4096, 1))
-    speculator.last_token_indices = torch.zeros(16, dtype=torch.int64)
-    speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
-    speculator.input_buffers = object()
-    speculator.prefill_cudagraph_manager = None
-    speculator.dp_size = 1
-    speculator.dp_rank = 0
-    speculator.draft_tokens = torch.zeros((16, 1), dtype=torch.int64)
-    speculator._copy_request_inputs = lambda *args, **kwargs: None
-    speculator._prepare_eplb_forward = lambda *args, **kwargs: None
-    speculator.on_prefill_begin = lambda *args, **kwargs: None
-    speculator.on_prefill_end = lambda *args, **kwargs: None
-
-    def record_prefill(self, num_reqs, num_tokens, *args, **kwargs):
-        prefill_tokens.append(int(num_tokens))
-
-    speculator._prefill = MethodType(record_prefill, speculator)
-
-    monkeypatch.setattr(
-        speculator_module,
-        "prepare_prefill_inputs",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        speculator_module,
-        "get_uniform_decode_token_count",
-        lambda *args, **kwargs: None,
-    )
-
-    def dispatch_prefill(
-        manager,
-        num_reqs,
-        num_tokens,
-        uniform_token_count,
-        **kwargs,
-    ):
-        return (
-            SimpleNamespace(
-                cg_mode=speculator_module.CUDAGraphMode.NONE,
-                num_tokens=num_tokens,
-            ),
-            None,
-        )
-
-    monkeypatch.setattr(
-        speculator_module,
-        "dispatch_cg_and_sync_dp",
-        dispatch_prefill,
-    )
+    speculator = SimpleNamespace(num_speculative_steps=1, propose=propose)
 
     def profile_run(self):
         num_tokens = int(self.max_num_tokens)

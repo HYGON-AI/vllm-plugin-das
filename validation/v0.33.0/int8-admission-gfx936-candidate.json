@@ -1,0 +1,128 @@
+{
+  "target": "v0.33.0",
+  "core_sha": "da8b48faa58bf4adfb9ba6ed2eee634e6d88ede2",
+  "adapter_sha": "7e1a6db70670649e2a9f53a63696057929b9b9e9",
+  "production": {
+    "plugin_build_source_sha": "ec01e20951c8385d6e7ba30acd8e44425e9e0ffe",
+    "plugin_wheel": "/data/models/vllm033-upgrade-20261103/wheels/int8-admission-plugin/hcu_vllm_das_plugin-0.3.0.dev0-py3-none-any.whl",
+    "plugin_wheel_sha256": "a4766b0c3ff3052986bc4b85170e6af9c5c79929c1394203b85edfdb27302cea",
+    "installed_root": "/data/models/vllm033-upgrade-20261103/.venv-plugin-review/lib/python3.12/site-packages",
+    "exact_python_files": 14,
+    "files": [
+      {
+        "path": "hcu_vllm_das/__init__.py",
+        "sha256": "71b746268fa5a31439aa6511d8d79f60a90d7ff3f7a6913ed558e74ca82bd84b"
+      },
+      {
+        "path": "hcu_vllm_das/environment.py",
+        "sha256": "519bd00e243af5ec58a1a112bb440ec2048c6c9b4d12231738b26d9585120c62"
+      },
+      {
+        "path": "hcu_vllm_das/extension.py",
+        "sha256": "257f0d1ea2623f20c0895fbb778587a6f0b9c9d281034be7c729d6d340bec80e"
+      },
+      {
+        "path": "hcu_vllm_das/flash_activation.py",
+        "sha256": "5cc858150111ca77c2ff651f0291e0e23088802e088415eb51daf27981bcd2ed"
+      },
+      {
+        "path": "hcu_vllm_das/rms_norm.py",
+        "sha256": "a51593a859ff7a24fa2313b45890c2af0c5ef1f6a66eb4689d047d772e0708b0"
+      },
+      {
+        "path": "hcu_vllm_das/version.py",
+        "sha256": "0433fc8fc76eeb871e411bdfcef0e8d1fe34710322663c29d985242065ff1351"
+      },
+      {
+        "path": "hcu_vllm_das/attention/__init__.py",
+        "sha256": "8d5108ef92b53f9ba457042d1c10724f70bab75caef6c737f309399b6f8dcf46"
+      },
+      {
+        "path": "hcu_vllm_das/attention/e5m2_cache.py",
+        "sha256": "57f9e1f6e2b9091a8c46ed732a850fba49b306d1d771aad1e95cd748b9eba56c"
+      },
+      {
+        "path": "hcu_vllm_das/attention/e5m2_scales.py",
+        "sha256": "1fa6dae52b64f601ba17b47d5a0210b74f452c5c5e7954b93d8f5f88e5ac75f6"
+      },
+      {
+        "path": "hcu_vllm_das/attention/flash_attn.py",
+        "sha256": "a6a28694a3aa918e531c4bf9d380222bfe817fd3275b9ca7ac1b57a05d9139e5"
+      },
+      {
+        "path": "hcu_vllm_das/moe/__init__.py",
+        "sha256": "07ef819fcc489a7c711f0d707c25b9ff7a2fc107b994f515b4c9e6a54f1b2d6a"
+      },
+      {
+        "path": "hcu_vllm_das/moe/fused_moe_aiter.py",
+        "sha256": "598b8ac6b0febd22ff6293a6c1c31f772c320bae5b58f57e0bcabcfa3c17501a"
+      },
+      {
+        "path": "hcu_vllm_das/moe/int8_asm.py",
+        "sha256": "f1a9ad90aa174d81de0747e2d151d3da65bfce3817dc9fe22760d478d0aa4304"
+      },
+      {
+        "path": "hcu_vllm_das/moe/int8_oracle.py",
+        "sha256": "060099b7431bad8c42ba3247380dd967a0c73bef8ffb23e003659904f7a45dbf"
+      }
+    ],
+    "core_adapter_provenance": "final033-build-provenance.json",
+    "previous_asm_math_provenance": "asm-math-plugin-build-provenance.json",
+    "change": "Reject expert bias and unforwarded parameterized activations before INT8 weight conversion or any vendor launch",
+    "full_model_math_wheel": "529855a50e509a867911839d2a2197b1db594dcd"
+  },
+  "decision": "HOLD PR330: directly relevant model quality and unchanged vendor-Triton numerical gates remain open",
+  "last_good": false,
+  "change": "Reject unsupported expert bias and SITU/SwiGLU-OAI variants in INT8 admission; no Core/Adapter production change",
+  "validation": {
+    "before": "9 new portable cases fail; installed real v0.33 classes admit all10 activation/bias pairs",
+    "after": "55 focused /262 portable passed,66 skipped; installed native11 passed,14 retained warnings; installed actual v0.33 admits only SiLU/GELU without bias",
+    "real_admission_probe_sha256": "b0fa59cc6a4f23a5649fa2e13cef788c83cedfd83c82a7fea47653aa0fc0d8d4"
+  },
+  "evidence": [
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/v033-int8-admission-before.log",
+      "sha256": "15f3c9d02c6b86e039d0d88c2c7b83495ab05c306a8be2d34238f1810ba7787e",
+      "size": 10828
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/v033-int8-admission-after.log",
+      "sha256": "a5d9486787438d436cff02173663c13fed10b89b8d5aa558438af70d5390b664",
+      "size": 99
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/v033-int8-admission-portable.log",
+      "sha256": "7793472eaa4939398b15f6b4a1186fb6e44c6f3f1586febb9af4279359ab4018",
+      "size": 444
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/v033-int8-real-admission-before.log",
+      "sha256": "f94ce082de7c31d772421cce7673746c760cbff6737253045e7740bdb3d60f80",
+      "size": 608
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/v033-int8-real-admission-after.log",
+      "sha256": "ebb49716476d53d28304110b747eb39c96bafc59fc0b68cd40e08d222350df6c",
+      "size": 1323
+    },
+    {
+      "path": "/data/models/vllm033-upgrade-20261103/evidence/v033-int8-admission-hcu.log",
+      "sha256": "e65dd49fa7e830476878b37676e1e3d88187cff3e0aa4bc187b042cab38f24aa",
+      "size": 7096
+    }
+  ],
+  "full_model_followup": {
+    "status": "running",
+    "model": "/model/Qwen3.5-35B-A3B-W8A8",
+    "math_production_sha": "529855a50e509a867911839d2a2197b1db594dcd",
+    "attention_backend": "TRITON_ATTN",
+    "moe_backends": [
+      "triton",
+      "aiter"
+    ],
+    "combo_kernels": false,
+    "mtp": 0,
+    "native_observed": "ASM stage1/stage2 code objects loaded; M1024 config SOL_ID1=12001/SOL_ID2=22000/BLOCK_SIZE_M=64",
+    "acceptance_not_claimed": true
+  }
+}

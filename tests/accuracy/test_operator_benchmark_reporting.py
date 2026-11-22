@@ -4,16 +4,28 @@
 from __future__ import annotations
 
 import math
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
 
-from tools.benchmark_sglang_operator_candidates import (
-    build_comparison_record,
-    build_parser,
-    distribution_version,
-    speedup_percent,
-    summarize_timings,
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+_TOOL_PATH = REPOSITORY / "tools" / "benchmark_sglang_operator_candidates.py"
+_SPEC = importlib.util.spec_from_file_location(
+    "plugin_tools_benchmark_sglang_operator_candidates", _TOOL_PATH
 )
+assert _SPEC is not None and _SPEC.loader is not None
+benchmark = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = benchmark
+_SPEC.loader.exec_module(benchmark)
+
+build_comparison_record = benchmark.build_comparison_record
+build_parser = benchmark.build_parser
+distribution_version = benchmark.distribution_version
+speedup_percent = benchmark.speedup_percent
+summarize_timings = benchmark.summarize_timings
 
 
 def test_summarize_timings_uses_median_and_extrema() -> None:
@@ -135,7 +147,8 @@ def test_distribution_version_uses_installed_package_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "tools.benchmark_sglang_operator_candidates.metadata.version",
+        benchmark.metadata,
+        "version",
         lambda name: f"installed-{name}",
     )
 

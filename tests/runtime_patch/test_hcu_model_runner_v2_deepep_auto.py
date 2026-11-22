@@ -122,11 +122,11 @@ def test_real_batch_phase_remains_authoritative_without_dummy_scope(
     monkeypatch.setattr(
         GPUModelRunner,
         "prepare_inputs",
-        lambda self, scheduler_output, batch_req_state, batch_desc: input_batch,
+        lambda self, scheduler_output, batch_req_state, batch_desc, num_active_loras: input_batch,
     )
 
     with deepep_auto_request_phase_scope():
-        result = runner.prepare_inputs("scheduler", "state", "descriptor")
+        result = runner.prepare_inputs("scheduler", "state", "descriptor", 0)
         assert result is input_batch
         assert get_deepep_auto_request_phase() is phase
 

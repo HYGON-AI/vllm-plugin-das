@@ -1,8 +1,65 @@
 # HYV4 Flash on vLLM 0.33 (candidate)
 
-The plugin registers `HYV4FlashForCausalLM` and
-`HYV4FlashVLForConditionalGeneration`. Model registration and static import
-closure are not evidence that a checkpoint can be served on HCU.
+The legacy source registration declares `HYV4FlashForCausalLM` and
+`HYV4FlashVLForConditionalGeneration`. The active v0.33 plugin now delivers
+Flash configuration metadata through an Adapter extension, but these model
+implementations and registrations are still absent from that wheel. The
+integration blocker below must be fixed before claiming HCU serving support.
+
+### Configuration port
+
+The active `hyv4-flash-config` capability registers `hy_v4_flash` and
+`hy_v4_flash_vl` with public Transformers AutoConfig. It inherits official
+Core's text configuration and preserves the candidate's Flash/vision config
+fields and validation. It does not touch Core's model registry or register
+the legacy plugin platform. Real installed config parsing, serialization,
+foreign-owner refusal, partial-commit failure and process lifecycle contracts
+are selected by `tests/vllm033/test_hyv4_flash_config_cpu.py` in portable CI.
+This first part of the port does not close model implementation, tokenizer,
+multimodal processor, attention, weights, device or accuracy gates.
+
+## Remaining v0.33 model integration blocker
+
+The original prospective integration of PR #493 head `acab29bb2228` with release target
+`32a1a6c05d6d` merges without conflicts, but its actual
+`hcu-vllm-das-plugin==0.33.0` wheel contains neither `vllm_hcu` nor HYV4 Flash
+model modules. This historical finding predates the configuration-only port
+above. The active `adapter_extension/pyproject.toml` includes only
+`hcu_vllm_das` packages and Adapter extension entry points. The target also
+explicitly disables the repository-root legacy build. Adding the repository
+to `PYTHONPATH` or rebuilding the retired root project cannot qualify this
+release artifact.
+
+An isolated, repository-free probe used that built wheel with the actual
+Core `0.33.0+das.c440c08.dtk2610.torch2130.gfx936gfx938.r211.rocm72` and
+Adapter `0.5.22+hcu.1`. It found no `vllm_hcu` import spec and no registry entries
+for either Flash architecture. Ordinary `HYV4ForCausalLM` and `HYV4MTPModel`
+remain registered to official Core `vllm.models.hy_v4`; those names do not
+establish Flash support. The probe used `HCU_ADAPTER_HOST=none`, inspected real
+distribution metadata and Core registry objects, and did not activate HCU or
+instantiate a checkpoint.
+
+The prospective merged tree passes all eight existing source-tier tests.
+Its source, portable, device and gfx938 CI selectors select no
+`tests/models/hy_v4` cases. That green source tier verifies its existing package
+boundary; it does not exercise delivery of this MR's feature. Earlier AST-body
+and source-overlay model results retain their original scope.
+
+Before this MR is merge-ready, port only the missing model behavior into the
+active plugin package after comparing it with Core's current implementations;
+connect registration through the Adapter extension lifecycle; and add wheel,
+installed discovery and applicable runtime coverage to the v0.33 CI matrix.
+Keep official HYV4 registrations and platform ownership intact. Packaging and
+registration checks must pass outside the source tree before device/model,
+accuracy, Graph and lifecycle qualification. Do not restore the retired root
+platform/general entry points to conceal this gap.
+
+Reproducible local evidence: `evidence/pr493-v033-integration-20261122/`
+in the upgrade handoff workspace, including the merge parents/tree, wheel
+inventory/hash, `registry-probe-r2.json`, `source-ci.xml` and `ci-selection.json`.
+The original probe-generation syntax error is retained separately; its corrected
+registry probe exits zero. No FlashAttention modification/rebuild or DeepSeek
+V4.1 checkpoint test was performed.
 
 ## Repository boundary and dependency
 
@@ -29,6 +86,36 @@ same stream. It must not call ROCm-AITER's private logical-topk event hook.
 The current runtime explicitly rejects speculative decoding.
 
 ## Validation gates
+
+Quantized checkpoint completeness includes every routed layer's FP32
+`expert_bias`, including the `gate.e_score_correction_bias` checkpoint alias;
+the explicit audit also requires materialized IndexPool `intra_group_ape`,
+Engram pre-gamma/per-HC scales and projection biases, HC base/scale parameters,
+and learned attention sinks. A quantized Core tracker and an audit over only
+observed shards can miss whole non-`.weight` tensors; constructor defaults
+cannot replace learned checkpoint values. CPU regressions reject each omitted
+tensor before the recording Core tracker and exercise canonical tensor assignment
+through the actual loader body. Constructor/tracker shells remain explicit;
+these are not installed checkpoint, long-context, TP or device/model tests.
+
+For visual 2D RoPE, the learned position-embedding edge is a training grid,
+while preprocessing can admit longer rectangular grids. The tower retains
+Core's original table and uses its inverse frequencies for a local,
+nonpersistent extension when needed. CPU tests cover real admitted profiling
+grids, repeated growth without a construction config context, and unchanged
+small-grid values. Encoder Graph and installed VL model validation remain open.
+
+Image profiling follows the processor's input aspect check before rounding.
+For example, legal `8192x41` input becomes `8192x32`, with 512 tokens when
+row newlines are enabled. A dummy image can therefore have unaligned raw
+dimensions; token budgets use its actual resized grid. The search also covers
+downscale floor grids below `min_pixels`, both closed input-aspect endpoints,
+and the separate alignment/max-pixel contract when resizing is disabled.
+It does not tighten request admissibility or change image preprocessing.
+Regression coverage includes real resize/profile/token-count function bodies,
+an exhaustive finite raw-input family and independent sampled raw inputs.
+This CPU coverage does not qualify the installed multimodal dispatcher,
+checkpoint loading, encoder Graphs or model quality.
 
 CPU-only seam tests:
 

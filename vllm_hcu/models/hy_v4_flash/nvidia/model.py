@@ -430,6 +430,8 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
                     DefaultModelLoader,
                 )
 
+                # Quantized Core tracking and observed-shard checks can miss
+                # whole learned tensors, including leaves not named "weight".
                 required = {
                     name
                     for name, _ in self.named_parameters()
@@ -438,7 +440,10 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
                         ".w13_weight_packed", ".w2_weight_packed",
                         ".w13_weight_scale", ".w2_weight_scale",
                         ".w13_weight_shape", ".w2_weight_shape",
-                    ))
+                        ".expert_bias", ".intra_group_ape", ".bias",
+                        ".unified_pre_gamma", ".hc_scale", ".hc_base",
+                        ".hc_head_base", ".hc_head_scale", ".learnable_sink_param",
+                    )) or ".unified_per_hc_scales." in name
                 }
                 missing = required - self._loaded_weights
                 if missing:
