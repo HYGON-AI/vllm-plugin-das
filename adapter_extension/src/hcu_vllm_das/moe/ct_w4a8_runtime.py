@@ -67,7 +67,9 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
     if isinstance(native,DeepEPHTPrepareAndFinalize):
         if native.num_dispatchers()!=moe.moe_parallel_config.ep_size:
             raise RuntimeError('DeepEP HT group disagrees with loaded MoE')
-        return HcuCTHTPrepareAndFinalize(native.buffer,native.num_dispatchers(),native.dp_size,native.rank_expert_offset)
+        prepare = HcuCTHTPrepareAndFinalize(native.buffer,native.num_dispatchers(),native.dp_size,native.rank_expert_offset)
+        from hcu_vllm_das.hy4_ht_int8 import select_prepare
+        return select_prepare(prepare, config, moe)
     raise RuntimeError('HCU W4A8 requires a fixed native HT/LL prepare object')
 
 

@@ -113,6 +113,16 @@ native launch. MTP is unchanged. This defaults off; unset the child or disable
 the master and restart to roll back. Reduction ordering can change slightly;
 component tests do not replace checkpoint accuracy or serving measurements.
 
+HY4 W4A8 PCP16 prefills can opt into per-token INT8 DeepEP HT transport with
+`VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_HT_INT8_DISPATCH=1` (default off).
+This quantizes source rows before dispatch; Core retains receive metadata,
+communication handles and finalize. Inputs below 2048 source tokens per rank
+keep BF16 transport. Admission requires gfx938, BF16, eager MRV2, synchronous
+scheduling, TP1/PP1/DP1/DCP1, HT16, and no DBO, ubatching, LoRA or online EPLB.
+The child or master can be disabled before restarting to retain the existing
+prepare path. CPU contracts and 16-rank transport/scale equivalence are covered;
+whole-model accuracy and serving performance are separate validation gates.
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
