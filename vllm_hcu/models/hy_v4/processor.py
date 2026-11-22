@@ -489,16 +489,22 @@ class HYV4VLProcessor(ProcessorMixin):
             tokenizer = AutoTokenizer.from_pretrained(
                 pretrained_model_name_or_path, trust_remote_code=False, **load_kwargs
             )
-        processor_dict, _ = HYV4VLImageProcessor.get_image_processor_dict(
+        image_dict, _ = HYV4VLImageProcessor.get_image_processor_dict(
             pretrained_model_name_or_path, **load_kwargs
         )
-        image_kwargs = {**processor_dict, **kwargs.pop("images_kwargs", {})}
-        video_kwargs = {**processor_dict, **kwargs.pop("videos_kwargs", {})}
+        # Let HF resolve nested/dedicated video configs and legacy shared fallback.
+        video_dict, _ = HYV4VLVideoProcessor.get_video_processor_dict(
+            pretrained_model_name_or_path, **load_kwargs
+        )
+        image_kwargs = {**image_dict, **kwargs.pop("images_kwargs", {})}
+        video_overrides = kwargs.pop("videos_kwargs", {})
+        video_kwargs = dict(video_dict)
         for key, value in kwargs.items():
             if key in HYV4ImageProcessorKwargs.__annotations__:
                 image_kwargs[key] = value
             if key in HYV4VideoProcessorKwargs.__annotations__:
                 video_kwargs[key] = value
+        video_kwargs.update(video_overrides)
         return cls(
             HYV4VLImageProcessor(**image_kwargs),
             tokenizer,
