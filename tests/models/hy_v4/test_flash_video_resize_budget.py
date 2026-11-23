@@ -294,7 +294,7 @@ class PublicVideoResizeBudgetTests(unittest.TestCase):
                     },
                 )
                 shape = HYV4VLProcessingInfo.get_dummy_video_shape(
-                    info, 512, {"video": 1}
+                    info, 512, {"video": 1}, return_raw=True
                 )
                 count, height, width = shape
                 metadata = dict(
@@ -308,7 +308,31 @@ class PublicVideoResizeBudgetTests(unittest.TestCase):
                     videos=[(self.frames(count, height, width), metadata)],
                     videos_kwargs=self.options(return_tensors="pt", **options),
                 )
-                self.check_output(output, count, height, width, spatial)
+                resized_height, resized_width = self.processor.adaptive_resize(
+                    height,
+                    width,
+                    count,
+                    merge_size=2 * spatial,
+                    **{
+                        key: options[key]
+                        for key in (
+                            "max_pixels",
+                            "video_max_image_size",
+                            "timestamp_token_per_frame",
+                            "timestamp_token_reserve",
+                        )
+                    },
+                )
+                # Minimum-edge clamping can exceed the nominal per-frame area
+                # cap; the processor enforces only the total post-resize cap.
+                grid = [count, resized_height // 16, resized_width // 16]
+                self.assertEqual(output["video_grid_thw"].tolist(), [grid])
+                self.assertEqual(
+                    output["pixel_values_videos"].shape[0], math.prod(grid)
+                )
+                self.assertLessEqual(
+                    count * resized_height * resized_width, options["max_pixels"]
+                )
                 tokens = wrapper.get_replacement(
                     "video", output["video_grid_thw"][0], output["video_timestamps"]
                 )

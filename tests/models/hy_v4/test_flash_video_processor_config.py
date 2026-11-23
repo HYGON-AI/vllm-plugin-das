@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Video config regressions; local files only, no model/tokenizer downloads.
 
-RealHFLoaderTests calls the public HF get_dict methods without Torch.
+RealHFLoaderTests calls public HF get_dict and standardization methods without Torch.
 FactoryAstTests isolates the production factory/constructor with test doubles;
 it does NOT test HF file resolution or tensor processing. RealHFLocalFilesTests
 uses the actual plugin and HF loaders/constructors, and explicitly skips when
@@ -49,6 +49,59 @@ VIDEO = {
     "timestamp_token_reserve": 1000,
     "video_max_image_size": 768,
 }
+
+
+class ProcessorSettingsAssertions:
+    def assert_settings(self, component, settings):
+        for name, value in settings.items():
+            actual = getattr(component, name)
+            if name in ("image_mean", "image_std"):
+                # HF canonicalizes JSON lists to tuples; contents must still match.
+                self.assertSequenceEqual(actual, value, name)
+            else:
+                self.assertEqual(actual, value, name)
+
+
+class SettingsAssertionsTests(ProcessorSettingsAssertions, unittest.TestCase):
+    def test_mean_std_accept_lists_and_tuples(self):
+        for actual_type in (list, tuple):
+            for expected_type in (list, tuple):
+                with self.subTest(actual=actual_type, expected=expected_type):
+                    self.assert_settings(
+                        SimpleNamespace(
+                            **{
+                                name: actual_type(IMAGE[name])
+                                for name in ("image_mean", "image_std")
+                            }
+                        ),
+                        {
+                            name: expected_type(IMAGE[name])
+                            for name in ("image_mean", "image_std")
+                        },
+                    )
+
+    def test_mean_std_reject_wrong_values_order_length_and_scalars(self):
+        for name in ("image_mean", "image_std"):
+            expected = IMAGE[name]
+            for actual in ([0.0] * 3, expected[::-1], expected[:-1], 0.5):
+                with self.subTest(name=name, actual=actual):
+                    with self.assertRaises(AssertionError):
+                        self.assert_settings(
+                            SimpleNamespace(**{name: actual}), {name: expected}
+                        )
+
+    def test_other_settings_still_require_exact_values(self):
+        for name, expected, actual in (
+            ("size", VIDEO["size"], IMAGE["size"]),
+            ("fps", 3, 7),
+            ("timestamp_token_reserve", 0, 1000),
+            ("do_sample_frames", False, True),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    self.assert_settings(
+                        SimpleNamespace(**{name: actual}), {name: expected}
+                    )
 
 
 class FactoryAstTests(unittest.TestCase):
@@ -208,8 +261,8 @@ class FactoryAstTests(unittest.TestCase):
     importlib.util.find_spec("transformers") is not None,
     "real HF get_dict tests require Transformers (Torch is not required)",
 )
-class RealHFLoaderTests(unittest.TestCase):
-    """Actual installed HF file resolution; no processor construction or Torch."""
+class RealHFLoaderTests(ProcessorSettingsAssertions, unittest.TestCase):
+    """Actual HF config resolution and kwargs standardization; no tensors or Torch."""
 
     @classmethod
     def setUpClass(cls):
@@ -237,6 +290,26 @@ class RealHFLoaderTests(unittest.TestCase):
             )
             self.assertEqual(actual, expected)
             self.assertEqual(unused, {"probe_option": "returned-unused"})
+
+    def test_real_hf_standardized_mean_std_match_config_sequences(self):
+        from transformers.image_processing_utils import BaseImageProcessor
+
+        processor = BaseImageProcessor()
+        for settings in (
+            IMAGE,
+            VIDEO,
+            {"image_mean": [0.25] * 3, "image_std": [0.35] * 3},
+        ):
+            for sequence_type in (list, tuple):
+                expected = {
+                    name: sequence_type(settings[name])
+                    for name in ("image_mean", "image_std")
+                }
+                with self.subTest(settings=settings, sequence_type=sequence_type):
+                    actual = processor._standardize_kwargs(**expected)
+                    for name in expected:
+                        self.assertIsInstance(actual[name], tuple)
+                    self.assert_settings(SimpleNamespace(**actual), expected)
 
     def test_separate_video_file(self):
         self.write("preprocessor_config.json", IMAGE)
@@ -296,7 +369,7 @@ HAS_REAL_DEPS = all(
     HAS_REAL_DEPS,
     "real local-files HF/plugin tests require Torch, torchvision, Transformers, tokenizers and vLLM",
 )
-class RealHFLocalFilesTests(unittest.TestCase):
+class RealHFLocalFilesTests(ProcessorSettingsAssertions, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from tokenizers import Tokenizer
@@ -332,10 +405,6 @@ class RealHFLocalFilesTests(unittest.TestCase):
             local_files_only=True,
             **kwargs,
         )
-
-    def assert_settings(self, component, settings):
-        for name, value in settings.items():
-            self.assertEqual(getattr(component, name), value, name)
 
     def test_separate_video_file(self):
         self.write("preprocessor_config.json", IMAGE)
@@ -388,8 +457,10 @@ class RealHFLocalFilesTests(unittest.TestCase):
                 self.write(filename, contents)
                 result = self.load()
                 self.assertEqual(result.video_processor.size["longest_edge"], 33554432)
-                self.assertEqual(result.video_processor.image_mean, [0.5] * 3)
-                self.assertEqual(result.video_processor.fps, 2)
+                self.assert_settings(
+                    result.video_processor,
+                    {"image_mean": [0.5] * 3, "image_std": [0.5] * 3, "fps": 2},
+                )
 
     def test_explicit_video_overrides_win_over_files_and_flat_options(self):
         self.write(
