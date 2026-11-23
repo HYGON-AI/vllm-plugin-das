@@ -2,9 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pinned PR #68296 DFly derivation for the v0.33 HCU plugin."""
 from copy import deepcopy
+from functools import partial
 from transformers import PreTrainedConfig
 from vllm_hcu.models.hy_v4_flash.configs import SPARSE_ATTENTION
 from vllm_hcu.models.hy_v4.config import HYV4Config
+
+
+def _copy_derived_dfly_config(derived, _loaded_config):
+    """Keep draft HF overrides pickleable across Core/worker spawn boundaries."""
+    return deepcopy(derived)
+
 
 def _derive_dfly_config(
     hf_config: PreTrainedConfig,
@@ -223,7 +230,7 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
             max_model_len=self.max_model_len or target.max_model_len,
             spec_target_max_model_len=target.max_model_len, quantization=self.quantization,
             enforce_eager=True, max_logprobs=target.max_logprobs,
-            hf_overrides=lambda _: deepcopy(derived), config_format=target.config_format,
+            hf_overrides=partial(_copy_derived_dfly_config, derived), config_format=target.config_format,
         )
         self.draft_parallel_config = self.create_draft_parallel_config(
             parallel, parallel.tensor_parallel_size, self.draft_model_config)
