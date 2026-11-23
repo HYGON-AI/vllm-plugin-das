@@ -96,10 +96,34 @@ class JointProfileBudgetTests(unittest.TestCase):
     def setUpClass(cls):
         cls.ns = functions()
 
-    def run_shape(self, info, length=512, counts=None):
-        return self.ns["get_dummy_video_shape"](info, length, counts or {"video": 1})
+    def run_shape(self, info, length=512, counts=None, *, return_raw=False):
+        return self.ns["get_dummy_video_shape"](
+            info, length, counts or {"video": 1}, return_raw=return_raw
+        )
 
-    def assert_accepted(self, shape, config, processor, options=None):
+    def resize_shape(self, shape, config, processor, options=None):
+        options = options or {}
+        frames, height, width = shape
+        if not options.get("do_resize", processor.do_resize):
+            return shape
+        height, width = self.ns["adaptive_resize"](
+            height,
+            width,
+            frames,
+            config.patch_size,
+            config.spatial_merge_size * config.spatial_patch_size,
+            options.get("max_pixels", processor.size["longest_edge"]),
+            options.get("video_max_image_size", processor.video_max_image_size),
+            options.get(
+                "timestamp_token_per_frame", processor.timestamp_token_per_frame
+            ),
+            options.get("timestamp_token_reserve", processor.timestamp_token_reserve),
+        )
+        return frames, height, width
+
+    def assert_accepted(
+        self, shape, info, config, processor, options=None, length=512, counts=None
+    ):
         options = options or {}
         frames, height, width = shape
         factor = (
@@ -110,32 +134,20 @@ class JointProfileBudgetTests(unittest.TestCase):
         maximum = options.get("max_pixels", processor.size["longest_edge"])
         self.assertLessEqual(frames * height * width, maximum)
         self.assertLessEqual(frames, options.get("max_frames", processor.max_frames))
-        if options.get("do_resize", processor.do_resize):
-            self.assertEqual(
-                self.ns["adaptive_resize"](
-                    height,
-                    width,
-                    frames,
-                    config.patch_size,
-                    config.spatial_merge_size * config.spatial_patch_size,
-                    maximum,
-                    options.get("video_max_image_size", processor.video_max_image_size),
-                    options.get(
-                        "timestamp_token_per_frame", processor.timestamp_token_per_frame
-                    ),
-                    options.get(
-                        "timestamp_token_reserve", processor.timestamp_token_reserve
-                    ),
-                ),
-                (height, width),
-            )
+        # The processed optimum need not be a resize fixed point. Validate a
+        # raw witness through exactly ONE production resize; never resize the
+        # processed grid and pretend that it was a supported raw input.
+        raw = self.run_shape(info, length, counts, return_raw=True)
+        self.assertEqual(raw[0], frames)
+        self.assertTrue(all(isinstance(value, int) and value > 0 for value in raw))
+        self.assertEqual(self.resize_shape(raw, config, processor, options), shape)
 
     def test_short_context_witness_profiles_at_least_the_accepted_encoder_work(self):
         for spatial, witness_patches in ((2, 2304), (1, 1024)):
             with self.subTest(spatial=spatial):
                 info, config, processor, tokenizer = settings(spatial=spatial)
                 shape = self.run_shape(info)
-                self.assert_accepted(shape, config, processor)
+                self.assert_accepted(shape, info, config, processor)
                 t, h, w = shape
                 patches = t * (h // 16) * (w // 16)
                 self.assertGreaterEqual(patches, witness_patches)
@@ -145,9 +157,14 @@ class JointProfileBudgetTests(unittest.TestCase):
                 )
                 self.assertNotEqual(shape, (2 if spatial == 2 else 1, f, f))
 
-    def test_small_grid_search_matches_independent_exhaustive_oracle(self):
+    def test_output_grid_search_matches_exhaustive_upper_bound(self):
         for spatial, tau, newline, extra, budget, resize in product(
-            (1, 2), (1, 2), (False, True), (False, True), (48, 128, 512), (False, True)
+            (1, 2),
+            (1, 2, 3),
+            (False, True),
+            (False, True),
+            (48, 128, 512),
+            (False, True),
         ):
             options = {"do_resize": resize}
             info, config, processor, tokenizer = settings(
@@ -164,7 +181,7 @@ class JointProfileBudgetTests(unittest.TestCase):
             )
             factor = 32 * spatial
             max_cells = processor.size["longest_edge"] // factor**2
-            expected = 0
+            expected = None
             for frames in range(2 if spatial == 2 else 1, processor.max_frames + 1):
                 for rows in range(1, max_cells // frames + 1):
                     for cols in range(1, max_cells // frames // rows + 1):
@@ -174,11 +191,25 @@ class JointProfileBudgetTests(unittest.TestCase):
                             > budget
                         ):
                             continue
-                        if resize and self.ns["adaptive_resize"](
-                            h, w, frames, 16, 2 * spatial, 81920, 128, 1, 0
-                        ) != (h, w):
-                            continue
-                        expected = max(expected, frames * rows * cols)
+                        # Exhaust every output grid, rather than the optimized
+                        # row/column solver. Non-clamped grids have strict total
+                        # resize area and inclusive side-area bounds. A one-cell
+                        # short edge can instead be reached by a thin raw input.
+                        if resize and min(rows, cols) > 1:
+                            resize_cells = max(1, max_cells - frames)
+                            if frames * rows * cols >= resize_cells:
+                                continue
+                            if h * w > processor.video_max_image_size**2:
+                                continue
+                        candidate = (
+                            frames * rows * cols,
+                            rows * cols,
+                            frames,
+                            min(h, w),
+                            max(h, w),
+                        )
+                        if expected is None or candidate > expected:
+                            expected = candidate
             with self.subTest(
                 spatial=spatial,
                 tau=tau,
@@ -189,9 +220,9 @@ class JointProfileBudgetTests(unittest.TestCase):
             ):
                 shape = self.run_shape(info, budget)
                 frames, h, w = shape
-                self.assertGreater(expected, 0, "oracle fixture must admit some video")
-                self.assertEqual(frames * (h // factor) * (w // factor), expected)
-                self.assert_accepted(shape, config, processor, options)
+                self.assertIsNotNone(expected, "oracle fixture must admit some video")
+                self.assertEqual(shape, expected[2:])
+                self.assert_accepted(shape, info, config, processor, options, budget)
                 self.assertLessEqual(
                     placeholder_tokens(
                         frames, h // factor, w // factor, config, tokenizer
@@ -207,7 +238,7 @@ class JointProfileBudgetTests(unittest.TestCase):
         edge = config.max_image_size // config.patch_size + 1
         self.assertLessEqual(max(height, width) // config.patch_size, edge)
         self.assertGreaterEqual(frames * (height // 16) * (width // 16), 2304)
-        self.assert_accepted(shape, config, processor)
+        self.assert_accepted(shape, info, config, processor)
         self.assertLessEqual(
             placeholder_tokens(frames, height // 64, width // 64, config, tokenizer),
             512,
@@ -222,7 +253,7 @@ class JointProfileBudgetTests(unittest.TestCase):
         self.assertLessEqual(
             placeholder_tokens(frames, h // 64, w // 64, config, tokenizer), 32
         )
-        self.assert_accepted((frames, h, w), config, processor)
+        self.assert_accepted((frames, h, w), info, config, processor, length=32)
 
     def test_explicit_limits_and_shared_media_budget_are_used(self):
         options = {
@@ -234,7 +265,9 @@ class JointProfileBudgetTests(unittest.TestCase):
         }
         info, config, processor, tokenizer = settings(options=options)
         shape = self.run_shape(info, 512, {"image": 1, "video": 2})
-        self.assert_accepted(shape, config, processor, options)
+        self.assert_accepted(
+            shape, info, config, processor, options, 512, {"image": 1, "video": 2}
+        )
         t, h, w = shape
         self.assertLessEqual(
             placeholder_tokens(t, h // 64, w // 64, config, tokenizer), 512 // 3
@@ -254,6 +287,167 @@ class JointProfileBudgetTests(unittest.TestCase):
         info, _, _, _ = settings(max_frames=1)
         with self.assertRaisesRegex(ValueError, "max_frames"):
             self.run_shape(info)
+
+    def test_reported_non_idempotent_raw_inputs_are_covered(self):
+        info, config, processor, tokenizer = settings()
+        real = self.resize_shape((25, 2688, 3264), config, processor)
+        self.assertEqual(real, (25, 896, 1088))
+        real_patches = real[0] * (real[1] // 16) * (real[2] // 16)
+        self.assertEqual(real_patches, 95200)
+        self.assertGreater(real_patches, 90720)  # Old fixed-point profile.
+        self.assertEqual(placeholder_tokens(25, 14, 17, config, tokenizer), 6682)
+        shape = self.run_shape(info, 8192)
+        self.assertEqual(shape, (2, 64, 261056))
+        self.assertGreaterEqual(
+            shape[0] * (shape[1] // 16) * (shape[2] // 16), real_patches
+        )
+        raw = self.run_shape(info, 8192, return_raw=True)
+        self.assertEqual(raw[1], 2)  # Neither H=1 nor H=3: HF channel ambiguity.
+        self.assertNotEqual(raw, shape)
+        self.assertNotEqual(self.resize_shape(shape, config, processor), shape)
+        self.assert_accepted(shape, info, config, processor, length=8192)
+        self.assertEqual(placeholder_tokens(2, 1, 4079, config, tokenizer), 8192)
+        # The short-edge clamp can exceed the nominal per-frame side-area cap.
+        self.assertGreater(shape[1] * shape[2], processor.video_max_image_size**2)
+
+    def test_small_pixel_budget_raw_counterexample_uses_thin_input_clamp(self):
+        options = {"max_pixels": 81920}
+        info, config, processor, tokenizer = settings(spatial=1, options=options)
+        real = self.resize_shape((1, 32, 4096), config, processor, options)
+        self.assertEqual(real, (1, 32, 256))
+        self.assertEqual(placeholder_tokens(1, 1, 8, config, tokenizer), 26)
+        shape = self.run_shape(info, 32)
+        self.assertEqual(shape, (1, 32, 448))
+        self.assertGreater(shape[0] * (shape[1] // 16) * (shape[2] // 16), 32)
+        self.assertEqual(self.run_shape(info, 32, return_raw=True)[1], 2)
+        self.assert_accepted(shape, info, config, processor, options, 32)
+        self.assertEqual(placeholder_tokens(1, 1, 14, config, tokenizer), 32)
+
+    def test_nonclamped_raw_witness_resizes_once_to_cache_bounded_optimum(self):
+        info, config, processor, tokenizer = settings()
+        config.use_2d_rope = True
+        shape = self.run_shape(info, 8192)
+        self.assertEqual(shape, (26, 832, 1152))
+        self.assertGreater(min(shape[1:]), 64)  # Exercise non-clamp construction.
+        self.assertNotEqual(self.resize_shape(shape, config, processor), shape)
+        raw = self.run_shape(info, 8192, return_raw=True)
+        self.assertNotEqual(raw, shape)
+        self.assertGreater(raw[0] * raw[1] * raw[2], processor.size["longest_edge"])
+        self.assert_accepted(shape, info, config, processor, length=8192)
+        self.assertGreaterEqual(shape[0] * (shape[1] // 16) * (shape[2] // 16), 95200)
+        edge = config.max_image_size // config.patch_size + 1
+        self.assertLessEqual(max(shape[1:]) // config.patch_size, edge)
+        self.assertLessEqual(placeholder_tokens(26, 13, 18, config, tokenizer), 8192)
+
+    def test_already_fixed_point_raw_witness_is_returned_unchanged(self):
+        info, config, processor, _ = settings(spatial=1)
+        shape = self.run_shape(info, 32)
+        self.assertEqual(shape, (1, 32, 448))
+        self.assertEqual(self.run_shape(info, 32, return_raw=True), shape)
+        self.assert_accepted(shape, info, config, processor, length=32)
+
+    def test_resize_disabled_does_not_apply_reserves_or_construct_raw_witness(self):
+        options = {
+            "do_resize": False,
+            "timestamp_token_reserve": 1000000,
+            "timestamp_token_per_frame": 1000000,
+            "video_max_image_size": 1,
+        }
+        info, config, processor, _ = settings(spatial=1, options=options)
+        shape = self.run_shape(info, 128)
+        self.assertEqual(self.run_shape(info, 128, return_raw=True), shape)
+        self.assert_accepted(shape, info, config, processor, options, 128)
+        default_info, _, _, _ = settings(spatial=1, options={"do_resize": False})
+        self.assertEqual(shape, self.run_shape(default_info, 128))
+
+    def test_resolved_resize_overrides_match_equivalent_processor_defaults(self):
+        for reserve, per_frame in ((0, 0), (4, 1), (1000, 6)):
+            options = {
+                "max_pixels": 81920,
+                "max_frames": 6,
+                "video_max_image_size": 128,
+                "timestamp_token_reserve": reserve,
+                "timestamp_token_per_frame": per_frame,
+            }
+            override, config, processor, _ = settings(spatial=1, options=options)
+            defaults, _, _, _ = settings(
+                spatial=1, maximum=81920, max_frames=6,
+                side=128, reserve=reserve, per_frame=per_frame,
+            )
+            with self.subTest(reserve=reserve, per_frame=per_frame):
+                for raw in (False, True):
+                    self.assertEqual(
+                        self.run_shape(override, 128, return_raw=raw),
+                        self.run_shape(defaults, 128, return_raw=raw),
+                    )
+                self.assert_accepted(
+                    self.run_shape(override, 128), override,
+                    config, processor, options, 128,
+                )
+
+    def test_one_pass_raw_space_not_only_aligned_fixed_points(self):
+        # Independent RAW inputs, not the output-grid feasibility inequalities
+        # used by the exhaustive oracle. Include transposes, sub-factor edges,
+        # floor boundaries, and widths much larger than the per-frame side cap.
+        edges = (1, 2, 3, 31, 32, 33, 63, 64, 65, 127, 128, 129, 256, 1024)
+        accepted = 0
+        for spatial, tau, newline, extra in product(
+            (1, 2), (1, 3), (False, True), (False, True)
+        ):
+            info, config, processor, tokenizer = settings(
+                spatial, tau, newline, extra,
+                maximum=81920, max_frames=6, side=128, reserve=0, per_frame=1,
+            )
+            factor = 32 * spatial
+            profile = self.run_shape(info, 128)
+            work = profile[0] * (profile[1] // factor) * (profile[2] // factor)
+            for frames in range(2 if spatial == 2 else 1, 7):
+                for height, width in product(edges, repeat=2):
+                    _, h, w = self.resize_shape(
+                        (frames, height, width), config, processor
+                    )
+                    if frames * h * w > processor.size["longest_edge"]:
+                        continue
+                    if placeholder_tokens(
+                        frames, h // factor, w // factor, config, tokenizer
+                    ) > 128:
+                        continue
+                    accepted += 1
+                    self.assertLessEqual(
+                        frames * (h // factor) * (w // factor), work,
+                        (spatial, tau, newline, extra, frames, height, width, h, w),
+                    )
+            self.assert_accepted(profile, info, config, processor, length=128)
+        self.assertGreater(accepted, 1000)  # Ensure the scan is not vacuous.
+
+    def test_tiny_context_raw_query_preserves_minimum_abi_not_a_fit_claim(self):
+        for resize in (False, True):
+            info, config, _, tokenizer = settings(options={"do_resize": resize})
+            shape = self.run_shape(info, 1)
+            self.assertEqual(shape, (2, 64, 64))
+            self.assertEqual(self.run_shape(info, 1, return_raw=True), shape)
+            self.assertGreater(placeholder_tokens(2, 1, 1, config, tokenizer), 1)
+
+    def test_unconstructible_nonclamped_raw_witness_fails_without_underprofiling(self):
+        info, config, _, _ = settings()
+        config.use_2d_rope = True
+        namespace = functions()
+        # Inject failure only in the bounded inverse-construction path; the
+        # output-grid optimum must not silently degrade to a smaller fixed point.
+        namespace["adaptive_resize"] = lambda *args: (64, 64)
+        with self.assertRaisesRegex(RuntimeError, "resize witness"):
+            namespace["get_dummy_video_shape"](
+                info, 8192, {"video": 1}, return_raw=True
+            )
+
+    def test_video_grid_rejects_too_small_2d_rope_cache(self):
+        info, config, _, _ = settings()
+        config.use_2d_rope = True
+        config.max_image_size = 16
+        for raw in (False, True):
+            with self.subTest(return_raw=raw):
+                with self.assertRaisesRegex(ValueError, "2D RoPE cache"):
+                    self.run_shape(info, 128, return_raw=raw)
 
 
 if __name__ == "__main__":
