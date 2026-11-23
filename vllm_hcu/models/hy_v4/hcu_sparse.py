@@ -21,6 +21,7 @@ two kernel wrappers differ from the parent.
 """
 
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +33,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.models.hy_v4.d576_mls import resident_d576_with_sink
 from vllm_hcu.models.hy_v4.fp8_kv_dequant import (
     LightOpKVReuseState,
     gather_dequantize_fp8_ds_mla_cache,
@@ -52,7 +54,7 @@ from vllm_hcu.v1.attention.ops.flashmla import (
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.hcu.hy_v4.hcu_sparse")
 
 
 def _has_uniform_query_width(
@@ -143,6 +145,7 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
 
     supports_pcp: bool = True
     can_return_lse_for_decode: bool = True
+    _resident_d576 = False
 
     def __init__(
         self,
@@ -184,6 +187,12 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        self._resident_d576 = os.getenv("VLLM_HCU_HYV4_D576_MLS", "0") == "1"
+        if self._resident_d576:
+            from vllm_hcu.platforms.hcu import on_gfx938
+
+            if not on_gfx938():
+                raise ValueError("HY4 D576 resident MLS requires gfx938")
         self._dcp_sinks: torch.Tensor | None = None
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -436,6 +445,8 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
         )
 
         out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
+        if self._resident_d576:
+            logger.info_once("HY4 D576 MLS consumed dequantized FP8 decode slots")
         out = out.reshape(num_tokens_b, seq_len, num_heads, out.shape[-1])
         return out, None
 
@@ -490,6 +501,26 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
             q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
+        if self._resident_d576 and num_tokens:
+            if not (
+                q.shape[1:] == (64, 576)
+                and kv_c_and_k_pe_cache.shape[1:] == (1, 576)
+                and kv_c_and_k_pe_cache.shape[0] > 0
+                and topk_indices.shape[-1] == 2048
+                and q.dtype == kv_c_and_k_pe_cache.dtype == torch.bfloat16
+                and topk_indices.dtype == torch.int32
+                and q.stride(-1) == kv_c_and_k_pe_cache.stride(-1) == topk_indices.stride(-1) == 1
+                and min(q.stride(0), q.stride(1), topk_indices.stride(0)) > 0
+                and 0 < kv_c_and_k_pe_cache.stride(0) < 8192
+            ):
+                raise ValueError("Incompatible query, KV, or indices for HY4 D576 MLS")
+            output, lse = resident_d576_with_sink(
+                q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale,
+                attn_sink, topk_length,
+            )
+            logger.info_once("HY4 D576 MLS consumed flat BF16 KV")
+            return output[:, :query_heads, :], lse[:, :query_heads]
+
         output, _, lse = flash_mla_sparse_fwd(
             q,
             kv_c_and_k_pe_cache,
