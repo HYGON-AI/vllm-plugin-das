@@ -28,6 +28,7 @@ from vllm.multimodal.processing.processor import replace_token_matches
 from vllm_hcu.models.hy_v4.config import HYV4VLConfig
 from vllm_hcu.models.hy_v4.processor import (
     HYV4VLProcessor,
+    adaptive_resize,
     smart_resize,
     vision_token_count,
 )
@@ -73,19 +74,49 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         factor = processor.patch_size * processor.merge_size
         maximum = options.get("max_pixels", processor.size["longest_edge"])
         minimum = options.get("min_pixels", processor.size["shortest_edge"])
+        if min(factor, minimum) <= 0 or maximum < minimum:
+            raise ValueError("Image pixel limits must be positive and ordered")
         cells = max(1, maximum // factor**2)
+        config = self.get_hf_config().vision_config
+        max_edge = None
+        if config.use_2d_rope:
+            # Cache positions index raw patches, before the spatial merger.
+            max_edge = (config.max_image_size // config.patch_size + 1) // (
+                processor.merge_size
+            )
         candidates = []
-        for rows in range(1, math.isqrt(cells * 200) + 1):
+        row_limit = math.isqrt(cells * 200)
+        if max_edge is not None:
+            row_limit = min(row_limit, max_edge)
+        for rows in range(1, row_limit + 1):
             cols = min(cells // rows, rows * 200)
+            if max_edge is not None:
+                cols = min(cols, max_edge)
             if cols and rows <= cols * 200:
-                candidates.append((rows * (cols + 1), rows, cols))
-        _, rows, cols = max(candidates)
-        height, width = smart_resize(
-            rows * factor, cols * factor, factor, minimum, maximum
-        )
+                try:
+                    height, width = smart_resize(
+                        rows * factor, cols * factor, factor, minimum, maximum
+                    )
+                except ValueError:
+                    # A candidate's minimum-area rounding may exceed max_pixels;
+                    # discard that shape, not otherwise valid user inputs.
+                    continue
+                if max_edge is not None and max(height, width) > max_edge * factor:
+                    continue
+                candidates.append(
+                    (height // factor * (width // factor + 1), height, width)
+                )
+        if not candidates:
+            raise ValueError("Image pixel limits cannot fit the vision 2D RoPE cache")
+        _, height, width = max(candidates)
         return ImageSize(width=width, height=height)
 
-    def get_dummy_video_shape(self, seq_len, mm_counts):
+    def get_dummy_video_shape(self, seq_len, mm_counts, *, return_raw=False):
+        """Maximal processed grid, or a raw witness for one public resize.
+
+        The dummy builder requests return_raw=True. Keeping the processed-shape
+        query separate avoids treating a non-idempotent output as raw input.
+        """
         hf_processor = self.get_hf_processor()
         processor = hf_processor.video_processor
         options = self._merge_and_resolve_mm_processor_kwargs({}).get(
@@ -120,6 +151,8 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
             max_edge = (config.max_image_size // config.patch_size + 1) // (
                 config.spatial_merge_size * config.spatial_patch_size
             )
+        if max_edge is not None and max_edge < 1:
+            raise ValueError("Minimum video grid exceeds the vision 2D RoPE cache")
         best = None
         timestamp_lengths = {}
         # Jointly search temporal length and aligned spatial grids. Maximizing
@@ -145,14 +178,9 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
                 overhead += timestamp_lengths[text]
             visual_cells = (available - overhead) // len(timestamps) - extra
             frame_cells = max_cells // frames
-            if resize:
-                frame_cells = min(frame_cells, side**2 // factor**2)
-                resize_budget = (
-                    max(1, max_cells - timestamp_reserve - timestamp_per_frame * frames)
-                    // frames
-                )
-            else:
-                resize_budget = None
+            resize_budget = max(
+                1, max_cells - timestamp_reserve - timestamp_per_frame * frames
+            )
             # Swapping portrait to landscape preserves patch count and resize
             # limits while never increasing newline tokens, so rows <= cols
             # suffices. Enumerating rows and solving cols visits the maximum
@@ -164,8 +192,20 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
                 cols = min(frame_cells // rows, visual_cells // rows - newline)
                 if max_edge is not None:
                     cols = min(cols, max_edge)
-                if resize_budget is not None:
-                    cols = min(cols, resize_budget // (rows + 1))
+                if resize and rows > 1:
+                    # For non-clamped outputs, area is bounded by BOTH resize
+                    # scales. floor(raw_area) + floor(raw_long_edge) is strictly
+                    # greater than raw_area when the long edge >= one cell,
+                    # hence the strict total-budget bound. This is NOT the
+                    # fixed-point condition rows*cols + cols <= budget/frames.
+                    cols = min(
+                        cols,
+                        ((resize_budget - 1) // frames) // rows,
+                        (side**2 // factor**2) // rows,
+                    )
+                # With rows==1 the minimum-edge clamp defeats both resize area
+                # bounds: arbitrarily thin raw inputs can yield any long edge.
+                # Only the post-resize max_pixels, context and RoPE caps apply.
                 if cols < rows:
                     continue
                 height, width = rows * factor, cols * factor
@@ -173,19 +213,73 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
                 candidate = (patches, rows * cols, frames, height, width)
                 if best is None or candidate > best:
                     best = candidate
-            # adaptive_resize clamps both dimensions to at least one cell even
-            # if its reserved token budget is exhausted. Keep that legal edge
-            # candidate too, but never let it replace a larger fitting grid.
-            minimum_tokens = len(timestamps) * (1 + newline + extra) + overhead
-            if minimum_tokens <= available:
-                candidate = (frames, 1, frames, factor, factor)
-                if best is None or candidate > best:
-                    best = candidate
         if best is None:
             # No complete video placeholder fits at all; retain the smallest
             # legal encoder shape for the existing tiny-context profile ABI.
             return min_frames, factor, factor
-        return best[2:]
+        _, _, frames, height, width = best
+        if not resize or not return_raw:
+            return frames, height, width
+
+        def resized(raw_height, raw_width):
+            return adaptive_resize(
+                raw_height,
+                raw_width,
+                frames,
+                config.patch_size,
+                config.spatial_merge_size * config.spatial_patch_size,
+                maximum,
+                side,
+                timestamp_per_frame,
+                timestamp_reserve,
+            )
+
+        # Return RAW input dimensions, not the desired output grid. Refeeding
+        # an adaptive_resize output is not idempotent. The builder and public
+        # HF preprocessor must perform exactly one resize on this witness.
+        if resized(height, width) == (height, width):
+            return frames, height, width
+        if height == factor:
+            # A sub-factor short edge clamps to one output cell; W*scale grows without
+            # bound. Bracket and bisect a crossing of the desired output width.
+            # scale is non-increasing in integer W, so an upward step is <=1
+            # raw pixel and cannot skip an aligned output width (even though
+            # floor terms can cause downward steps; monotonicity is NOT assumed).
+            # Core builds channels-last NumPy videos. H=1 or H=3 would make
+            # HF channel inference ambiguous, so use H=2 (patch factor >= 2).
+            raw_height = 2
+            low, high = 0, width
+            while resized(raw_height, high)[1] < width:
+                low, high = high, high * 2
+            while high - low > 1:
+                mid = (low + high) // 2
+                if resized(raw_height, mid)[1] >= width:
+                    high = mid
+                else:
+                    low = mid
+            if resized(raw_height, high) != (height, width):
+                raise RuntimeError("Cannot construct the video profile clamp witness")
+            return frames, raw_height, high
+
+        # Without a clamped edge, the limiting scaled area is Q. If the aligned
+        # grid is not already a fixed point, Q lies inside its rounding box.
+        # Choose an interior aspect ratio and increase raw resolution until the
+        # diminishing raw-long-edge overhead leaves exactly this output grid.
+        budget = max(1, max_cells - timestamp_reserve - timestamp_per_frame * frames)
+        rows, cols = height // factor, width // factor
+        area = min(budget / frames, side**2 / factor**2)
+        lower, upper = max(rows, area / (cols + 1)), min(rows + 1, area / cols)
+        target_h = (lower + upper) / 2
+        target_w = area / target_h
+        for power in range(64):
+            scale = 2**power
+            raw_h = math.ceil(target_h * factor * scale)
+            raw_w = math.ceil(target_w * factor * scale)
+            if resized(raw_h, raw_w) == (height, width):
+                return frames, raw_h, raw_w
+        # Do not silently substitute a smaller, underprofiling fixed point if
+        # numeric construction fails for an unsupported extreme configuration.
+        raise RuntimeError("Cannot construct the video profile resize witness")
 
     def get_mm_max_tokens_per_item(self, seq_len, mm_counts):
         config = self.get_hf_config().vision_config
@@ -219,7 +313,9 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
         size = self.info.get_image_size_with_most_features()
         videos = []
         if mm_counts.get("video", 0):
-            frames, height, width = self.info.get_dummy_video_shape(seq_len, mm_counts)
+            frames, height, width = self.info.get_dummy_video_shape(
+                seq_len, mm_counts, return_raw=True
+            )
             videos = self._get_dummy_videos(
                 width=width,
                 height=height,
