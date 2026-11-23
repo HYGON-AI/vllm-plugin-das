@@ -11,6 +11,30 @@ class HcuInt8LinearError(RuntimeError):
     """The explicitly enabled HCU INT8 kernel cannot execute safely."""
 
 
+@torch.library.custom_op("vllm_hcu::per_token_quant_int8", mutates_args=())
+def _per_token_quant_int8(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep LightOp's process-local Triton kernel IDs out of cached FX graphs."""
+    try:
+        from lightop.quant import per_token_quant_int8
+    except (ImportError, AttributeError) as exc:
+        raise HcuInt8LinearError(
+            "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
+        ) from exc
+    return per_token_quant_int8(x)
+
+
+@_per_token_quant_int8.register_fake
+def _per_token_quant_int8_fake(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(x, dtype=torch.int8),
+        torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32),
+    )
+
+
 def weight8bit_nt_kpack2_marlin2(
     weight: torch.Tensor,
     k_tile: int = 16,
@@ -109,13 +133,7 @@ def apply_int8_linear(
             )
         x_q, x_scale = x_and_scale_quanted
     else:
-        try:
-            from lightop.quant import per_token_quant_int8
-        except (ImportError, AttributeError) as exc:
-            raise HcuInt8LinearError(
-                "HCU W8A8 linear requires lightop.quant.per_token_quant_int8"
-            ) from exc
-        x_q, x_scale = per_token_quant_int8(input)
+        x_q, x_scale = _per_token_quant_int8(input)
 
     if x_q.shape != input.shape or x_scale.shape != (*input.shape[:-1], 1):
         raise HcuInt8LinearError(
