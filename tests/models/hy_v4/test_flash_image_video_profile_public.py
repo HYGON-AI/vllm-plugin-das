@@ -163,7 +163,7 @@ class PublicImageVideoProfileTests(unittest.TestCase):
             self.assert_core_rope(grid, wrapper.config.vision_config)
         del real
         info = self.info(wrapper, options)
-        # Real Core builder -> raw NumPy video -> public HF preprocess, ONCE.
+        # Core builder allocates a bounded processed grid, not an inverse raw witness.
         data = self.builder_class(info).get_dummy_mm_data(budget, {"video": 1}, {})
         expected_output = info.get_dummy_video_shape(budget, {"video": 1})
         frames, metadata = data["video"][0]
@@ -175,6 +175,8 @@ class PublicImageVideoProfileTests(unittest.TestCase):
                 "do_rescale": False,
                 "do_normalize": False,
                 **options,
+                # Core get_dummy_inputs supplies this profiling-only override.
+                "do_resize": False,
             },
         )
         dummy_grid = dummy["video_grid_thw"][0].tolist()
