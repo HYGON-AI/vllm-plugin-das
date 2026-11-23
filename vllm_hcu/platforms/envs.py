@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
+    VLLM_HCU_MOONCAKE_FABRIC_MEM_POOL: bool = False
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
@@ -515,6 +516,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Deprecated compatibility switch; unified routing always uses the config.
     "VLLM_HCU_USE_AITER_MOE_CONFIG": resolve_aiter_moe_config_compat,
+
+    # Opt-in Fabric allocations during Mooncake KV-cache initialization.
+    # This does not select the Mooncake transport; MC_ENABLE_HYLINK is separate.
+    "VLLM_HCU_MOONCAKE_FABRIC_MEM_POOL":
+        lambda: (os.environ.get("VLLM_HCU_MOONCAKE_FABRIC_MEM_POOL", "0").lower() in
+                    ("true", "1")),
 
     # Emit Mooncake TTFT_EVENT DEBUG lines with wall-clock ts for PD TTFT analysis.
     "VLLM_HCU_MOONCAKE_TTFT_TRACE":
