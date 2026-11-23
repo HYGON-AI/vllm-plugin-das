@@ -48,6 +48,17 @@ Adapter versions retain their original auto policy. General-plugin activation
 defers an unresolved V4.1 auto configuration until the platform resolves it.
 The existing FP4 deployment admission and provider checks still apply.
 
+The LightOp FP4 decode path masks logits beyond each device sequence length
+before candidate selection and top-k, including during CUDA Graph replay.
+
+## V4.1 W4A8 masked MoE scheduling hint
+
+The small-batch masked GEMM hint defaults on for eligible DeepEP low-latency
+`gfx938` 64-CU W4A8 paths. It uses the local token extent for both masked GEMMs
+and clamp/quantization. Workspace capacity and device-side per-expert row
+counts retain their roles. Set `HCU_DSV41_W4A8_MOE_EXPECTED_M=0` before startup
+to use the capacity hint for all configurations.
+
 ## E2M1 packer lowering (default triton, `stock` opts out)
 
 `das_hcu_fp4_packer` rebinds Core's `_fp32x2_to_fp4x2` E2M1 packer at startup.
@@ -129,9 +140,27 @@ activate their inherited mapping, and spawned children discover the installed
 entry point. The capability can be required using the existing Adapter
 `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
 
-This is configuration parsing support only. The active wheel still lacks
-Flash model execution and model registration; PR #493 remains Draft until
-the [model integration and runtime gates](../docs/hy4_flash.md) are closed.
+This is configuration parsing support only, not installed Flash model
+execution or model registration. MR-level readiness of this scoped increment
+is separate from the remaining [model integration and runtime gates](
+../docs/hy4_flash.md), including full-model joint qualification.
+
+## DSV4.1 HCU decode defaults
+
+Eligible DSpark draft LL receive quantization, INT8 direct GEMM, and Shared
+Expert INT8 fusion default on. Set `HCU_DSV41_DRAFT_LL_LIVE_QUANT=0`,
+`HCU_DSV41_WQ_B_INT8_DIRECT=0`, or `HCU_DSV41_SHARED_EXPERT_INT8_FUSION=0`
+respectively before startup to restore the corresponding fallback. The Adapter
+uses LightOp in eligible INT8 and FP8 graph capture by default. Set
+`HCU_LIGHTOP_PER_TOKEN_INT8_GRAPH=0` or `HCU_LIGHTOP_PER_TOKEN_FP8_GRAPH=0`
+to restore upstream quantization for that capture path.
+
+On the validated gfx938 vLLM 0.33 build (`g7364da`),
+`HCU_VLLM_WO_A_TOKEN_MAJOR` defaults to enabled. It applies to eligible
+BF16 eager decode batches of 2–32 rows. The owned MXFP4 attention path
+also enables `VLLM_HCU_DSV41_INT8_WQ_B` by default, subject to the existing
+FULL capture, quantization and tensor layout checks. Set either variable to
+`0` before starting the server to disable its optimization.
 
 ## DSV4.1 Channel-FP8 configuration routing
 

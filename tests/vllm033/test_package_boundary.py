@@ -30,6 +30,7 @@ EXPECTED_ENTRY_POINTS = {
         "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
         "das_hcu_step5_config": "hcu_vllm_das.step5_activation:extension_spec",
         "das_hcu_hyv4_flash_config": "hcu_vllm_das.hyv4_flash_config_activation:extension_spec",
+        "das_hcu_wo_a_token_major": "hcu_vllm_das.wo_a_token_major:extension_spec",
     }
 }
 

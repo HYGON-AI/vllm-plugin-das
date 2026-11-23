@@ -206,7 +206,11 @@ def test_breakable_piecewise_graph_is_admitted(optin, monkeypatch):
     assert validate_config(optin).page_records == 64
 
 
-def test_full_cudagraph_is_refused(optin):
+def test_pcp8_full_cudagraph_is_refused(optin, monkeypatch):
+    monkeypatch.setenv('HCU_VLLM_PCP_IMPL', 'native')
+    optin.parallel_config.prefill_context_parallel_size = 8
+    optin.parallel_config.enable_expert_parallel = True
+    optin.parallel_config.all2all_backend = 'deepep_high_throughput'
     optin.model_config.enforce_eager = False
     optin.compilation_config = _compilation(full=True)
     with pytest.raises(ValueError, match='Graph'):

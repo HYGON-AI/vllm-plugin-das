@@ -80,9 +80,9 @@ def test_selects_only_native_eager_w4a8_with_padding_support(monkeypatch):
         model_config=NS(hf_config=NS(model_type="deepseek_v41"),
                         enforce_eager=True, quantization=profile.NAME),
     )
-    assert profile_worker._select("default", config) == profile_worker.W4A8_WORKER
+    assert profile_worker.w4a8_profile_selected(config)
     monkeypatch.setattr(profile.envs, "VLLM_MOE_SKIP_PADDING", False)
-    assert profile_worker._select("default", config) == "default"
+    assert not profile_worker.w4a8_profile_selected(config)
 
 
 @pytest.mark.parametrize("layer_split_available", [False, True])

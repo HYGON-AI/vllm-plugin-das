@@ -133,7 +133,19 @@ def wrap_profile_runner(base, config, device):
     return (layer_split_prefill_runner_cls(base) if _matches(config) else base)(config, device)
 
 
+def _needs_prefill_runner(config):
+    from .dsv41.profile_worker import w4a8_profile_selected
+
+    return _matches(config) or w4a8_profile_selected(config)
+
+
 def _create(config, device):
+    from .dsv41.profile_worker import w4a8_profile_selected
+
+    if w4a8_profile_selected(config):
+        from .dsv41.w4a8_profile import W4A8PcpProfileRunner
+
+        return wrap_profile_runner(W4A8PcpProfileRunner, config, device)
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     return layer_split_prefill_runner_cls(GPUModelRunner)(config, device)
@@ -142,4 +154,7 @@ def _create(config, device):
 def install():
     from hcu_adapter.bridges.vllm_model_runner import register_model_runner_factory
 
-    register_model_runner_factory('das-hcu-v41-layer-split-prefill', matches=_matches, create=_create)
+    # Compose profiling and Layer Split in one factory, leaving the Adapter
+    # Worker in place for its post-load hooks and KV-cache localization.
+    register_model_runner_factory('das-hcu-v41-layer-split-prefill',
+                                  matches=_needs_prefill_runner, create=_create)
