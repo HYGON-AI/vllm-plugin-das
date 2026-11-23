@@ -201,7 +201,9 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         _, _, _, height, width = best
         return ImageSize(width=width, height=height)
 
-    def get_dummy_video_shape(self, seq_len, mm_counts, *, return_raw=False):
+    def get_dummy_video_shape(
+        self, seq_len, mm_counts, *, return_raw=False, video_options=None
+    ):
         """Maximal processed grid, or a mathematical raw resize witness.
 
         Profiling allocates the bounded processed grid and disables video resize
@@ -233,6 +235,19 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         factor = (
             config.patch_size * config.spatial_merge_size * config.spatial_patch_size
         )
+        # Core options describe raw profile dimensions. Consume them BEFORE the
+        # processed-grid search: Core's later min() crop is not patch aligned.
+        # The minimum-edge clamp can legitimately enlarge a sub-factor input.
+        height_cells = width_cells = None
+        if video_options is not None:
+            if video_options.height is not None:
+                height_cells = max(1, video_options.height // factor)
+            if video_options.width is not None:
+                width_cells = max(1, video_options.width // factor)
+            if video_options.num_frames is not None:
+                # A spatially compressed video requires at least two frames;
+                # conservatively profile that minimum even for a one-frame hint.
+                max_frames = max(min_frames, min(max_frames, video_options.num_frames))
         max_cells = maximum // factor**2
         newline = int(config.use_image_newline_token)
         extra = 2 * int(bool(config.cat_extra_token))
@@ -272,32 +287,45 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
             resize_budget = max(
                 1, max_cells - timestamp_reserve - timestamp_per_frame * frames
             )
-            # Swapping portrait to landscape preserves patch count and resize
-            # limits while never increasing newline tokens, so rows <= cols
-            # suffices. Enumerating rows and solving cols visits the maximum
-            # area for every possible row count, without a pixel-size scan.
-            row_limit = math.isqrt(max(0, min(frame_cells, visual_cells)))
+            # Without axis-specific options, swapping portrait to landscape
+            # preserves patches and limits while not increasing newline tokens.
+            # Otherwise retain both orientations. Solve cols per row rather
+            # than scanning every raw pixel size.
+            if height_cells is None and width_cells is None:
+                row_limit = math.isqrt(max(0, min(frame_cells, visual_cells)))
+            else:
+                # Width/height overrides break portrait/landscape symmetry.
+                row_limit = min(frame_cells, max(0, visual_cells // (1 + newline)))
+            if height_cells is not None:
+                row_limit = min(row_limit, height_cells)
             if max_edge is not None:
                 row_limit = min(row_limit, max_edge)
             for rows in range(1, row_limit + 1):
                 cols = min(frame_cells // rows, visual_cells // rows - newline)
                 if max_edge is not None:
                     cols = min(cols, max_edge)
-                if resize and rows > 1:
+                if width_cells is not None:
+                    cols = min(cols, width_cells)
+                if resize and rows > 1 and cols > 1:
                     # For non-clamped outputs, area is bounded by BOTH resize
                     # scales. floor(raw_area) + floor(raw_long_edge) is strictly
                     # greater than raw_area when the long edge >= one cell,
                     # hence the strict total-budget bound. This is NOT the
                     # fixed-point condition rows*cols + cols <= budget/frames.
-                    cols = min(
-                        cols,
-                        ((resize_budget - 1) // frames) // rows,
-                        (side**2 // factor**2) // rows,
+                    cols = max(
+                        1,  # A one-cell width has the same minimum-edge clamp.
+                        min(
+                            cols,
+                            ((resize_budget - 1) // frames) // rows,
+                            (side**2 // factor**2) // rows,
+                        ),
                     )
-                # With rows==1 the minimum-edge clamp defeats both resize area
-                # bounds: arbitrarily thin raw inputs can yield any long edge.
+                # With either edge==1 the minimum-edge clamp defeats both
+                # resize area bounds: thin raw inputs can yield any long edge.
                 # Only the post-resize max_pixels, context and RoPE caps apply.
-                if cols < rows:
+                if cols < 1 or (
+                    height_cells is None and width_cells is None and cols < rows
+                ):
                     continue
                 height, width = rows * factor, cols * factor
                 patches = frames * rows * cols
@@ -416,15 +444,21 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
         size = self.info.get_image_size_with_most_features()
         videos = []
         if mm_counts.get("video", 0):
+            video_options = mm_options.get("video")
+            shape_options = (
+                {"video_options": video_options} if video_options is not None else {}
+            )
             frames, height, width = self.info.get_dummy_video_shape(
-                seq_len, mm_counts
+                seq_len, mm_counts, **shape_options
             )
             videos = self._get_dummy_videos(
                 width=width,
                 height=height,
                 num_frames=frames,
                 num_videos=mm_counts["video"],
-                overrides=mm_options.get("video"),
+                # Options were resolved into an aligned processed grid above.
+                # Do not let Core crop it again to unaligned raw dimensions.
+                overrides=None,
             )
         return {
             "image": self._get_dummy_images(

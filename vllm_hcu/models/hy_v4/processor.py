@@ -296,6 +296,8 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
     timestamp_token_per_frame = 4
     timestamp_token_reserve = 2000
     video_max_image_size = 1024
+    # Bound by the wrapper from the vision config, never a per-call HF kwarg.
+    _rope_axis_patch_limit = None
     valid_kwargs = HYV4VideoProcessorKwargs
     model_input_names = ["pixel_values_videos", "video_grid_thw"]
 
@@ -380,6 +382,18 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
                 )
             if do_convert_rgb:
                 video = self.convert_to_rgb(video)
+            factor = patch_size * merge_size * spatial_patch_size
+            axis_limit = getattr(self, "_rope_axis_patch_limit", None)
+            if axis_limit is not None:
+                # RoPE indexes raw patches, before spatial/merge compression.
+                aligned_cap = axis_limit // (merge_size * spatial_patch_size) * factor
+                if aligned_cap < factor:
+                    raise ValueError("2D RoPE cache cannot fit one merged video patch")
+                if not do_resize and max(h, w) > axis_limit * patch_size:
+                    raise ValueError(
+                        "Video exceeds the fixed 2D RoPE cache axis with do_resize=False; "
+                        "enable resizing or use smaller video frames"
+                    )
             if do_resize:
                 h, w = adaptive_resize(
                     h,
@@ -396,10 +410,13 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
                     if timestamp_token_reserve is not None
                     else self.timestamp_token_reserve,
                 )
+                if axis_limit is not None and max(h, w) > aligned_cap:
+                    scale = aligned_cap / max(h, w)
+                    h = max(factor, math.floor(h * scale / factor) * factor)
+                    w = max(factor, math.floor(w * scale / factor) * factor)
                 video = self.resize(
                     video, SizeDict(height=h, width=w), PILImageResampling.BICUBIC
                 )
-            factor = patch_size * merge_size * spatial_patch_size
             if h % factor or w % factor:
                 raise ValueError(
                     "Video frame dimensions must align with patch, merge and spatial compression"
@@ -506,13 +523,14 @@ class HYV4VLProcessor(ProcessorMixin):
                     )
 
         vision = self.config.vision_config
-        # Apply after all component/factory options: images_kwargs must not
+        # Apply after all component/factory options: request kwargs must not
         # override the model's actual cache. Explicitly clear on non-RoPE reuse.
-        image_processor._rope_axis_patch_limit = (
-            vision.max_image_size // vision.patch_size + 1
-            if getattr(vision, "use_2d_rope", False)
-            else None
-        )
+        for component in (image_processor, video_processor):
+            component._rope_axis_patch_limit = (
+                vision.max_image_size // vision.patch_size + 1
+                if getattr(vision, "use_2d_rope", False)
+                else None
+            )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
