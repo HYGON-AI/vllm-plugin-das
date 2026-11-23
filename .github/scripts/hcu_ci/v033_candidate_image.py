@@ -24,7 +24,17 @@ GPU_LIBRARIES = ('_C.abi3.so', '_C_stable_libtorch.abi3.so',
 ADAPTER_SEAMS = ('kernels/pcp_fork.py', 'fp4_indexer.py', 'v41_fp8_indexer.py',
                  'ct_w4a8_registration.py', 'dsv41_activation.py',
                  'dsv41_channel_fp8.py', 'dsv41_dspark_registration.py',
-                 'kernels/pcp_dspark.py', 'hcu_config.py')
+                 'kernels/pcp_dspark.py', 'hcu_config.py',
+                 'kernels/pcp_rope_policy.py', 'bridges/vllm_cli.py')
+RELOCATED_ADAPTER_SEAMS = {
+    'fp4_indexer.py': 'features/dsv41/fp4_indexer.py',
+    'v41_fp8_indexer.py': 'features/dsv41/v41_fp8_indexer.py',
+    'ct_w4a8_registration.py': 'features/ct_w4a8/ct_w4a8_registration.py',
+    'dsv41_activation.py': 'features/dsv41/dsv41_activation.py',
+    'dsv41_channel_fp8.py': 'features/dsv41/dsv41_channel_fp8.py',
+    'dsv41_dspark_registration.py': 'features/dsv41/dsv41_dspark_registration.py',
+    'hcu_config.py': 'infra/hcu_config.py',
+}
 PAIR_INPUTS = ('ADAPTER_SOURCE', 'ADAPTER_WHEEL_SHA256', 'KERNEL_WHEEL_SHA256')
 
 
@@ -166,6 +176,23 @@ def adapter_catalog(source):
         raise CandidateError('Adapter BACKEND_CATALOG lacks selectable vllm_pcp_q_rope/hcu')
 
 
+def adapter_seams(payload, new_layout=None):
+    """Match the runtime namespace choice without importing package code.
+
+    A partial infra namespace still selects the new layout, including namespace
+    packages without __init__.py. Never fill its missing owners from old files.
+    """
+    if new_layout is None:
+        new_layout = ('hcu_adapter/infra.py' in payload or any(
+            name.startswith('hcu_adapter/infra/') for name in payload))
+    seams = {name: 'hcu_adapter/' + (RELOCATED_ADAPTER_SEAMS.get(name, name)
+                                   if new_layout else name) for name in ADAPTER_SEAMS}
+    missing = [path for path in seams.values() if path not in payload]
+    if missing:
+        raise CandidateError('Adapter lacks required recorded interfaces: ' + ', '.join(missing))
+    return seams
+
+
 def component_payload(path, digest, distribution):
     payload = wheel_payload(path, digest)
     info, metadata = wheel_identity(path)
@@ -185,10 +212,9 @@ def component_payload(path, digest, distribution):
     if namespace + '/__init__.py' not in payload:
         raise CandidateError('paired wheel lacks its package')
     if distribution == 'hcu-adapter':
-        if not all('hcu_adapter/' + name in payload for name in ADAPTER_SEAMS):
-            raise CandidateError('paired Adapter lacks required interfaces')
+        seams = adapter_seams(payload)
         with zipfile.ZipFile(path) as archive:
-            adapter_catalog(archive.read('hcu_adapter/hcu_config.py'))
+            adapter_catalog(archive.read(seams['hcu_config.py']))
     elif len([name for name in payload if name.startswith('sgl_kernel/native_ops.')
               and name.endswith('.so')]) != 1:
         raise CandidateError('paired kernel requires exactly one native_ops library')
@@ -287,12 +313,14 @@ def inspect_image(expected=None):
     adapter = metadata.distribution('hcu-adapter')
     kernel = metadata.distribution('sgl-kernel')
     records = {}
+    recorded_payloads = {}
     for name, distribution in [('vllm', core), ('hcu-adapter', adapter), ('sgl-kernel', kernel)]:
         raw = distribution.read_text('RECORD')
         if not raw:
             raise CandidateError('installed ' + name + ' lacks RECORD')
         count = 0
         seen = set()
+        hashed = set()
         for filename, digest, size in csv.reader(io.StringIO(raw)):
             if filename in seen:
                 raise CandidateError('duplicate installed RECORD member')
@@ -302,8 +330,10 @@ def inspect_image(expected=None):
                 actual = 'sha256=' + base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b'=').decode()
                 if digest != actual or size != str(len(payload)):
                     raise CandidateError('installed ' + name + ' RECORD differs: ' + filename)
+                hashed.add(filename)
                 count += 1
         records[name] = dict(verified=count, record_sha256=hashlib.sha256(raw.encode()).hexdigest())
+        recorded_payloads[name] = hashed
     if expected is not None:
         owners = {'vllm': core, 'hcu-adapter': adapter, 'sgl-kernel': kernel}
         wheels = expected.get('wheels', [])
@@ -318,10 +348,10 @@ def inspect_image(expected=None):
                 payload = Path(distribution.locate_file(filename)).read_bytes()
                 if hashlib.sha256(payload).hexdigest() != digest:
                     raise CandidateError('installed payload differs from prepared wheel: ' + filename)
-    for name in ADAPTER_SEAMS:
-        if not Path(adapter.locate_file('hcu_adapter/' + name)).is_file():
-            raise CandidateError('image Adapter lacks ' + name)
-    adapter_catalog(Path(adapter.locate_file('hcu_adapter/hcu_config.py')).read_bytes())
+    new_layout = (Path(adapter.locate_file('hcu_adapter/infra')).exists()
+                  or Path(adapter.locate_file('hcu_adapter/infra.py')).exists())
+    seams = adapter_seams(recorded_payloads['hcu-adapter'], new_layout=new_layout)
+    adapter_catalog(Path(adapter.locate_file(seams['hcu_config.py'])).read_bytes())
     native = {}
     for name in GPU_LIBRARIES:
         native['vllm/' + name] = architectures(Path(core.locate_file('vllm/' + name)))

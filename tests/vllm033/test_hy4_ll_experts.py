@@ -151,8 +151,10 @@ def test_actual_expert_apply_preserves_counts_capacity_and_clamp(monkeypatch):
         w1_scale=torch.ones(1, 4, 1), w2_scale=torch.ones(1, 2, 1),
         quant_config=NS(gemm1_clamp_limit=10.),
         ops=NS(gemm_masked=gemm, clamp_quant_ep=clamp),
+        _small_batch_hint=False, _live_row_activation=False,
         _check=lambda *a: None, moe_problem_size=lambda *a: (1, 512, 4, 2, 8),
         expected_m=lambda *a: 128)
+    instance._masked_gemm=lambda *args:runtime.HcuCTMaskedExperts._masked_gemm(instance,*args)
     runtime.HcuCTMaskedExperts.apply(instance, torch.empty(1, 512, 2),
         torch.zeros(1, 512, 2, dtype=torch.int8), None, None,
         torch.ones(1, 8), torch.zeros(1, 8, dtype=torch.int64), MoEActivation.SILU,

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 hcu_config = _adapter_module('hcu_config')
-from hcu_adapter.kernels import pcp_fork
+from hcu_adapter.kernels import pcp_fork, pcp_rope_policy
 from hcu_vllm_das import inverse_rope_hcu, pcp_q_rope, v41_pcp, v41_pcp_activation
 
 
@@ -18,13 +18,21 @@ def isolated_q_rope(monkeypatch):
     for name in ("_q_rope_provider", "_q_rope_binding", "_q_rope_failure"):
         monkeypatch.setattr(pcp_fork, name, None)
     monkeypatch.setenv("HCU_VLLM_PCP_IMPL", "native")
+    monkeypatch.setenv("VLLM_HCU_DSV41_PCP_ATTENTION", "1")
     monkeypatch.setenv("HCU_DISABLE_OPS", "")
+    monkeypatch.delenv(pcp_rope_policy.MODE_VARIABLE, raising=False)
+    monkeypatch.setattr(pcp_rope_policy, "_process_arch", lambda _pid: "gfx938")
+    monkeypatch.setattr(hcu_config, "load", lambda: {
+        "ops": {"vllm_inverse_rope": "stock"}, "overrides": {},
+    })
 
 
 def test_q_rope_policy(monkeypatch, isolated_q_rope):
     ops = {}
     monkeypatch.setattr(hcu_config, "load", lambda: {"ops": ops, "overrides": {}})
     monkeypatch.setenv("HCU_DISABLE_OPS", "")
+    assert pcp_fork.q_rope_selected()
+    ops[pcp_fork.Q_ROPE_OP] = "stock"
     assert not pcp_fork.q_rope_selected()
     ops[pcp_fork.Q_ROPE_OP] = "hcu"
     assert pcp_fork.q_rope_selected()
@@ -36,7 +44,7 @@ def test_q_rope_policy(monkeypatch, isolated_q_rope):
 def test_compile_factor_distinguishes_the_two_rope_policies(
         monkeypatch, isolated_q_rope):
     activation = v41_pcp_activation
-    ops = {}
+    ops = {"vllm_inverse_rope": "stock", pcp_fork.Q_ROPE_OP: "stock"}
     monkeypatch.setattr(hcu_config, "load", lambda: {"ops": ops, "overrides": {}})
     monkeypatch.setattr(activation, "pcp_enabled", lambda: True)
     monkeypatch.setattr(activation, "host_enabled", lambda: False)
@@ -129,7 +137,7 @@ def test_plugin_binds_provider_for_owned_eager_attention(monkeypatch, isolated_q
     for field in ("_reference", "_engram_validator", "_forward_context_resolver"):
         monkeypatch.setattr(pcp_fork, field, None)
     monkeypatch.setattr(hcu_config, "load", lambda: {
-        "ops": {pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
+        "ops": {"vllm_inverse_rope": "stock", pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
     })
     monkeypatch.setenv("HCU_DISABLE_OPS", "")
     monkeypatch.setattr(pcp_fork, "validate_config", lambda cfg: True)
@@ -227,7 +235,7 @@ def test_owned_prefill_routes_q_and_keeps_native_kv(monkeypatch, isolated_q_rope
         from hcu_adapter.bridges import vllm_pcp
 
         monkeypatch.setattr(hcu_config, "load", lambda: {
-            "ops": {pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
+            "ops": {"vllm_inverse_rope": "stock", pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
         })
         monkeypatch.setattr(vllm_pcp, "_failure", None)
         monkeypatch.setattr(vllm_pcp, "_publication", None)
@@ -283,7 +291,7 @@ def test_plugin_owner_latches_q_rope_binding_drift(monkeypatch, isolated_q_rope,
     monkeypatch.setattr(activation, "_is_hcu", lambda: True)
     monkeypatch.setattr(activation, "_install_profile_worker", lambda: None)
     monkeypatch.setattr(hcu_config, "load", lambda: {
-        "ops": {pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
+        "ops": {"vllm_inverse_rope": "stock", pcp_fork.Q_ROPE_OP: "hcu"}, "overrides": {},
     })
     monkeypatch.setenv("VLLM_HCU_DSV41_PCP_ATTENTION", "1")
     monkeypatch.setenv("VLLM_HCU_DSV41_ENGRAM_HOST", "0")

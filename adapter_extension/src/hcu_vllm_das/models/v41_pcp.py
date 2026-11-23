@@ -20,7 +20,7 @@ from vllm.models.deepseek_v4.amd import model as native_v4
 from vllm.models.deepseek_v41.amd import model as native
 from vllm.models.deepseek_v41.amd import vl_model as native_vl
 from .. import static_eplb_runtime as static_eplb
-from ..v41_pcp import attention_class, validate_config
+from ..v41_pcp import attention_class, validate_config, validate_layer_split_policy
 from ..v41_engram import HcuV41PcpEngram
 from ..v41_target_engram import HcuV41HostEngram, use_host_target, validate_host_config
 
@@ -72,18 +72,12 @@ def select_attention(cfg):
     `HCU_DISABLE_OPS=vllm_pcp` actually mean something at construction time.
     """
     from hcu_adapter.kernels import pcp_fork
-    from ..inverse_rope_policy import selected_mode
 
+    validate_layer_split_policy(cfg)
     admitted = pcp_fork.selected_mode() != 'stock' and validate_config(cfg)
     if not admitted:
-        if selected_mode() == 'hcu':
-            raise ValueError('Selected inverse RoPE requires native PCP attention')
         return native._select_dsv4_attn_cls(cfg)
-    base = attention_class()
-    if cfg.speculative_config is not None:
-        from ..pcp_dspark import HcuV41PcpDSparkAttention
-        return HcuV41PcpDSparkAttention
-    return base
+    return attention_class(cfg, dspark=cfg.speculative_config is not None)
 
 
 class HcuV41PcpMoE(native.DeepseekV4MoE):
@@ -114,6 +108,13 @@ if hashlib.sha256(inspect.getsource(_REPLAY_NATIVE).encode()).hexdigest() != _RE
                        f'{_REPLAY_NATIVE.__qualname__}')
 
 
+def _draft_fits_replay(config, target_window):
+    hf = config.speculative_config.draft_model_config.hf_config
+    window = getattr(hf, 'sliding_window', None)
+    return (type(window) is int and 0 < window <= target_window
+            and all(kind == 'sliding_attention' for kind in (getattr(hf, 'layer_types', None) or ())))
+
+
 class HcuV41PcpBackbone(native.DeepseekV4Model):
     def __init__(self, *, vllm_config, prefix=''):
         if validate_config(vllm_config):
@@ -126,7 +127,7 @@ class HcuV41PcpBackbone(native.DeepseekV4Model):
 
         Native model state pads each rank's replay batch to the global kept
         rows and rebuilds PCP metadata for it; owned PCP attention reads only
-        that metadata. validate_config already pins PP/DP=1 and no drafter.
+        that metadata. validate_config pins PP/DP=1 and the supported drafter.
         """
         if not validate_config(vllm_config):
             return _REPLAY_NATIVE(self, vllm_config, cut)
@@ -136,20 +137,13 @@ class HcuV41PcpBackbone(native.DeepseekV4Model):
             reason = 'sequence parallel and microbatching cannot follow the replay batch'
         elif any(i >= cut for i in getattr(self.config, 'engram_layer_ids', ())):
             reason = 'an Engram layer sits at or after the last KV source layer'
-        elif vllm_config.speculative_config is not None and (
-            getattr(vllm_config.speculative_config.draft_model_config.hf_config,
-                    'sliding_window', None) is None
-            or vllm_config.speculative_config.draft_model_config.hf_config.sliding_window
-                > self.config.sliding_window
-            or any(kind != 'sliding_attention' for kind in getattr(
-                vllm_config.speculative_config.draft_model_config.hf_config, 'layer_types', ()))
-        ):
+        elif vllm_config.speculative_config is not None and not _draft_fits_replay(
+                vllm_config, self.config.sliding_window):
             reason = 'the drafter reads hidden states outside the target replay window'
         else:
             return True
         native.logger.warning_once('Decoder SWA bounded replay is off: %s.', reason)
         return False
-
 
 class HcuV41PcpLLM(native.DeepseekV41LLMForCausalLM):
     model_cls = HcuV41PcpBackbone
@@ -264,6 +258,8 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             init = (_FP4_EPLB_OUTER_INIT if self._hcu_static_eplb_config is not None
                     else _FP4_OUTER_INIT)
             init(self, vllm_config=vllm_config, prefix=prefix)
+            from ..dspark_ll import install_model_entry_reset
+            install_model_entry_reset(self, vllm_config, 384)
             return
         from ..v41_pcp_activation import check_health
         check_health()
@@ -282,6 +278,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             # PCP1 without the explicit host route remains fully native.
             super().__init__(vllm_config=vllm_config, prefix=prefix)
 
+        from ..dspark_ll import install_model_entry_reset
+        install_model_entry_reset(self, vllm_config, 384)
+
     def load_weights(self, weights):
         cfg = getattr(self, '_hcu_static_eplb_config', None)
         if cfg is not None:
@@ -295,8 +294,13 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         if cfg is None:
             return
         # DummyModelLoader also reaches this hook without calling load_weights.
-        static_eplb.bind_placement(self, cfg, bind_weight_loaders=False)
+        plan = static_eplb.bind_placement(self, cfg, bind_weight_loaders=False)
         static_eplb.install_routing(self, cfg)
+        if plan is not None:
+            native.logger.info(
+                'HCU static EPLB routing ready: physical_experts=%d redundant_experts=%d',
+                plan.num_physical_experts, plan.num_redundant_experts,
+            )
         self._hcu_static_eplb_session = static_eplb.record_session(self)
 
     def forward(self, input_ids, positions, intermediate_tensors=None,
@@ -318,6 +322,12 @@ def _fp4_attention(cfg):
     from ..fp4_indexer import Fp4Attention, Fp4PcpAttention, preflight
     preflight(cfg)
     if validate_config(cfg):
+        from ..v41_pcp import layer_split_selected
+        if layer_split_selected(cfg):
+            from ..dsa_cache_layer_split import apply_kv_source_write_suppression
+            from ..fp4_indexer import Fp4LayerSplitPcpAttention
+            apply_kv_source_write_suppression()
+            return Fp4LayerSplitPcpAttention
         return Fp4PcpAttention
     return Fp4Attention
 
@@ -336,11 +346,38 @@ _FP4_PCP_DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
 class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
     def __init__(self, *args, **kwargs):
         cfg = args[0] if args else kwargs['vllm_config']
-        if validate_config(cfg):
+        use_pcp = validate_config(cfg)
+        if use_pcp:
             init = _FP4_PCP_DECODER_INIT
         else:
             init = _FP4_HOST_DECODER_INIT if use_host_target(cfg) else _FP4_DECODER_INIT
         init(self, *args, **kwargs)
+        self._hcu_paired_attention_norm = False
+        if use_pcp:
+            return
+        from ..shared_expert_int8 import bind_shared_expert
+
+        bind_shared_expert(cfg, self.ffn)
+        if not self.use_sequence_parallel and self.attn._int8_wq_b_direct is not None:
+            from ..int8_wq_b import bind_decoder_direct_gemm
+
+            bind_decoder_direct_gemm(self.attn._int8_wq_b_direct, self.attn, self.ffn)
+        from ..rms_int8 import install_owned_decoder
+        self._hcu_paired_attention_norm = install_owned_decoder(self)
+
+    def forward(self, *args, **kwargs):
+        if not self._hcu_paired_attention_norm:
+            return super().forward(*args, **kwargs)
+        from hcu_adapter.rms_int8_scope import attention_norm_scope
+        with attention_norm_scope():
+            return super().forward(*args, **kwargs)
+
+    def write_kv(self, *args, **kwargs):
+        if not self._hcu_paired_attention_norm:
+            return super().write_kv(*args, **kwargs)
+        from hcu_adapter.rms_int8_scope import attention_norm_scope
+        with attention_norm_scope():
+            return super().write_kv(*args, **kwargs)
 
 
 _FP4_BACKBONE_INIT = _constructor(_BACKBONE_NATIVE, _REVIEWED[1],

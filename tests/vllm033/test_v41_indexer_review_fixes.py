@@ -118,7 +118,7 @@ def test_cpu_without_candidates_never_touches_the_candidate_kernels():
 def staged_config():
     """Config fixture plus the scheduler view the staging plan reads."""
     cfg = config(ratio=1)
-    cfg.scheduler_config = NS(max_num_seqs=32)
+    cfg.scheduler_config = NS(max_num_seqs=32, max_num_batched_tokens=192)
     return cfg
 
 
@@ -448,7 +448,7 @@ def test_plugin_pcp_selector_applies_the_mode_gate(monkeypatch):
     owned = []
     monkeypatch.setattr(pcp_fork, 'selected_mode', lambda: 'native')
     monkeypatch.setattr(models, 'attention_class',
-                        lambda: owned.append('owned') or 'OWNED')
+                        lambda cfg, **kw: owned.append('owned') or 'OWNED')
     assert models.select_attention(cfg) == 'OWNED'
     assert owned == ['owned']
 

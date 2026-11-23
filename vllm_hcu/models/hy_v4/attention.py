@@ -897,8 +897,9 @@ class HYV4MLAAttention(nn.Module):
             and layer_types[self.layer_id] in _SPARSE_LAYER_TYPES
         )
         # Only actual sparse layers may share another layer's top-k indices.
-        self.skip_topk = requested_sparse and self.layer_id in compute_skip_topk_layers(
-            config
+        self.external_topk = requested_sparse and getattr(config, "dfly_external_topk", False)
+        self.skip_topk = requested_sparse and (
+            self.external_topk or self.layer_id in compute_skip_topk_layers(config)
         )
         # The skip pattern only governs backbone layers. MTP/nextn layers
         # (layer_id >= num_hidden_layers) always build a full indexer: they
@@ -1126,6 +1127,11 @@ class HYV4MLAAttention(nn.Module):
             attn_backend=sink_backend,
             **extra_impl_args,
         )
+        self.post_proj_norm = (
+            RMSNorm(hidden_size, config.rms_norm_eps)
+            if getattr(config, "attn_post_proj_norm", False)
+            else None
+        )
         q_proj_layer = self.q_b_proj if self.q_b_proj is not None else self.q_proj
         self.dcp_q_replicate = bool(
             getattr(q_proj_layer, "qrep_active", False)
@@ -1276,7 +1282,7 @@ class HYV4MLAAttention(nn.Module):
                 attn_out = attn_out * torch.sigmoid(gate_score)
 
         out, _ = self.o_proj(attn_out)
-        return out
+        return self.post_proj_norm(out) if self.post_proj_norm is not None else out
 
     @eager_break_during_capture
     def _indexer_and_attn(

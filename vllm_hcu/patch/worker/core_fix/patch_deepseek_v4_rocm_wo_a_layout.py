@@ -83,6 +83,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_get_cached_wo_a_bf16, _WRAPPER_MARKER, True)
     setattr(rocm_ops, "_vllm_hcu_original_get_cached_wo_a_bf16", original)
+    setattr(rocm_ops, "_vllm_hcu_get_cached_wo_a_bf16", hcu_get_cached_wo_a_bf16)
     setattr(rocm_ops, "_get_cached_wo_a_bf16", hcu_get_cached_wo_a_bf16)
     setattr(rocm_ops, _MARKER, True)
     return True

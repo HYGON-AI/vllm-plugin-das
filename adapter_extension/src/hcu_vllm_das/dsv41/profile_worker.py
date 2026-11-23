@@ -25,6 +25,15 @@ def profile_token_capacity(config, pcp_size, default_capacity):
     return local_token_bound(scheduler.max_num_batched_tokens, scheduler.max_num_seqs, pcp_size)
 
 
+def w4a8_profile_selected(config):
+    if (not dsv41_profile_worker_enabled()
+            or config.model_config.quantization != 'hcu_dsv41_ct_w4a8'):
+        return False
+    from .w4a8_profile import uses_w4a8_pcp_profile
+
+    return uses_w4a8_pcp_profile(config)
+
+
 def _select(worker_cls: str, config) -> str:
     """Replace only Core's own default; a deliberate choice stays untouched."""
     if dsv41_profile_worker_enabled():

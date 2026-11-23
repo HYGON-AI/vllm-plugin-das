@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass
 import functools
 import inspect
@@ -23,6 +24,8 @@ _ACTIVE_SCOPE = ContextVar("hcu_dsv41_dspark_draft_scope", default=None)
 _SCOPE_LOCK = RLock()
 _LOADER_MARKER = "_hcu_dsv41_dspark_graph_loader"
 _CONTEXT_MARKER = "_hcu_dsv41_dspark_graph_context"
+_BATCH_MARKER = "_hcu_dsv41_dspark_batch_capacity"
+_BUFFER_MARKER = "_hcu_dsv41_dspark_buffer_capacity"
 _installed = False
 _loader_module = None
 _speculator_module = None
@@ -33,6 +36,7 @@ _failure: str | None = None
 
 @dataclass(frozen=True)
 class TokenCapacity:
+    """Per-pass row limits, independently bounded by the runner token budget."""
     query_per_request: int
     query_rows: int
     verify_rows: int
@@ -69,6 +73,10 @@ def token_capacity(config) -> TokenCapacity:
     n = spec.num_speculative_tokens
     requests = scheduler.max_num_seqs
     budget = scheduler.max_num_batched_tokens
+    active = getattr(scheduler, 'max_num_active_seqs', None)
+    if active is None:
+        # Match the native scheduler when it leaves the active limit unset.
+        active = requests
     if any(type(value) is not int or value <= 0 for value in (n, requests, budget)):
         raise ValueError(
             "DSpark requires positive speculative tokens, request slots and capacity"
@@ -77,13 +85,30 @@ def token_capacity(config) -> TokenCapacity:
     if type(anchor) is not bool:
         raise ValueError("DSpark sample_from_anchor must be bool")
     query = n if anchor else n + 1
-    result = TokenCapacity(query, requests * query, requests * (n + 1), budget)
-    if max(result.query_rows, result.verify_rows) > budget:
+    if budget < requests:
         raise ValueError(
-            "DSpark capacity exceeds original budget: "
-            f"query={result.query_rows}, verify={result.verify_rows}, budget={budget}"
+            "DSpark request slots exceed the native scheduler token budget: "
+            f"requests={requests}, budget={budget}"
         )
-    return result
+    if type(active) is not int or not 0 < active <= requests:
+        raise ValueError('DSpark active request bound must fit native request slots')
+    # The scheduler bounds target rows, but a separate draft pass emits query
+    # rows for every scheduled request, including short prefills. Allocate that
+    # pass independently rather than changing the user's scheduling budget.
+    return TokenCapacity(
+        query, max(active * query, budget), min(active * (n + 1), budget), budget
+    )
+
+
+def draft_buffer_config(config):
+    """Size private draft buffers without mutating target scheduling policy."""
+    capacity = token_capacity(config)
+    if capacity.query_rows == config.scheduler_config.max_num_batched_tokens:
+        return config
+    local = copy(config)
+    local.scheduler_config = copy(config.scheduler_config)
+    local.scheduler_config.max_num_batched_tokens = capacity.query_rows
+    return local
 
 
 def validate_graph_capacity(config, moe=None) -> None:
@@ -214,6 +239,14 @@ class _BorrowedEpView:
 
 def _load_with_scope(original, target_model, vllm_config):
     from .dspark_agrs import _owned_quant_kind, draft_config
+    from .layer_split_config import KEY, layer_split_enabled
+
+    if layer_split_enabled(vllm_config):
+        # Core validates the PCP1 draft config before constructing the draft
+        # model. Drop the target-only switch on a private loader config first.
+        vllm_config = copy(vllm_config)
+        vllm_config.additional_config = dict(vllm_config.additional_config)
+        del vllm_config.additional_config[KEY]
 
     spec = getattr(vllm_config, "speculative_config", None)
     # CT W4A8 and Channel-FP8 both own a private AG-RS draft scope so Graph
@@ -221,6 +254,10 @@ def _load_with_scope(original, target_model, vllm_config):
     if _owned_quant_kind(vllm_config) is None:
         return original(target_model, vllm_config)
     if spec is None or getattr(spec, "method", None) != "dspark":
+        return original(target_model, vllm_config)
+    from .dspark_backend import native_draft_ll_requested
+
+    if native_draft_ll_requested(vllm_config):
         return original(target_model, vllm_config)
     if vllm_config.parallel_config.data_parallel_size <= 1:
         return original(target_model, vllm_config)
@@ -310,6 +347,91 @@ def _patch_loader() -> None:
     _loader_original = original
 
 
+def _patch_draft_batch(cls) -> None:
+    """Reject an oversized actual draft before native input preparation writes."""
+    if getattr(cls, _BATCH_MARKER, False):
+        return
+    original = getattr(cls, "propose", None)
+    if not callable(original):
+        raise RuntimeError("vLLM DFlash propose entry is unavailable")
+    parameters = tuple(inspect.signature(original).parameters)
+    required = ("input_batch", "dummy_run", "dp_sync_state")
+    if any(name not in parameters for name in required):
+        raise RuntimeError("vLLM DFlash propose capacity ABI changed")
+    positions = {name: parameters.index(name) - 1 for name in required}
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        if getattr(self, "_speculator_name", None) == "DSpark":
+            def argument(name, default=None):
+                position = positions[name]
+                return kwargs.get(name, args[position] if len(args) > position else default)
+
+            batch = argument("input_batch")
+            if batch is None:
+                raise ValueError("DSpark input batch is missing")
+            requests = batch.num_reqs
+            sync = argument("dp_sync_state")
+            if argument("dummy_run", False) and sync is not None:
+                requests = min(requests, sync.num_reqs)
+            if not 0 <= requests <= self.max_num_reqs:
+                raise ValueError("DSpark actual batch exceeds request slots")
+            target_capacity = getattr(self, "_hcu_target_token_budget", self.max_num_tokens)
+            if not 0 <= batch.num_tokens <= target_capacity:
+                raise ValueError("DSpark actual target rows exceed runner capacity")
+            query_rows = requests * self.num_query_per_req
+            if query_rows > self.max_num_tokens:
+                raise ValueError(
+                    "DSpark actual draft query exceeds runner capacity before input preparation: "
+                    f"query={query_rows}, capacity={self.max_num_tokens}, requests={requests}"
+                )
+        return original(self, *args, **kwargs)
+
+    cls._hcu_dsv41_original_propose = original
+    setattr(wrapped, _BATCH_MARKER, True)
+    cls.propose = wrapped
+    setattr(cls, _BATCH_MARKER, True)
+
+
+def _patch_draft_buffers(cls) -> None:
+    if getattr(cls, _BUFFER_MARKER, False):
+        return
+    original_init, original_attn = cls.__init__, cls.set_attn
+    if tuple(inspect.signature(original_init).parameters) != ("self", "vllm_config", "device"):
+        raise RuntimeError("vLLM DSpark constructor capacity ABI changed")
+
+    @functools.wraps(original_init)
+    def initialize(self, vllm_config, device):
+        from .dspark_agrs import _owned_quant_kind
+        local = vllm_config
+        if native_decode_dspark(vllm_config) and _owned_quant_kind(vllm_config) is not None:
+            local = draft_buffer_config(vllm_config)
+            self._hcu_target_token_budget = vllm_config.scheduler_config.max_num_batched_tokens
+        from vllm.config import set_current_vllm_config
+        with set_current_vllm_config(local):
+            original_init(self, local, device)
+
+    @functools.wraps(original_attn)
+    def set_attn(self, model_state, kv_cache_config, block_tables,
+                 target_input_buffers, target_attn_groups):
+        if hasattr(self, "_hcu_target_token_budget"):
+            # This happens before graph capture. Keep the live native block
+            # tables and their ownership; only enlarge the shared output rows.
+            mappings = block_tables.slot_mappings
+            if mappings.shape[1] < self.max_num_tokens:
+                import torch
+                from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+                block_tables.slot_mappings = torch.full(
+                    (mappings.shape[0], self.max_num_tokens), PAD_SLOT_ID,
+                    dtype=mappings.dtype, device=mappings.device,
+                )
+        return original_attn(self, model_state, kv_cache_config, block_tables,
+                             target_input_buffers, target_attn_groups)
+
+    cls.__init__, cls.set_attn = initialize, set_attn
+    setattr(cls, _BUFFER_MARKER, True)
+
+
 def _patch_draft_context() -> None:
     global _speculator_module, _context_original
     module = import_module("vllm.v1.worker.gpu.spec_decode.dflash.speculator")
@@ -317,6 +439,9 @@ def _patch_draft_context() -> None:
     original = getattr(cls, "_run_model", None)
     if cls is None or not callable(original):
         raise RuntimeError("vLLM DFlash speculator context entry is unavailable")
+    _patch_draft_batch(cls)
+    dspark_cls = import_module("vllm.v1.worker.gpu.spec_decode.dspark.speculator").DSparkSpeculator
+    _patch_draft_buffers(dspark_cls)
     if getattr(cls, _CONTEXT_MARKER, False):
         _speculator_module = module
         _context_original = getattr(cls, "_hcu_dsv41_original_run_model")
@@ -342,6 +467,9 @@ def _patch_draft_context() -> None:
         num_tokens_across_dp,
         cudagraph_runtime_mode=mode_none,
     ):
+        if getattr(self, "_speculator_name", None) == "DSpark":
+            if not 0 <= num_tokens <= self.max_num_tokens:
+                raise ValueError("DSpark padded draft rows exceed runner capacity")
         scope = getattr(getattr(self, "model", None), "_hcu_dsv41_dspark_draft_scope", None)
         if scope is None:
             return original(
@@ -419,6 +547,11 @@ def check_dspark_graph_support() -> None:
     cls = getattr(_speculator_module, "DFlashSpeculator", None)
     if not getattr(cls, _CONTEXT_MARKER, False):
         raise RuntimeError("DSpark Graph context wrapper lost its owner")
+    if not getattr(cls, _BATCH_MARKER, False):
+        raise RuntimeError("DSpark actual-batch capacity wrapper lost its owner")
+    dspark_cls = import_module("vllm.v1.worker.gpu.spec_decode.dspark.speculator").DSparkSpeculator
+    if not getattr(dspark_cls, _BUFFER_MARKER, False):
+        raise RuntimeError("DSpark private-buffer capacity wrapper lost its owner")
 
 
 __all__ = [

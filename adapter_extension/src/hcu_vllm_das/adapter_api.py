@@ -47,3 +47,13 @@ def adapter_module_name(name):
 def adapter_module(name):
     """Return the actual owner module, preserving its identity and state."""
     return importlib.import_module(adapter_module_name(name))
+
+
+def optional_adapter_module(qualified_name):
+    """Probe a companion API while surfacing failures inside an installed module."""
+    try:
+        return importlib.import_module(qualified_name)
+    except ModuleNotFoundError as error:
+        if error.name != qualified_name:
+            raise
+        return None

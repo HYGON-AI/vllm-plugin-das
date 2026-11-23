@@ -145,10 +145,25 @@ def _engram_edp_check():
     return check_engram_edp_guard()
 
 
+def _qualify_dspark_markov(context):
+    if context.load_dummy_weights:
+        return
+    speculator = getattr(context.worker.model_runner, 'speculator', None)
+    model = getattr(speculator, 'model', None)
+    if not getattr(model, '_hcu_markov_pointwise', False):
+        return
+    from .dspark_greedy_admission import qualify_markov
+
+    qualify_markov(model, speculator)
+
+
 def _dspark_graph_install():
+    from hcu_adapter.bridges.vllm_model_load import register_post_model_load
     from .dspark_graph import install_dspark_graph_support
 
-    return install_dspark_graph_support()
+    installed = install_dspark_graph_support()
+    register_post_model_load('das-hcu-dsv41-dspark-markov', _qualify_dspark_markov)
+    return installed
 
 
 def _dspark_graph_check():

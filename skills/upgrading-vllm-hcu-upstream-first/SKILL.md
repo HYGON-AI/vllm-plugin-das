@@ -57,6 +57,14 @@ ops only after official split-list finalization, without replacing the config
 methods or mutating the shared stock list. Exercise real CPU config objects;
 these checks do not qualify custom-SP, DeepEP-auto, capture or model execution.
 
+For DBO, verify per-request phase flags through actual microbatch slicing;
+query length alone cannot distinguish a short prefill from decode. At v0.33,
+DP1 does not cover this path and hybrid DBO uses MRV1. See
+[DBO metadata and workspace validation](references/dbo-metadata.md) for the
+algorithm owner, upstream fixes, microbatch-scoped metadata reuse,
+split/unsplit profiling and device admission boundaries. Preserved phase flags
+and sufficient MoE workspace do not establish correct metadata-cache reuse.
+
 Before retaining a pre-fork block-size hook, trace worker KV specs back into
 EngineCore. A target that derives the parent's cache block size from those specs
 before scheduler/hash/KV initialization can already propagate a worker-local
@@ -79,6 +87,36 @@ there; bypassing that boundary can invent a missing-manager failure. For packed
 KV, check shared-allocation accounting and retained layer/offset/stride metadata
 through the real builder, conversion, connector and block pool. Keep independent
 backings, device copies and model acceptance separate from this CPU coverage.
+
+### DeepSeek V4.1 Layer Split paired upgrade
+
+- Pair the Plugin with the Adapter commit that exposes the vLLM parser,
+  platform KV-builder selection and worker-localization hooks. Keep Core's
+  scheduler and worker lifecycle. The Plugin owns cache-group geometry,
+  per-layer main/SWA placement and scratch/transfer semantics. Check the
+  companion APIs in actual installs before merging the Plugin.
+- Run discovery with the older supported Adapter package. Ordinary startup
+  keeps its existing policy. An explicit Layer Split request requires the
+  companion hooks. Test both CLI/JSON merging and startup before model
+  construction. The target's CLI setting stays out of the PCP1 dSpark draft
+  configuration; retain the draft's own replicated SWA pool. Exercise the
+  selected worker's runner constructor. When the W4A8 profile worker is
+  present, compose its runner with the prefill page-plan mixin and verify that
+  the scope stays within real target prefill.
+- For the final pair, bind the Adapter/Plugin/Core, native providers, model,
+  route and launch parameters to each artifact. Check independent group
+  budgets, owner scratch reuse, empty ranks and live-page-only Mooncake RDMA.
+  Preserve Core's empty release notifications for pre-schedule aborts and
+  full prefix hits. Exercise mixed batches and verify every producer owner
+  acknowledges the release with no RDMA descriptors for those requests.
+  Measure the original performance and operator comparisons with the same
+  requests, backend and prefix/replay policies. Report Graph and prefix per
+  admitted topology, including explicit rejection where the path is eager
+  only. Preserve normal service exit and device release as separate results.
+- Keep the original ordered HumanEval/0–31 requests and scoring protocol.
+  Retain raw predictions, reviews, finish reasons, and normalized per-task
+  outcomes from the isolated scorer. Preserve historical failures and identify
+  earlier CPU/replay or hardware runs by their original heads.
 
 ## Run a static preflight
 
@@ -171,6 +209,15 @@ Keep dispatch acknowledgement, the actual PR checkout and aggregate acceptance s
 For a private Core image candidate, use the guide's
 [publisher and credential boundaries](../../docs/validation/vllm033-ci-coverage.md#publish-a-private-core-candidate-image);
 inspect embedded architectures before changing a shared CI image.
+
+Candidate-wheel and installed-image inspection must follow the same Adapter
+namespace choice as runtime imports. An infra namespace selects relocated
+owners; missing new-layout files cannot fall back to stale legacy copies.
+Check the full current companion set (including PCP policy and CLI seams),
+and require installed seams in hashed RECORD entries before native inspection.
+One repaired catalog entry or a newer image date does not establish that the
+remaining interfaces or both native architectures are present. Keep inspection
+free of package imports and retain the complete device/aggregate gates.
 
 For a newly published image, prefer a trusted single-run candidate input when
 the target workflow provides one; see [candidate CI qualification](../../docs/validation/vllm033-ci-coverage.md#qualify-a-candidate-image-for-one-pr).
