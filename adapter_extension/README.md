@@ -141,8 +141,9 @@ entry point. The capability can be required using the existing Adapter
 `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
 
 This is configuration parsing support only. The active wheel still lacks
-Flash model execution and model registration; PR #493 remains Draft until
-the [model integration and runtime gates](../docs/hy4_flash.md) are closed.
+Flash model execution and model registration. MR-level Ready status reflects
+scoped source/component review, not closure of the
+[model integration and runtime gates](../docs/hy4_flash.md).
 
 ## DSV4.1 HCU decode defaults
 
