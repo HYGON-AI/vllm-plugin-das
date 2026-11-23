@@ -16,8 +16,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, get_pcp_g
 from vllm.distributed.device_communicators.all2all import AgRsAll2AllManager
 from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import MoEPrepareAndFinalizeNaiveDPEPModular
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-
-from .dspark_capacity import TokenCapacity, token_capacity
+from .dspark_graph import TokenCapacity, token_capacity
 
 _BACKEND = 'allgather_reducescatter'
 _OWNER = 'hcu_dsv41_dspark_agrs_v1'

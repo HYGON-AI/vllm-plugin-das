@@ -69,6 +69,18 @@ def graph_capture_allowed(config):
     return _impl.graph_capture_allowed(config)
 
 
+def _fp4_reader_ready():
+    from .v41_indexer_activation import fp4_reader_ready
+
+    return fp4_reader_ready()
+
+
+def _check_graph_fp4_provider():
+    from .v41_indexer_activation import check_graph_fp4_provider
+
+    check_graph_fp4_provider()
+
+
 def _register_split_hook(config):
     return globals()['register_splitting_op'](config)
 
@@ -84,6 +96,8 @@ _impl.bind_runtime_resolvers(
     gather_kv=lambda: globals()['cp_gather_indexer_k_quant_cache_triton'],
     enabled=lambda: globals()['enabled'](),
     health=_check_health,
+    fp4_reader_ready=_fp4_reader_ready,
+    check_graph_fp4_provider=_check_graph_fp4_provider,
     register_split=lambda: _register_split_hook,
     # Three names the old module owned that a caller may still patch. The
     # adapter reads them through these resolvers, so the patch keeps reaching
@@ -126,6 +140,7 @@ class HcuV41SparseAttnIndexer(_api['base']):
             admit_config(cfg)
         super().__init__(*args, **kwargs)
         if self._hcu_fp4:
+            import torch
             from vllm import envs
             from .fp4_workspace import query_chunk_rows
             from .fp4_indexer_lightop import decode_rows, staging_plan
@@ -137,12 +152,22 @@ class HcuV41SparseAttnIndexer(_api['base']):
                 cfg.scheduler_config.max_num_batched_tokens,
                 decode_rows(cfg))
             self.fp4_page_records = cfg.cache_config.block_size // self.compress_ratio
-            self.fp4_staging_plan = staging_plan(cfg, self.max_model_len, self.compress_ratio)
+            from hcu_adapter.kernels.fp4_staging_triton import supports_staging_device
+
+            self.fp4_staging_plan = staging_plan(
+                cfg, self.max_model_len, self.compress_ratio,
+                fused=supports_staging_device(torch.device(cfg.device_config.device)),
+            )
 
     def _fp4_preflight(self, cfg):
         from .fp4_indexer import preflight
 
         return preflight(cfg)
+
+    def _fp4_check_dispatch(self):
+        from .v41_indexer_activation import check_fp4_dispatch
+
+        check_fp4_dispatch()
 
     def _fp4_execute(self, hidden_states, q_quant, weights):
         from .fp4_indexer_lightop import execute
