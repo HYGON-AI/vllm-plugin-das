@@ -600,20 +600,35 @@ export HCU_VLLM_HY4_FUSED_ROUTING=1
 
 This defaults to off. The owned HY4 backbone and MTP routers reuse Core's
 `fused_topk_bias` for sigmoid routing with one expert group, renormalization,
-256 experts and top-k8. The original `GroupedTopKRouter` class, routing method,
+256 logical experts and top-k8. The original `GroupedTopKRouter` class, routing method,
 parameters, callbacks and `select_experts` remain unchanged.
 
 Admission requires text HY4 BF16 H6144 on gfx938, MRV2, compilation mode 0,
-DP16/EP16 with TP/PP/PCP/DCP1 and DeepEP LL. LoRA, online EPLB, elastic EP,
+DP16/EP16 with TP/PP/PCP/DCP1 and DeepEP LL. Static P also admits PCP16/EP16,
+TP/PP/DP/DCP1, DeepEP HT, DeepGEMM, eager synchronous execution and a real
+offline map with exactly 16 redundant experts (272 physical slots).
+LoRA, online EPLB, elastic EP,
 DBO, multiple ubatches, batch-invariant mode and AITER MoE retain native routing.
-Unsupported tensor metadata also retains native routing. P-side HT/static EPLB
-is unaffected.
+Unsupported tensor metadata also retains native routing. P calibration and
+`skip_padding=True` retain native routing. The original Core physical mapper
+and static placement remain in charge of replica selection.
 
 Core consumes the device padding mask: padded expert IDs become -1 while
-their normalized/scaled weights remain unchanged. Single-device operator and
+their normalized/scaled weights remain unchanged. P HT instead preserves its
+native `skip_padding=False` contract using a private, unmasked ForwardContext
+only during fused top-k; the original context is restored before capture and
+EPLB mapping. Single-device operator and
 changing-input Graph checks passed; actual 16-rank LL dispatch, experts,
 combine and whole-model validation remain outstanding. Component speedups
 are not serving throughput or TTFT measurements.
+
+The static P candidate passed 76 routing CPU tests and 112 related static,
+constructor, dense-fusion and HT tests. Eight single-GPU cases cover Q rows
+378/756/1134/6168, INT32/INT64 IDs, four padding contexts, Core replica hashing,
+logical capture and load recording. Including mapping, host-to-completion
+speedups were 2.03–3.53x on gfx938/Torch2.11/DTK2610 with Core c440c089.
+These are source-candidate routing tests with synthetic logits, not model
+accuracy, 16-rank HT dispatch or serving performance qualification.
 
 Restart with `HCU_VLLM_HY4_FUSED_ROUTING=0` to disable this policy, or
 `VLLM_HCU_USE_CUSTOM_OPS=0` for the master rollback. Changing a captured policy
