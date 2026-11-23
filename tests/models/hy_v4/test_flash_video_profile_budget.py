@@ -101,6 +101,42 @@ class JointProfileBudgetTests(unittest.TestCase):
             info, length, counts or {"video": 1}, return_raw=return_raw
         )
 
+    def test_dummy_dimension_options_search_aligned_grids_in_both_orientations(self):
+        for height, width in (
+            (224, 224),
+            (224, None),
+            (None, 224),
+            (65, 127),
+            (127, 65),
+            (1, 1),
+            (10**9, 10**9),
+        ):
+            with self.subTest(height=height, width=width):
+                info, config, processor, tokenizer = settings()
+                config.use_2d_rope = True
+                option = NS(height=height, width=width, num_frames=None)
+                shape = self.ns["get_dummy_video_shape"](
+                    info, 8192, {"video": 1}, video_options=option
+                )
+                frames, out_height, out_width = shape
+                for cap, edge in ((height, out_height), (width, out_width)):
+                    self.assertEqual(edge % 64, 0)
+                    self.assertLessEqual(edge, 2048)
+                    if cap is not None:
+                        self.assertLessEqual(edge, max(64, cap // 64 * 64))
+                self.assertLessEqual(
+                    placeholder_tokens(
+                        frames, out_height // 64, out_width // 64, config, tokenizer
+                    ),
+                    8192,
+                )
+                if height == width == 224:
+                    self.assertEqual(shape, (processor.max_frames, 192, 192))
+                if height is None:
+                    self.assertGreater(out_height, out_width)
+                if width is None:
+                    self.assertGreater(out_width, out_height)
+
     def resize_shape(self, shape, config, processor, options=None):
         options = options or {}
         frames, height, width = shape
@@ -371,8 +407,12 @@ class JointProfileBudgetTests(unittest.TestCase):
             }
             override, config, processor, _ = settings(spatial=1, options=options)
             defaults, _, _, _ = settings(
-                spatial=1, maximum=81920, max_frames=6,
-                side=128, reserve=reserve, per_frame=per_frame,
+                spatial=1,
+                maximum=81920,
+                max_frames=6,
+                side=128,
+                reserve=reserve,
+                per_frame=per_frame,
             )
             with self.subTest(reserve=reserve, per_frame=per_frame):
                 for raw in (False, True):
@@ -381,8 +421,12 @@ class JointProfileBudgetTests(unittest.TestCase):
                         self.run_shape(defaults, 128, return_raw=raw),
                     )
                 self.assert_accepted(
-                    self.run_shape(override, 128), override,
-                    config, processor, options, 128,
+                    self.run_shape(override, 128),
+                    override,
+                    config,
+                    processor,
+                    options,
+                    128,
                 )
 
     def test_one_pass_raw_space_not_only_aligned_fixed_points(self):
@@ -395,8 +439,15 @@ class JointProfileBudgetTests(unittest.TestCase):
             (1, 2), (1, 3), (False, True), (False, True)
         ):
             info, config, processor, tokenizer = settings(
-                spatial, tau, newline, extra,
-                maximum=81920, max_frames=6, side=128, reserve=0, per_frame=1,
+                spatial,
+                tau,
+                newline,
+                extra,
+                maximum=81920,
+                max_frames=6,
+                side=128,
+                reserve=0,
+                per_frame=1,
             )
             factor = 32 * spatial
             profile = self.run_shape(info, 128)
@@ -408,13 +459,17 @@ class JointProfileBudgetTests(unittest.TestCase):
                     )
                     if frames * h * w > processor.size["longest_edge"]:
                         continue
-                    if placeholder_tokens(
-                        frames, h // factor, w // factor, config, tokenizer
-                    ) > 128:
+                    if (
+                        placeholder_tokens(
+                            frames, h // factor, w // factor, config, tokenizer
+                        )
+                        > 128
+                    ):
                         continue
                     accepted += 1
                     self.assertLessEqual(
-                        frames * (h // factor) * (w // factor), work,
+                        frames * (h // factor) * (w // factor),
+                        work,
                         (spatial, tau, newline, extra, frames, height, width, h, w),
                     )
             self.assert_accepted(profile, info, config, processor, length=128)
