@@ -353,7 +353,9 @@ class HYV4DFlyForCausalLM(nn.Module):
         super().__init__()
         if not (is_hcu_platform() or current_platform.is_cuda()):
             raise NotImplementedError("HYV4 DFly requires the HCU/CUDA runtime")
-        self.model = HYV4DFlyModel(vllm_config, maybe_prefix(prefix, "model"))
+        self.model = HYV4DFlyModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         self.config = self.model.config
         self.has_own_embed_tokens = False
         self.lm_head: ParallelLMHead | None = None
