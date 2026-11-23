@@ -150,7 +150,8 @@ class FusedScatterContractTest(unittest.TestCase):
              "compute_aligned_M_and_alignment", scope=self.scope)
         load(EXPERTS, "_step5_fused_scatter_rows", "apply", scope=self.scope)
         self.runtime = load(RUNTIME, "ht_receiver",
-                            "_uses_post_dispatch_channel_fp8_quant")
+                            "_uses_post_dispatch_channel_fp8_quant",
+                            "_step5_fused_scatter_alignment", scope={"os": os})
 
     def gemm(self, inputs, weights, output, expert_ids, **kwargs):
         self.calls.append((inputs, output, expert_ids))
@@ -168,7 +169,7 @@ class FusedScatterContractTest(unittest.TestCase):
         buffer = object()
         key = (id(buffer), 0)
         pf = SimpleNamespace(
-            rank_expert_offset=0, buffer=buffer,
+            rank_expert_offset=0, buffer=buffer, num_dispatchers_=16,
             _hcu_step5_fused_scatter_enabled=scatter,
             _hcu_step5_scatter_buffers={key: (
                 Tensor((sum(counts), 4096)),
@@ -304,7 +305,9 @@ class FusedScatterContractTest(unittest.TestCase):
     def test_receiver_rejects_unaligned_negative_and_wrong_expert_counts(self):
         for counts in ([255] + [0] * 21, [-256] + [0] * 21,
                        [256.0] + [0] * 21, [256] + [0] * 20):
-            with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "dispatch counts"):
+            with self.subTest(counts=counts), self.assertRaisesRegex(
+                ValueError, "aligned counts for every local expert"
+            ):
                 self.receive(counts=counts)
 
     def test_stale_or_invalid_metadata_is_rejected_before_gemm(self):

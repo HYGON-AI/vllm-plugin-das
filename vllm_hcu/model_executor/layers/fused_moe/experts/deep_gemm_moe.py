@@ -675,9 +675,6 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             if current_platform.is_rocm() and self.quant_config.use_int8_w8a8
             else mk_alignment_scope(align_used)
         )
-        grouped_fp8 = m_grouped_fp8_gemm_nt_contiguous
-        if step5_channel_fp8 and fused_scatter is not None and align_used == 128:
-            from ..ep8_wasp128 import grouped_fp8
         with alignment_scope:
             mm1_out = _resize_cache(workspace2, (M_sum, N))
             if self.quant_config.use_int8_w8a8:
@@ -712,6 +709,9 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     expert_ids,
                 )
             else:
+                grouped_fp8 = m_grouped_fp8_gemm_nt_contiguous
+                if step5_channel_fp8 and fused_scatter is not None and align_used == 128:
+                    from ..ep8_wasp128 import grouped_fp8
                 grouped_fp8(
                     (a1q, a1q_scale),
                     (w1, self.w1_scale),
