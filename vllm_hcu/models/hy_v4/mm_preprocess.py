@@ -202,10 +202,11 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         return ImageSize(width=width, height=height)
 
     def get_dummy_video_shape(self, seq_len, mm_counts, *, return_raw=False):
-        """Maximal processed grid, or a raw witness for one public resize.
+        """Maximal processed grid, or a mathematical raw resize witness.
 
-        The dummy builder requests return_raw=True. Keeping the processed-shape
-        query separate avoids treating a non-idempotent output as raw input.
+        Profiling allocates the bounded processed grid and disables video resize
+        only on its dummy ProcessorInputs. A raw witness can be arbitrarily large:
+        return_raw is for arithmetic checks, never for allocating dummy media.
         """
         hf_processor = self.get_hf_processor()
         processor = hf_processor.video_processor
@@ -416,7 +417,7 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
         videos = []
         if mm_counts.get("video", 0):
             frames, height, width = self.info.get_dummy_video_shape(
-                seq_len, mm_counts, return_raw=True
+                seq_len, mm_counts
             )
             videos = self._get_dummy_videos(
                 width=width,
@@ -450,6 +451,21 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
 
 
 class HYV4VLMultiModalProcessor(BaseMultiModalProcessor[HYV4VLProcessingInfo]):
+    def get_dummy_inputs(self, seq_len, mm_counts, mm_options):
+        inputs = super().get_dummy_inputs(seq_len, mm_counts, mm_options)
+        if mm_counts.get("video", 0):
+            # The builder already allocates the conservative processed grid.
+            # adaptive_resize is not idempotent: resizing it again underprofiles,
+            # while materializing an inverse raw witness can exhaust host RAM.
+            # Scope this override to dummy videos; real requests and dummy images
+            # retain their configured preprocessing and no shared state is changed.
+            kwargs = dict(inputs.hf_processor_mm_kwargs)
+            video_kwargs = dict(kwargs.get("videos_kwargs", {}))
+            video_kwargs["do_resize"] = False
+            kwargs["videos_kwargs"] = video_kwargs
+            inputs = replace(inputs, hf_processor_mm_kwargs=kwargs)
+        return inputs
+
     def apply(self, inputs, timing_ctx):
         processor = self.info.get_hf_processor(**inputs.hf_processor_mm_kwargs)
         prompt = inputs.prompt

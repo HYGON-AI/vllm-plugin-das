@@ -99,6 +99,8 @@ class HYV4VLImageProcessor(TorchvisionBackend):
     spatial_patch_size = 1
     min_pixels = None
     max_pixels = None
+    # Bound by the wrapper from the vision config, never a per-call HF kwarg.
+    _rope_axis_patch_limit = None
     valid_kwargs = HYV4ImageProcessorKwargs
     model_input_names = ["pixel_values", "image_grid_thw"]
 
@@ -119,6 +121,41 @@ class HYV4VLImageProcessor(TorchvisionBackend):
         return super()._standardize_kwargs(
             size=size, min_pixels=min_pixels, max_pixels=max_pixels, **kwargs
         )
+
+    def _get_image_size(self, height, width, do_resize, size, patch_size, merge_size):
+        factor = patch_size * merge_size
+        axis_limit = self._rope_axis_patch_limit
+        if axis_limit is not None:
+            # RoPE indexes the raw patch grid, before spatial merging. Its
+            # fixed table has max_image_size // config.patch_size + 1 entries.
+            aligned_cap = axis_limit // merge_size * factor
+            if aligned_cap < factor:
+                raise ValueError("2D RoPE cache cannot fit one merged image patch")
+            if do_resize and size.shortest_edge > aligned_cap**2:
+                raise ValueError("Image min_pixels exceeds the fixed 2D RoPE cache")
+            if not do_resize and max(height, width) > axis_limit * patch_size:
+                raise ValueError(
+                    "Image exceeds the fixed 2D RoPE cache axis with do_resize=False; "
+                    "enable resizing or use a smaller image"
+                )
+        if do_resize:
+            height, width = smart_resize(
+                height, width, factor, size.shortest_edge, size.longest_edge
+            )
+            if axis_limit is not None and max(height, width) > aligned_cap:
+                scale = aligned_cap / max(height, width)
+                height = max(factor, math.floor(height * scale / factor) * factor)
+                width = max(factor, math.floor(width * scale / factor) * factor)
+                if height * width < size.shortest_edge:
+                    raise ValueError(
+                        "Image min_pixels conflicts with the fixed 2D RoPE cache "
+                        "axis and aspect ratio"
+                    )
+        if height % factor or width % factor:
+            raise ValueError("Image dimensions must align with patch_size * merge_size")
+        if height * width > size.longest_edge:
+            raise ValueError("Image exceeds max_pixels with resizing disabled")
+        return height, width
 
     def _preprocess(
         self,
@@ -143,23 +180,13 @@ class HYV4VLImageProcessor(TorchvisionBackend):
         outputs, grids = {}, {}
         for shape, batch in grouped.items():
             height, width = batch.shape[-2:]
+            height, width = self._get_image_size(
+                height, width, do_resize, size, patch_size, merge_size
+            )
             if do_resize:
-                height, width = smart_resize(
-                    height,
-                    width,
-                    patch_size * merge_size,
-                    size.shortest_edge,
-                    size.longest_edge,
-                )
                 batch = self.resize(
                     batch, SizeDict(height=height, width=width), resample
                 )
-            if height % (patch_size * merge_size) or width % (patch_size * merge_size):
-                raise ValueError(
-                    "Image dimensions must align with patch_size * merge_size"
-                )
-            if height * width > size.longest_edge:
-                raise ValueError("Image exceeds max_pixels with resizing disabled")
             batch = self.rescale_and_normalize(
                 batch, do_rescale, rescale_factor, do_normalize, image_mean, image_std
             )
@@ -178,12 +205,20 @@ class HYV4VLImageProcessor(TorchvisionBackend):
     def get_number_of_image_patches(self, height, width, images_kwargs=None):
         options = images_kwargs or {}
         patch = options.get("patch_size", self.patch_size)
-        height, width = smart_resize(
+        # Use HF's option standardization, including instance pixel limits and
+        # per-call size overrides, just like the public preprocess dispatcher.
+        size = self._standardize_kwargs(
+            size=options.get("size", self.size),
+            min_pixels=options.get("min_pixels", self.min_pixels),
+            max_pixels=options.get("max_pixels", self.max_pixels),
+        )["size"]
+        height, width = self._get_image_size(
             height,
             width,
-            patch * options.get("merge_size", self.merge_size),
-            options.get("min_pixels", self.size["shortest_edge"]),
-            options.get("max_pixels", self.size["longest_edge"]),
+            options.get("do_resize", self.do_resize),
+            size,
+            patch,
+            options.get("merge_size", self.merge_size),
         )
         return height // patch, width // patch
 
@@ -469,6 +504,15 @@ class HYV4VLProcessor(ProcessorMixin):
                     raise ValueError(
                         f"HYV4 processor {name} disagrees with vision_config"
                     )
+
+        vision = self.config.vision_config
+        # Apply after all component/factory options: images_kwargs must not
+        # override the model's actual cache. Explicitly clear on non-RoPE reuse.
+        image_processor._rope_axis_patch_limit = (
+            vision.max_image_size // vision.patch_size + 1
+            if getattr(vision, "use_2d_rope", False)
+            else None
+        )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
