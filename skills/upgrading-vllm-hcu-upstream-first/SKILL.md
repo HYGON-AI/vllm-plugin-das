@@ -328,6 +328,11 @@ separate from model and HumanEval qualification.
 Cover every admitted post-TP shape and each packing-tile branch before claiming
 the optimized shape set is qualified. Retain recovered allocator OOM warnings
 separately from unhandled OOM, numerical failures and performance qualification.
+For serving A/B, keep the master switch and unrelated provider policies fixed
+and toggle only the AWQ child switch; otherwise the control can also change
+RMSNorm. Observe both arms' actual implementations. See the
+[AutoAWQ serving comparison](../../docs/validation/vllm033-autoawq-prefill.md#serving-comparison)
+for runtime binding and inspection isolation.
 
 For `torch.library` exit errors, inspect the actual provider's registration:
 a Library already owns its namespace, so qualified definition names can leave

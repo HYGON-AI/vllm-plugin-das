@@ -36,6 +36,13 @@ def custom_ops_enabled() -> bool:
     return _flag(_MASTER_SWITCH, default=False)
 
 
+def lightop_awq_enabled() -> bool:
+    """Opt-in AutoAWQ provider, subordinate to the migrated master switch."""
+    master = custom_ops_enabled()
+    child = _flag("VLLM_HCU_USE_LIGHTOP_AWQ", default=False)
+    return master and child
+
+
 def rms_norm_enabled() -> bool:
     """Return whether the migrated LightOp RMSNorm paths are enabled."""
 
