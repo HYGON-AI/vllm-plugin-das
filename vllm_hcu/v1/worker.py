@@ -22,6 +22,7 @@ from vllm.platforms import current_platform
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.workspace import init_workspace_manager
 from vllm.v1.worker.utils import request_memory
+from vllm_hcu.platforms import envs as henvs
 
 logger = init_logger(__name__)
 
@@ -64,6 +65,13 @@ class HcuGPUWorker(Worker):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
+        self._mooncake_fabric_enabled = henvs.VLLM_HCU_MOONCAKE_FABRIC_MEM_POOL
+        self._mooncake_fabric_pool = None
+        if self._mooncake_fabric_enabled:
+            from vllm_hcu.v1.mooncake_fabric_pool import validate_fabric_pool_config
+
+            validate_fabric_pool_config(vllm_config)
+
         # Worker callbacks must be armed against the deserialised config before
         # the parent constructor imports model runners or custom operators.
         from vllm_hcu.patch.runtime_state import set_process_role
@@ -78,6 +86,35 @@ class HcuGPUWorker(Worker):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+    def _maybe_get_memory_pool_context(self, tag: str):
+        if tag != "kv_cache" or not self._mooncake_fabric_enabled:
+            return super()._maybe_get_memory_pool_context(tag)
+
+        # This outer scope only selects the worker. It does NOT enter MemPool:
+        # block tables, metadata, connector registration and PCP stay outside.
+        from vllm_hcu.v1.mooncake_kv_allocation import kv_cache_allocation_scope
+
+        return kv_cache_allocation_scope(
+            self.model_runner,
+            self._get_mooncake_fabric_pool,
+            use_v2_model_runner=self.use_v2_model_runner,
+        )
+
+    def _get_mooncake_fabric_pool(self):
+        if self._mooncake_fabric_pool is None:
+            from vllm_hcu.v1.mooncake_fabric_pool import MooncakeFabricPool
+
+            self._mooncake_fabric_pool = MooncakeFabricPool(self.device)
+        return self._mooncake_fabric_pool
+
+    def shutdown(self) -> None:
+        # The parent shuts down the connector and model runner first. Never
+        # destroy the pool while they can still access registered KV tensors.
+        super().shutdown()
+        if self._mooncake_fabric_pool is not None:
+            self._mooncake_fabric_pool.close()
+            self._mooncake_fabric_pool = None
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model, then require every enabled patch chain to be live."""
