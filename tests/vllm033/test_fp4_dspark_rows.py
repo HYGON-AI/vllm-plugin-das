@@ -22,14 +22,14 @@ def test_capacity_covers_native_decode_owners(requests):
     is_prefilling = np.zeros(requests, dtype=np.bool_)
     actual = [sum(size for _, _, size in manager._iter_rank_chunks(rank, scheduled, is_prefilling))
               for rank in range(8)]
-    cfg = NS(scheduler_config=NS(max_num_seqs=requests),
+    cfg = NS(scheduler_config=NS(max_num_seqs=requests, max_num_batched_tokens=requests * 6),
              parallel_config=NS(pcp_shard_decode_requests=True, prefill_context_parallel_size=8),
              speculative_config=NS(num_speculative_tokens=5))
     assert max(actual) == decode_rows(cfg)
 
 
 def test_unsharded_and_nonspeculative_capacities_preserved():
-    cfg = NS(scheduler_config=NS(max_num_seqs=128),
+    cfg = NS(scheduler_config=NS(max_num_seqs=128, max_num_batched_tokens=768),
              parallel_config=NS(pcp_shard_decode_requests=False, prefill_context_parallel_size=1),
              speculative_config=NS(num_speculative_tokens=5))
     assert decode_rows(cfg) == 768
@@ -50,7 +50,8 @@ def test_real_indexer_constructor_freezes_the_same_workspace_and_staging_bound(
              parallel_config=NS(pcp_shard_decode_requests=sharded,
                                 prefill_context_parallel_size=8),
              speculative_config=NS(num_speculative_tokens=speculative) if speculative else None,
-             cache_config=NS(block_size=64), model_config=NS(hf_config=NS()))
+             cache_config=NS(block_size=64), model_config=NS(hf_config=NS()),
+             device_config=NS(device=torch.device('cpu')))
 
     def base_init(self):
         torch.nn.Module.__init__(self)
