@@ -130,8 +130,8 @@ def test_native_pcp16_mtp_keeps_vision_profile_accounting(fixture, method, pcp):
                 pass
 
 
-@pytest.mark.parametrize("dp,allowed", [(16, True), (8, False)])
-def test_fp8_low_latency_mtp_profile(fixture, dp, allowed):
+@pytest.mark.parametrize("dp", [16, 8])
+def test_pcp1_fp8_low_latency_mtp_requires_vl_draft_inputs(fixture, dp):
     cfg = fixture.runner.vllm_config
     cfg.speculative_config = NS(method="mtp", num_speculative_tokens=3)
     cfg.model_config.quantization = "compressed-tensors"
@@ -142,13 +142,9 @@ def test_fp8_low_latency_mtp_profile(fixture, dp, allowed):
         tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=dp,
         enable_expert_parallel=True, all2all_backend="deepep_low_latency",
     )
-    if allowed:
+    with pytest.raises(ValueError, match="PCP16 MTP"):
         with load_profile()(fixture.runner):
-            assert fixture.events == [32]
-    else:
-        with pytest.raises(ValueError, match="DP16/EP16"):
-            with load_profile()(fixture.runner):
-                pass
+            pytest.fail("PCP1 MTP reached vision profiling")
 
 
 def test_preprofile_live_cache_does_not_reduce_measured_increment(fixture):
