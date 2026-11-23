@@ -400,6 +400,60 @@ class NativeProfileAllocationTests(unittest.TestCase):
         self.assertTrue(wrapper.video_processor.do_resize)
         self.assertTrue(wrapper.image_processor.do_resize)
 
+    def test_core_video_dummy_options_are_resolved_before_processed_allocation(self):
+        from dataclasses import asdict
+        from vllm.config.multimodal import MultiModalDummyOptions, VideoDummyOptions
+
+        # Real Core typed entry -> actual builder/parser -> public HF dispatch.
+        # Cover unaligned/aligned, asymmetric, minimum-clamped and oversized
+        # dimensions. No raw override-sized array may reach Core allocation.
+        cases = (
+            {"width": 224, "height": 224},
+            {"width": 256, "height": 256},
+            {"width": 224},
+            {"height": 224},
+            {"width": 65, "height": 127},
+            {"width": 1, "height": 1},
+            {"width": 10**9, "height": 10**9},
+            {"width": 224, "height": 224, "num_frames": 3},
+            {"width": 224, "height": 224, "num_frames": 1},
+        )
+        for values in cases:
+            with self.subTest(options=values):
+                wrapper = self.make_wrapper()
+                core, info, builder = self.make_core_processor(wrapper)
+                option = VideoDummyOptions(count=1, **values)
+                before = asdict(option)
+                options = MultiModalDummyOptions(video=option)
+                expected = info.get_dummy_video_shape(
+                    8192, {"video": 1}, video_options=option
+                )
+                inputs = core.get_dummy_inputs(8192, {"video": 1}, options)
+                output, frames = self.public_profile(wrapper, inputs)
+                self.assertEqual(tuple(frames.shape), (*expected, 3))
+                self.assertEqual(
+                    output["video_grid_thw"][0].tolist(),
+                    [expected[0], expected[1] // 16, expected[2] // 16],
+                )
+                self.assertEqual(asdict(option), before)
+                self.assertEqual(
+                    builder.allocations, [(tuple(frames.shape), frames.nbytes)]
+                )
+                self.assertLessEqual(frames.nbytes, ALLOCATION_LIMIT)
+                self.assertLessEqual(len(output["input_ids"][0]), 8192)
+                self.assertGreaterEqual(expected[0], 2)
+                for key, edge in (("height", expected[1]), ("width", expected[2])):
+                    self.assertEqual(edge % 64, 0)
+                    self.assertLessEqual(edge, 2048)
+                    if key in values:
+                        self.assertLessEqual(edge, max(64, values[key] // 64 * 64))
+                if values == {"width": 224, "height": 224}:
+                    self.assertEqual(expected[1:], (192, 192))
+                    # Re-search frames after applying small spatial bounds; do
+                    # not merely crop the old 26-frame global optimum.
+                    self.assertEqual(expected[0], wrapper.video_processor.max_frames)
+                del output, inputs, frames
+
     def test_real_video_still_resizes_after_dummy_inputs_on_the_same_processor(self):
         wrapper = self.make_wrapper(small=True)
         core, _, _ = self.make_core_processor(wrapper)
