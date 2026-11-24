@@ -15,6 +15,24 @@ The measured DeepGEMM wheel version was `2.1.0+das.dtk2610.655ebb3`, built
 from the DeepGEMM `step5-gfx938-ep8-wasp128` branch at
 `655ebb3c4c9cf8df9d7692f636b0dfa5db019f80`.
 
+For the nightly build, install the following into the Prefill Python
+environment.
+
+```bash
+python -m pip install --no-deps \
+    'deepgemm==2.1.0+dtk2610.torch2110.2611231831.gebe489' \
+    -i https://pypi.sourcefind.cn/nightly/dtk/
+```
+
+The local EP8 Prefill path uses the nightly wheel's explicit Pair32
+weight packer and contiguous WASP GEMM mode 1002 for G1 and G2.
+Both shapes produced bit-identical outputs to the original wheel's
+Step5 entry point in a gfx938 operator check. The nightly BN384 mode
+1003 was slower for G1. On 2026-11-24, the S7 nightly run with mode
+1002 completed the 128K batch of 32 requests at 22,067.00 input tok/s
+with no preemptions or inference JIT. The S9 result below uses the
+original wheel.
+
 Run [`serve_ep8_wasp128_prefill.sh`](serve_ep8_wasp128_prefill.sh) on the
 eight-device host. Set the model, tokenizer, qualified hipBLASLt directory,
 dense tuning JSON, and static EP8 expert placement using the environment

@@ -199,6 +199,73 @@ def test_weight_preparation_agrees_with_execution_capability(monkeypatch, case):
         assert result[0].ndim==6 and result[1].ndim==6
 
 
+@pytest.mark.parametrize("case", ["prefill", "decode", "legacy", "no_packer"])
+def test_nightly_wasp128_matches_pair32_packing_and_gemm(monkeypatch, case):
+    from vllm_hcu.model_executor.layers.fused_moe import ep8_wasp128
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_EP_FUSED_MOE", "0")
+    monkeypatch.setenv("DEEP_EP_NORMAL_MNVL", "0")
+    for flag in (
+        "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
+        "HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT",
+        "HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR",
+        "HCU_STEP5_DEEPEP_FUSED_SCATTER",
+    ):
+        monkeypatch.setenv(flag, "1")
+
+    calls = []
+
+    def pack(name):
+        def apply(weight):
+            calls.append(name)
+            return weight
+
+        return apply
+
+    wheel = ModuleType("deepgemm")
+    wheel.marlin_fp8_contiguous_weight = pack("default")
+    wheel.marlin_fp8_masked_weight = pack("masked")
+    wheel.m_grouped_fp8_gemm_nt_contiguous_wasp_pair32 = (
+        lambda *args, config: calls.append(config["MODE"])
+    )
+    pack_module = ModuleType("deepgemm.group_gemm_weight_pack")
+    if case != "no_packer":
+        pack_module.pack_fp8_weight_pair32 = pack("pair32")
+    if case == "legacy":
+        wheel.m_grouped_fp8_gemm_nt_contiguous_step5_ep8 = (
+            lambda *args: calls.append("native")
+        )
+    monkeypatch.setitem(sys.modules, "deepgemm", wheel)
+    monkeypatch.setitem(sys.modules, pack_module.__name__, pack_module)
+    monkeypatch.setattr(ep8_wasp128, "_deepgemm", lambda: wheel)
+    monkeypatch.setattr(ep8_wasp128, "_pair32_api", ep8_wasp128._pair32_api.__wrapped__)
+    monkeypatch.setattr(ep8_wasp128, "get_current_vllm_config_or_none",
+                        lambda: SimpleNamespace(parallel_config=SimpleNamespace(
+                            data_parallel_size_local=8, enable_dbo=True)))
+    config = SimpleNamespace(
+        num_experts=352,
+        moe_parallel_config=SimpleNamespace(
+            tp_size=1, ep_size=8, use_deepep_ht_kernels=case != "decode",
+        ),
+    )
+    layer = SimpleNamespace(_hcu_step5_owner=True, moe_config=config)
+    enum = SimpleNamespace(HCU_DEEPGEMM="hcu", AITER="aiter", DEEPGEMM="deep",
+                           BATCHED_DEEPGEMM="batched")
+    convert = load_function(
+        "vllm_hcu/patch/worker/op_opt/moe/patch_fp8_oracle.py",
+        "hcu_convert_to_fp8_moe_kernel_format", {"hcu_enum": enum},
+    )
+    convert("deep", layer, *tensors(), None, None)
+    assert calls == ["pair32" if case == "prefill" else "default"] * 2
+    assert ep8_wasp128.available(config) == (case in ("prefill", "legacy"))
+    if ep8_wasp128.available(config):
+        for k, n in ((4096, 3072), (1536, 4096)):
+            a = (torch.empty(1, k, device="meta"), None)
+            ep8_wasp128.grouped_fp8(a, None, torch.empty(1, n, device="meta"), None)
+        assert calls[2:] == ([1002, 1002] if case == "prefill" else ["native"] * 2)
+
+
 @pytest.mark.parametrize("output_offset", [0, 4096])
 def test_gathered_route_reduction_does_not_alias_output(output_offset):
     m, topk, hidden, intermediate = 8, 8, 4096, 1536

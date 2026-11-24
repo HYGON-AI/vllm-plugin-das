@@ -322,6 +322,21 @@ def apply_to_module(module: ModuleType) -> bool:
                     ),
                 )
             if not ep_fused:
+                if (
+                    henvs.custom_ops_enabled()
+                    and fp8_backend == hcu_enum.DEEPGEMM
+                    and w13_input_scale is None
+                    and w2_input_scale is None
+                    and os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER") == "1"
+                    and is_step5_owner(layer)
+                ):
+                    from vllm_hcu.model_executor.layers.fused_moe.ep8_wasp128 import (
+                        nightly_weight_packer,
+                    )
+
+                    pack_weight = nightly_weight_packer(
+                        getattr(layer, "moe_config", None)
+                    ) or pack_weight
                 with torch.no_grad():
                     w13 = pack_weight(w13).detach()
                     w2 = pack_weight(w2).detach()

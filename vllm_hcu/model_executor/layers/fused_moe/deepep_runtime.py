@@ -170,6 +170,10 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                 prepare._hcu_step5_scatter_guards = manager._hcu_step5_scatter_guards
                 prepare._hcu_step5_fused_scatter_enabled = True
                 experts._hcu_step5_fused_scatter_enabled = True
+                if prepare.num_dispatchers_ == 8:
+                    from .ep8_wasp128 import available
+
+                    prepare._hcu_step5_wasp128_enabled = available(moe_config)
 
     return kernel
 
@@ -474,12 +478,9 @@ def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
     )
 
 
-def _step5_fused_scatter_alignment(num_dispatchers, num_experts):
-    if num_dispatchers == 8 and num_experts == 352:
-        from .ep8_wasp128 import available
-
-        if available():
-            return 128
+def _step5_fused_scatter_alignment(prepare, num_experts):
+    if num_experts == 352 and getattr(prepare, "_hcu_step5_wasp128_enabled", False):
+        return 128
     return 256
 
 
@@ -575,7 +576,7 @@ def ht_do_dispatch(
         valid_experts = {8: (352,), 16: (352, 368)}.get(self.num_dispatchers_, ())
         if not (has_scales and expert_alignment == 256 and num_experts in valid_experts):
             raise ValueError("Step5 fused scatter requires E44 with EP8 or E22/E23 with EP16 per-token FP8 scales")
-        expert_alignment = _step5_fused_scatter_alignment(self.num_dispatchers_, num_experts)
+        expert_alignment = _step5_fused_scatter_alignment(self, num_experts)
         data, scales = token_data
         if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
             raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
@@ -713,7 +714,7 @@ def ht_receiver(
     ubatch_id = module.dbo_current_ubatch_id()
     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
         counts = tuple(expert_num_tokens_per_expert_list)
-        alignment = _step5_fused_scatter_alignment(self.num_dispatchers_, num_experts)
+        alignment = _step5_fused_scatter_alignment(self, num_experts)
         expert_tokens_meta._hcu_step5_fused_scatter_alignment = alignment
         if len(counts) != num_experts // self.num_dispatchers_ or any(
             type(c) is not int or c < 0 or c % alignment for c in counts
