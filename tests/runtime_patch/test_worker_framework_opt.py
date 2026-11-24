@@ -2988,3 +2988,106 @@ def test_kv_connector_control_context_does_not_join_dp_phase_collective(
         active._start_load_kv()
     connector.start_load_kv.assert_called_once_with(context)
     assert active._pending_load_start is False
+
+
+@pytest.mark.parametrize("method,architecture,supported", [
+    ("mtp", "DeepSeekV4MTPModel", True),
+    ("dspark", "DSparkDraftModel", True),
+    ("dspark", "DeepSeekV4MTPModel", False),
+    ("mtp", "OtherMTPModel", False),
+    ("eagle", "DSparkDraftModel", False),
+])
+@pytest.mark.parametrize("static", [False, True])
+def test_v4_draft_fixed_layout_isolates_target_config(method, architecture, supported, static):
+    from copy import copy
+    target = SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method,
+            draft_model_config=SimpleNamespace(architectures=[architecture])),
+        parallel_config=SimpleNamespace(enable_eplb=True,
+            eplb_config=SimpleNamespace(num_redundant_experts=16)),
+        additional_config={"hcu": HcuFeatureConfig(
+            expert_map_path="/tmp/target.json" if static else None).to_dict()},
+    )
+    draft = copy(target)
+    enabled = patch_eagle_utils._use_fixed_v4_draft_layout(draft)
+    assert enabled == (supported and static)
+    assert target.parallel_config.enable_eplb
+    assert target.parallel_config.eplb_config.num_redundant_experts == 16
+    if enabled:
+        assert not draft.parallel_config.enable_eplb
+        assert draft.parallel_config.eplb_config.num_redundant_experts == 0
+        assert draft.parallel_config._vllm_hcu_expert_map_path is None
+        assert target.additional_config["hcu"]["expert_map_path"] == "/tmp/target.json"
+
+
+def test_deepep_auto_reuses_target_buffer_for_smaller_fixed_draft(monkeypatch):
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(
+        Buffer=SimpleNamespace(set_num_sms=lambda value: None)))
+    module = _fake_all2all_module()
+    allocations = []
+    def get_handle(self, kwargs):
+        handle = object()
+        allocations.append((dict(kwargs), handle))
+        return handle
+    monkeypatch.setattr(module.DeepEPLLAll2AllManager, "get_handle", get_handle, raising=False)
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPAutoAll2AllManager("group")
+    target = dict(max_num_tokens_per_dp_rank=256, token_hidden_size=4096,
+                  num_ep_ranks=8, num_global_experts=272, num_local_experts=34)
+    draft = dict(target, num_global_experts=256, num_local_experts=32)
+    original_draft = dict(draft)
+    handle = manager.get_handle(target)
+    assert manager.get_handle(draft) is handle
+    assert manager.get_handle(target) is handle
+    assert len(allocations) == 1
+    assert draft == original_draft
+    # Different hidden geometry cannot alias the original communication layout.
+    other = manager.get_handle(dict(draft, token_hidden_size=8192))
+    assert other is not handle
+    assert len(allocations) == 2
+
+@pytest.mark.parametrize("spec", [
+    None, SimpleNamespace(method="dspark", draft_model_config=None),
+])
+def test_fixed_draft_layout_ignores_missing_speculation(spec):
+    assert not patch_eagle_utils._use_fixed_v4_draft_layout(
+        SimpleNamespace(speculative_config=spec)
+    )
+
+
+@pytest.mark.parametrize("destroy_fails", [False, True])
+def test_deepep_auto_destroy_drops_shared_handle(monkeypatch, destroy_fails):
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(
+        Buffer=SimpleNamespace(set_num_sms=lambda value: None)))
+    module = _fake_all2all_module()
+    allocations = []
+    destroyed = []
+    def get_handle(self, kwargs):
+        handle = object()
+        allocations.append(handle)
+        return handle
+    def destroy(self):
+        destroyed.append(allocations[-1])
+        if destroy_fails:
+            raise RuntimeError("teardown failed")
+    monkeypatch.setattr(
+        module.DeepEPLLAll2AllManager, "get_handle", get_handle, raising=False,
+    )
+    monkeypatch.setattr(
+        module.DeepEPLLAll2AllManager, "destroy", destroy, raising=False,
+    )
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPAutoAll2AllManager("group")
+    kwargs = dict(max_num_tokens_per_dp_rank=256, token_hidden_size=4096,
+                  num_ep_ranks=8, num_global_experts=272, num_local_experts=34)
+    first = manager.get_handle(kwargs)
+    if destroy_fails:
+        with pytest.raises(RuntimeError, match="teardown failed"):
+            manager.destroy()
+    else:
+        manager.destroy()
+    assert destroyed == [first]
+    assert getattr(manager, "_hcu_shared_auto_handle", None) is None
+    second = manager.get_handle(kwargs)
+    assert second is not first
+    assert len(allocations) == 2

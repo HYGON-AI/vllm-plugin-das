@@ -2507,13 +2507,17 @@ def test_sparse_cache_normalization_tolerates_missing_attention_config(
     assert config.cache_config.cache_dtype == "fp8_e4m3"
 
 
+@pytest.mark.parametrize("dspark", [False, True])
+@pytest.mark.parametrize("piecewise", [False, True])
 @pytest.mark.parametrize(
     "parallel_dimension",
     ["prefill_context_parallel_size", "decode_context_parallel_size"],
 )
-def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
+def test_deepep_auto_platform_final_graph_policy_scopes_pcp_dspark(
     monkeypatch: pytest.MonkeyPatch,
     parallel_dimension: str,
+    dspark: bool,
+    piecewise: bool,
 ) -> None:
     from vllm.config.compilation import CUDAGraphMode
     from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
@@ -2529,7 +2533,9 @@ def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
             pcp=2,
             dp=1,
             enable_expert_parallel=True,
-            enforce_eager=True,
+            enforce_eager=not dspark,
+            speculative=dspark,
+            speculative_method="dspark",
             all2all_backend="deepep_low_latency",
             moe_backend="auto",
         )
@@ -2557,7 +2563,9 @@ def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
     config.parallel_config.worker_cls = "custom"
     config.parallel_config.distributed_executor_backend = "uni"
     setattr(config.parallel_config, parallel_dimension, 2)
-    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    config.compilation_config.cudagraph_mode = (
+        CUDAGraphMode.PIECEWISE if piecewise else CUDAGraphMode.FULL_DECODE_ONLY
+    )
 
     monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
     monkeypatch.setattr(
@@ -2566,9 +2574,17 @@ def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
         lambda _vllm_config: None,
     )
 
+    if piecewise and dspark and parallel_dimension == "prefill_context_parallel_size":
+        with pytest.raises(ValueError, match="PIECEWISE"):
+            HCUPlatform.check_and_update_config(config)
+        assert config.compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+        return
     HCUPlatform.check_and_update_config(config)
 
-    assert config.compilation_config.cudagraph_mode is CUDAGraphMode.NONE
+    expected = (CUDAGraphMode.FULL_DECODE_ONLY
+                if dspark and parallel_dimension == "prefill_context_parallel_size"
+                else CUDAGraphMode.NONE)
+    assert config.compilation_config.cudagraph_mode is expected
 
 
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
@@ -3227,6 +3243,38 @@ def test_engine_args_skip_list_covers_every_master_resolved_field():
         "dp_int8_allgather",
     }
     assert skip_list == persisted - {"glm53_kda_cp_head_shard", "glm53_pcp_mtp_sync"}
+
+
+@pytest.mark.parametrize("disable_rearrange", [False, True])
+def test_deepep_auto_recording_does_not_bypass_model_guard(disable_rearrange):
+    config = _validation_config(HcuFeatureConfig(
+        deepep_auto=True, expert_map_record_path="/tmp/calibration.json",
+        eplb_disable_rearrange=disable_rearrange))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+    with pytest.raises(ValueError, match="deepep_auto.*EPLB.*not supported"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("expert_dtype", ["fp8", "int8"])
+def test_deepep_auto_online_eplb_v4_fp8(use_async, expert_dtype):
+    config = _validation_config(HcuFeatureConfig(
+        deepep_auto=True, moe_backend="deep_gemm"))
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.model_config.hf_config = SimpleNamespace(expert_dtype=expert_dtype)
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+    config.parallel_config.eplb_config = SimpleNamespace(use_async=use_async)
+    if expert_dtype == "fp8":
+        patch_vllm_config.validate_and_update_hcu_config(config)
+    else:
+        with pytest.raises(ValueError, match="online rebalancing requires"):
+            patch_vllm_config.validate_and_update_hcu_config(config)
 
 
 def _glm53_head_hash_config(pcp=8, speculative=False):

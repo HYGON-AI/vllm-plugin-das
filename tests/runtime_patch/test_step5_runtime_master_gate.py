@@ -118,6 +118,7 @@ def test_runner_master_off_delegates_to_native_execute(monkeypatch, master, mode
     runtime = _compile([subject], {
         "NativeRunner": NativeRunner,
         "nullcontext": nullcontext,
+        "pcp_dispatch_metadata_scope": nullcontext,
         "deepep_auto_request_phase_scope": nullcontext,
         "_uses_global_pcp_batch": lambda config: False,
         "_DEEPEP_AUTO_DUMMY_PHASE": SimpleNamespace(get=lambda: None),

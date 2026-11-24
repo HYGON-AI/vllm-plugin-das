@@ -34,6 +34,7 @@ def shared_setup(monkeypatch):
         calls.append(("enter", stream.name))
         yield
     monkeypatch.setattr(torch.cuda, "stream", stream_scope)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     class Layer(torch.nn.Module):
         def forward(self, x):
             calls.append(("compute",))
@@ -118,3 +119,29 @@ def test_eplb_overlap_preserves_raw_input_alias(shared_setup):
     assert shared.requires_input_preservation(x)
     assert not shared.allows_inplace_routed_output(x, x.view_as(x))
     assert shared.allows_inplace_routed_output(x.clone(), x)
+
+
+@pytest.mark.parametrize("settings", [
+    {"eplb": False}, {"backend": "deepep_low_latency"},
+    {"fi": True}, {"dbo": True}, {"safe": False}, {"stream": False},
+])
+def test_ineligible_overlap_never_queries_capture(shared_setup, monkeypatch, settings):
+    build, _ = shared_setup
+    settings = dict(settings)
+    stream = settings.pop("stream", True)
+    shared = build(**settings)
+    if not stream:
+        shared._stream = None
+
+    def device_call():
+        pytest.fail("Ineligible shared-expert overlap must not query CUDA capture")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", device_call)
+    assert not shared._can_overlap_deepep_eplb()
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_capture_disables_eligible_overlap(shared_setup, monkeypatch, capturing):
+    build, _ = shared_setup
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    assert build()._can_overlap_deepep_eplb() is (not capturing)

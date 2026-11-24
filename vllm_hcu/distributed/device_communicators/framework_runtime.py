@@ -224,6 +224,31 @@ def install_deep_ep_auto_manager(module: object) -> type:
                 "enable_shrink": self.support_fault_tolerance,
             }
 
+        def get_handle(self, kwargs):
+            # Target static EPLB can have more physical experts than its fixed
+            # draft. Reuse the larger buffer: creating a second auto Buffer
+            # reinitializes process-global ROCSHMEM and invalidates LL traffic.
+            # This changes allocation capacity only, never dispatch expert IDs.
+            cached = getattr(self, "_hcu_shared_auto_handle", None)
+            if cached is not None:
+                previous, handle = cached
+                geometry = ("max_num_tokens_per_dp_rank", "token_hidden_size", "num_ep_ranks")
+                if all(kwargs[key] == previous[key] for key in geometry):
+                    if (kwargs["num_global_experts"] <= previous["num_global_experts"]
+                            and kwargs["num_local_experts"] <= previous["num_local_experts"]):
+                        return handle
+            handle = super().get_handle(kwargs)
+            self._hcu_shared_auto_handle = (dict(kwargs), handle)
+            return handle
+
+        def destroy(self):
+            try:
+                return super().destroy()
+            finally:
+                # The inherited teardown clears its owner cache. Drop this
+                # additional capacity shortcut as well, including error exits.
+                self._hcu_shared_auto_handle = None
+
         def max_sms_used(self) -> int | None:
             return self.num_sms
 

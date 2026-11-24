@@ -166,6 +166,8 @@ class SharedExperts(torch.nn.Module):
         Limit automatic overlap to quantized DeepEP inputs, an auxiliary
         stream and the non-DBO schedule. The routed computation must not
         overwrite the raw shared input; keep the existing safety callback.
+        Skip it under CUDA graph capture: on HCU the captured cross-stream
+        joins stall the decode graph (DSV4 PCP8 bs=2 step 60 -> 51 ms off).
         """
         parallel = self._moe_config.moe_parallel_config
         return bool(
@@ -178,6 +180,7 @@ class SharedExperts(torch.nn.Module):
             and not self.enable_dbo
             and self._stream is not None
             and self._is_multistream_safe()
+            and not torch.cuda.is_current_stream_capturing()
         )
 
     @property

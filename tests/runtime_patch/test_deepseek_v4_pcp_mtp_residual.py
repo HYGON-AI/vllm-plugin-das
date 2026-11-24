@@ -80,10 +80,11 @@ def _native_sampler():
                           "sample_tokens", namespace)
 
 
+@pytest.mark.parametrize("draft_method", ["mtp", "dspark"])
 @pytest.mark.parametrize("pcp_size", [2, 4, 8])
 @pytest.mark.parametrize("layout", ["prefill", "mixed", "short", "decode"])
-def test_native_mtp_propose_receives_global_pre_hc_residual(
-    pcp_runner_module, monkeypatch, pcp_size, layout,
+def test_native_propose_receives_global_target_states(
+    pcp_runner_module, monkeypatch, pcp_size, layout, draft_method,
 ):
     module, _ = pcp_runner_module
     monkeypatch.setattr(module.GPUModelRunner, "sample_tokens", _native_sampler())
@@ -118,13 +119,18 @@ def test_native_mtp_propose_receives_global_pre_hc_residual(
         residuals = [model.get_mtp_target_hidden_states()[:output.shape[0]].clone()
                      for model, output in zip(models, outputs)]
 
+        aux_outputs = [output.repeat(1, 3) for output in outputs]
+        aux_outputs_2 = [output.repeat(1, 5) for output in outputs]
+        expected_aux = expected_hidden.repeat(1, 3)
+        expected_aux_2 = expected_hidden.repeat(1, 5)
+
         for rank, (manager, group, model, local, output) in enumerate(zip(
             managers, groups, models, local_batches, outputs,
         )):
             calls = []
 
             def gather(tensor, dim=0):
-                peers = residuals if tensor.shape[1] == 4 else outputs
+                peers = {4: residuals, 6: aux_outputs, 10: aux_outputs_2, 2: outputs}[tensor.shape[1]]
                 torch.testing.assert_close(tensor, peers[rank])
                 calls.append(tensor.shape[1])
                 return torch.cat(peers, dim=dim)
@@ -133,6 +139,7 @@ def test_native_mtp_propose_receives_global_pre_hc_residual(
             monkeypatch.setattr(manager, "prepare_global_attn", lambda: ((), None))
             config = _config(pcp_size)
             config.model_config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+            config.speculative_config = SimpleNamespace(method=draft_method)
             runner = module.HcuGPUModelRunnerV2(config, "cpu")
             runner.model = model
             runner.pcp_manager = manager
@@ -143,8 +150,12 @@ def test_native_mtp_propose_receives_global_pre_hc_residual(
 
             def propose(input_batch, metadata, slots, hidden, *args, **kwargs):
                 assert input_batch is batch
-                torch.testing.assert_close(hidden, expected_residual)
-                assert hidden.shape[1] == 4  # pre-hc, not post-hc hidden states
+                if draft_method == "dspark":
+                    torch.testing.assert_close(args[0][0], expected_aux)
+                    torch.testing.assert_close(args[0][1], expected_aux_2)
+                else:
+                    torch.testing.assert_close(hidden, expected_residual)
+                    assert hidden.shape[1] == 4  # pre-hc, not post-hc hidden states
                 proposals.append(hidden.clone())
                 return torch.zeros((batch.num_reqs, 2), dtype=torch.int32)
 
@@ -178,7 +189,10 @@ def test_native_mtp_propose_receives_global_pre_hc_residual(
             runner.num_speculative_steps = 0
             runner.kv_connector = SimpleNamespace(post_forward=lambda *args: None)
             runner.execute_model_state = State(
-                local, {}, {}, output, None, None, set(), None, None, None,
+                local, {}, {}, output,
+                [aux_outputs[rank], aux_outputs_2[rank]]
+                if draft_method == "dspark" else None,
+                None, set(), None, None, None,
             )
             persistent_buffer = model.get_mtp_target_hidden_states()
             runner.sample_tokens(None)
@@ -186,5 +200,6 @@ def test_native_mtp_propose_receives_global_pre_hc_residual(
             assert model.get_mtp_target_hidden_states() is persistent_buffer
             assert runner.pcp_manager is manager
             assert runner.execute_model_state is None
-            expected_calls = [] if manager._hidden_restore_idx is None else [4, 2]
+            expected_calls = ([] if manager._hidden_restore_idx is None or layout == "decode"
+                              else ([6, 10, 2] if draft_method == "dspark" else [4, 2]))
             assert calls == expected_calls  # no duplicate restore by native sampler
