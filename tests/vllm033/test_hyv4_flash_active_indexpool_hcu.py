@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real HIP tests of the active IndexPool package, not legacy/AST aliases.
 
-Run with HIP_VISIBLE_DEVICES=2 and an active source snapshot on PYTHONPATH.
+Run on the single logical device assigned by the device runner. By default,
+validate the installed Plugin; INDEXPOOL_ACTIVE_PACKAGE_ROOT can explicitly
+select a source snapshot for a separate source-only experiment.
 Missing HIP, runtime activation, provider ABI, or kernels is a failure, not skip.
 This suite validates arithmetic/provider contracts, not an installed model/wheel.
 """
 
 import hashlib
 import importlib
+from importlib import metadata
 import inspect
 import json
 import os
@@ -17,17 +20,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytestmark = pytest.mark.hcu
+
 
 @pytest.fixture(scope="session")
 def active():
-    assert os.environ.get("HIP_VISIBLE_DEVICES") == "2"
     assert torch.version.hip is not None and torch.cuda.is_available()
-    assert torch.cuda.device_count() == 1
+    assert torch.cuda.device_count() == 1, "Assign exactly one logical HCU device"
+    torch.cuda.set_device(0)
     device = torch.cuda.get_device_properties(0)
-    assert (device.pci_domain_id, device.pci_bus_id, device.pci_device_id) == (
-        0,
-        0x5E,
-        0,
+    print(
+        "INDEXPOOL_DEVICE=" + json.dumps(dict(
+            logical_device=0,
+            architecture=device.gcnArchName,
+            pci=[device.pci_domain_id, device.pci_bus_id, device.pci_device_id],
+            visibility={name: os.environ.get(name) for name in (
+                "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"
+            )},
+        ), sort_keys=True),
+        flush=True,
     )
     from hcu_adapter.bridges.vllm import hcu_runtime_plugin
 
@@ -62,11 +73,10 @@ def active():
     }
     assert modules["runtime"].is_hcu_platform()
     modules["runtime"].validate_flash_platform()
+    root_override = os.environ.get("INDEXPOOL_ACTIVE_PACKAGE_ROOT")
     expected = Path(
-        os.environ.get(
-            "INDEXPOOL_ACTIVE_PACKAGE_ROOT",
-            Path(__file__).resolve().parents[2] / "adapter_extension/src",
-        )
+        root_override if root_override is not None else
+        metadata.distribution("hcu-vllm-das-plugin").locate_file("")
     ).resolve()
     provenance = {}
     for name, module in modules.items():
