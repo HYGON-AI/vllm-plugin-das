@@ -15,7 +15,8 @@ from .hy4_ihc_launch import _device_arch
 from .moe.ct_w4a8_prepare import HcuCTHTPrepareAndFinalize, _check_quant
 from .quantization.hy4_ct_policy import is_hy4
 
-MIN_TOKENS = 2048
+# Preserve the measured small-input BF16 path while admitting normal PCP batches.
+MIN_TOKENS = 756
 logger = init_logger(f'vllm.{__name__}')
 
 

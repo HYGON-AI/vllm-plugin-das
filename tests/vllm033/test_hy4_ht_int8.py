@@ -120,6 +120,20 @@ def inputs(rows):
     return x, torch.ones((rows, 8), dtype=torch.float32), torch.zeros((rows, 8), dtype=torch.int64)
 
 
+@pytest.mark.parametrize('rows,want_int8', [
+    (378, False), (755, False), (756, True), (1134, True), (1512, True), (1890, True),
+])
+def test_wire_admits_measured_prefill_sizes(active, monkeypatch, rows, want_int8):
+    m, p, base, config = active
+    x, weights, ids = inputs(rows)
+    monkeypatch.setattr(base, 'prepare_async', lambda *a, **k: 'bf16')
+    monkeypatch.setattr(m, 'moe_kernel_quantize_input', lambda *a, **k:
+        (torch.empty_like(x, dtype=torch.int8), torch.ones((rows, 1), dtype=torch.float32)))
+    monkeypatch.setattr(p, '_do_dispatch', lambda **k: 'int8')
+    actual = p.prepare_async(x, weights, ids, 272, None, False, config)
+    assert actual == ('int8' if want_int8 else 'bf16')
+
+
 @pytest.mark.parametrize('offset', [-1,0,1])
 def test_wire_boundary_and_native_receiver_identity(active, monkeypatch, offset):
     m, p, base, config = active

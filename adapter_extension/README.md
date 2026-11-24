@@ -139,12 +139,18 @@ remain native.
 HY4 W4A8 PCP16 prefills can opt into per-token INT8 DeepEP HT transport with
 `VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_HT_INT8_DISPATCH=1` (default off).
 This quantizes source rows before dispatch; Core retains receive metadata,
-communication handles and finalize. Inputs below 2048 source tokens per rank
+communication handles and finalize. Inputs below 756 source tokens per rank
 keep BF16 transport. Admission requires gfx938, BF16, eager MRV2, synchronous
 scheduling, TP1/PP1/DP1/DCP1, HT16, and no DBO, ubatching, LoRA or online EPLB.
 The child or master can be disabled before restarting to retain the existing
 prepare path. CPU contracts and 16-rank transport/scale equivalence are covered;
 whole-model accuracy and serving performance are separate validation gates.
+
+The same HY4 PCP16 HT scope can opt into the legacy LightOp expert output
+gather with `HCU_VLLM_HY4_EXPERT_GATHER=1` (default off). Adapter owns the
+provider bridge; the owned expert instance retains the native permutation,
+GEMMs, activation and finalize. Disabling the child or custom-ops master
+restores native gather. No process-wide Core binding is changed.
 
 ## Standalone Step5 MTP configuration
 
