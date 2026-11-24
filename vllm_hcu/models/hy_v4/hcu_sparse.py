@@ -22,6 +22,7 @@ two kernel wrappers differ from the parent.
 
 import math
 import os
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 import torch
@@ -113,6 +114,31 @@ def _lightop_mapping_reuse_group_size(
     return metadata.max_query_len if uniform_width and pure_decode else 1
 
 
+# Upstream passes tensor slices, but not the batch metadata, to the BF16 kernel.
+# Scope the host routing decision to this invocation, including nested calls.
+_d576_prefill_impl = ContextVar("hyv4_d576_prefill_impl", default=None)
+
+
+def _long_context_prefill(metadata, common) -> bool:
+    """Conservative CPU estimate of TopK occupancy, never a GPU count readback."""
+    extra = metadata.fp8_extra_metadata
+    if (
+        extra is None
+        or metadata.fp8_use_mixed_batch
+        or extra.num_decodes != 0
+        or extra.num_prefills != metadata.num_reqs
+        or metadata.num_reqs == 0
+        or metadata.topk_tokens != 2048
+    ):
+        return False
+    # Use the authoritative host prefix, not an optimistic upper bound or
+    # total sequence length (which includes every query in this step).
+    prefix = getattr(common, "_num_computed_tokens_cpu", None)
+    if prefix is None or prefix.device.type != "cpu" or prefix.numel() < metadata.num_reqs:
+        return False
+    return bool((prefix[: metadata.num_reqs] >= metadata.topk_tokens).all())
+
+
 class HYV4FlashMLASparseMetadataBuilder(HcuFlashMLASparseMetadataBuilder):
     """Mark only pure multi-token decode batches as LightOp reuse groups."""
 
@@ -127,6 +153,12 @@ class HYV4FlashMLASparseMetadataBuilder(HcuFlashMLASparseMetadataBuilder):
             common_attn_metadata,
             fast_build,
         )
+        if os.getenv("VLLM_HCU_HYV4_D576_MLS", "0") == "1":
+            metadata.hyv4_long_d576_prefill = (
+                self.vllm_config.model_config.enforce_eager
+                and self.vllm_config.parallel_config.decode_context_parallel_size == 1
+                and _long_context_prefill(metadata, common_attn_metadata)
+            )
         metadata.lightop_kv_group_size = _lightop_mapping_reuse_group_size(
             metadata,
             common_attn_metadata.is_prefilling,
@@ -191,8 +223,7 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
         if self._resident_d576:
             from vllm_hcu.platforms.hcu import on_gfx938
 
-            if not on_gfx938():
-                raise ValueError("HY4 D576 resident MLS requires gfx938")
+            self._resident_d576 = on_gfx938()
         self._dcp_sinks: torch.Tensor | None = None
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -445,8 +476,6 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
         )
 
         out = self._bf16_flash_mla_kernel(q_flat, kv_bf16, new_idx)
-        if self._resident_d576:
-            logger.info_once("HY4 D576 MLS consumed dequantized FP8 decode slots")
         out = out.reshape(num_tokens_b, seq_len, num_heads, out.shape[-1])
         return out, None
 
@@ -501,19 +530,20 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
             q = q_padded
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        if self._resident_d576 and num_tokens:
-            if not (
-                q.shape[1:] == (64, 576)
-                and kv_c_and_k_pe_cache.shape[1:] == (1, 576)
-                and kv_c_and_k_pe_cache.shape[0] > 0
-                and topk_indices.shape[-1] == 2048
-                and q.dtype == kv_c_and_k_pe_cache.dtype == torch.bfloat16
-                and topk_indices.dtype == torch.int32
-                and q.stride(-1) == kv_c_and_k_pe_cache.stride(-1) == topk_indices.stride(-1) == 1
-                and min(q.stride(0), q.stride(1), topk_indices.stride(0)) > 0
-                and 0 < kv_c_and_k_pe_cache.stride(0) < 8192
-            ):
-                raise ValueError("Incompatible query, KV, or indices for HY4 D576 MLS")
+        if (
+            self._resident_d576
+            and _d576_prefill_impl.get() is self
+            and num_tokens > 0
+            and q.shape[1:] == (64, 576)
+            and kv_c_and_k_pe_cache.shape[1:] == (1, 576)
+            and kv_c_and_k_pe_cache.shape[0] >= 2048
+            and topk_indices.shape[-1] == 2048
+            and q.dtype == kv_c_and_k_pe_cache.dtype == torch.bfloat16
+            and topk_indices.dtype == torch.int32
+            and q.stride(-1) == kv_c_and_k_pe_cache.stride(-1) == topk_indices.stride(-1) == 1
+            and min(q.stride(0), q.stride(1), topk_indices.stride(0)) > 0
+            and 0 < kv_c_and_k_pe_cache.stride(0) < 8192
+        ):
             output, lse = resident_d576_with_sink(
                 q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale,
                 attn_sink, topk_length,
@@ -553,6 +583,13 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
         layer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.dcp_world_size <= 1:
+            if self._resident_d576:
+                selected = self if getattr(attn_metadata, "hyv4_long_d576_prefill", False) else None
+                token = _d576_prefill_impl.set(selected)
+                try:
+                    return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+                finally:
+                    _d576_prefill_impl.reset(token)
             return super().forward_mqa(
                 q,
                 kv_c_and_k_pe_cache,
