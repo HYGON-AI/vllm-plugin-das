@@ -220,13 +220,14 @@ def test_pure_ll_initializes_once_before_graph_capture(monkeypatch, cold_capture
         assert buffer._hcu_step5_ll_initialized is True
 
 
-@pytest.mark.parametrize("step5_owner", [False, True])
+@pytest.mark.parametrize("step5_owner", [None, False, True])
 def test_execution_keeps_construction_owner_after_config_context_exits(monkeypatch, step5_owner):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm_hcu.model_executor.layers.fused_moe.experts import dpsk_v4_deep_gemm_moe as experts
 
     instance = object.__new__(experts.DeepEPDeepGemmMaskedExperts)
-    instance._step5_ll = step5_owner
+    if step5_owner is not None:
+        instance._step5_ll = step5_owner
     monkeypatch.setattr(experts, "is_step5_tp4_deepep_ll", lambda: False)
     monkeypatch.setattr(experts.henvs, "optional_custom_op_enabled", lambda value: bool(value))
     args = dict(output=None, hidden_states=None, w1=None, w2=None, topk_weights=None,

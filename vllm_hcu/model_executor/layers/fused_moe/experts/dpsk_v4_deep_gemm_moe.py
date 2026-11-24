@@ -648,10 +648,9 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         del topk_weights, expert_map
         del a2_scale, apply_router_weight_on_input
         del workspace13
-        if not (activation == MoEActivation.SILU or (
-            activation == MoEActivation.SWIGLUSTEP
-            and self._step5_ll and henvs.optional_custom_op_enabled(True)
-        )):
+        step5_ll = getattr(self, "_step5_ll", False) and henvs.optional_custom_op_enabled(True)
+        step5_swiglustep = step5_ll and activation == MoEActivation.SWIGLUSTEP
+        if not (activation == MoEActivation.SILU or step5_swiglustep):
             raise NotImplementedError(
                 "DeepEP DeepGEMM LL requires SiLU or the Step5 SWIGLUSTEP route, "
                 f"got {activation.value}."
@@ -663,7 +662,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         if self.w1_scale is None or self.w2_scale is None:
             raise RuntimeError("DeepEP DeepGEMM LL requires weight scales")
         use_int8 = bool(self.quant_config.use_int8_w8a8)
-        if use_int8 and activation == MoEActivation.SWIGLUSTEP:
+        if use_int8 and step5_swiglustep:
             raise NotImplementedError("Step5 SWIGLUSTEP requires channel-FP8 experts")
         if self._deepgemm_w13 is None or self._deepgemm_w2 is None:
             raise RuntimeError(
@@ -679,7 +678,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         local_num_experts, max_tokens, _ = hidden_states.shape
         _, _, N, K, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
         dispatch_tokens = topk_ids.size(0)
-        if (self._step5_ll and henvs.optional_custom_op_enabled(True)
+        if (step5_ll
                 and dispatch_tokens > 0 and dispatch_tokens % 4 == 0):
             dispatch_tokens //= 4
         expected_m = max_tokens
@@ -735,7 +734,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
                     tokens_per_expert=expert_num_tokens,
                 )
         else:
-            if activation == MoEActivation.SWIGLUSTEP:
+            if step5_swiglustep:
                 from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
                     ep_masked_swiglustep_quant_deepgemm,
                 )
