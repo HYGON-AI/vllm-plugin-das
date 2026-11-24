@@ -8,7 +8,8 @@ Numeric tests use real Torch tensors, per-token CPU FP8 round trips on replicate
 projections, and real Gloo all-reduces observed by a communication spy. This does
 not validate native expert quantization, accelerator kernels, or model serving.
 
-Set HYV4_CORE033_ROOT if the pinned Core checkout is not a sibling directory.
+Use the CI's VLLM_TARGET_ROOT or the installed Core by default. Set
+HYV4_CORE033_ROOT to explicitly test a different pinned Core source tree.
 This file can run alone with pytest --confcutdir=<this file's directory>.
 """
 
@@ -30,7 +31,14 @@ from torch import distributed as dist, multiprocessing as mp, nn
 from torch.nn import functional as F
 
 REPO = Path(__file__).resolve().parents[2]
-CORE = Path(os.environ.get("HYV4_CORE033_ROOT", REPO.parent / "vllm-core-033"))
+_core_override = os.environ.get("HYV4_CORE033_ROOT") or os.environ.get("VLLM_TARGET_ROOT")
+if _core_override:
+    CORE = Path(_core_override)
+else:
+    _core_spec = importlib.util.find_spec("vllm")
+    if _core_spec is None or _core_spec.origin is None:
+        raise RuntimeError("Install Core or set HYV4_CORE033_ROOT/VLLM_TARGET_ROOT")
+    CORE = Path(_core_spec.origin).resolve().parent.parent
 ACTIVE = REPO / "adapter_extension/src/hcu_vllm_das/models/hy_v4_flash/core_moe.py"
 CORE_MOE = CORE / "vllm/models/hy_v4/nvidia/moe.py"
 FACTORY = CORE / "vllm/model_executor/layers/fused_moe/layer.py"

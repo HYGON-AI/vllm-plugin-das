@@ -143,3 +143,43 @@ The module SHA256 tested on CPU and HIP is
 The GPU test SHA256 is
 `7d3bedb023bf539c23370fbe21558496405076b472256f6face92f9f6264db28`.
 These are exact source snapshots, not a full latest-head model qualification.
+
+## Current CI entry
+
+`tests/vllm033/test_hisparse_owner_gpu_lifecycle_hcu.py` now delegates the
+complete cohort to `_hisparse_owner_gpu_lifecycle.py` in a fresh interpreter.
+The existing authorized device tier sets `VLLM033_HCU_TEST=1`; the child
+requires exactly one visible HIP device and records its PCI identity. The
+32MiB allocator cap and original stream/reset assertions remain child-local.
+Standalone `HCU_OWNER_GPU_LIFECYCLE=1` preserves the original physical GPU2
+visibility and PCI checks. Missing authorization fails rather than skips.
+The marked entry is absent from portable file discovery and present in the
+existing device tier. This routing change does not requalify the historical
+12-case result above; the new source/installed combination needs its own run.
+
+The follow-up over `231fb95595dd` was validated on 2026-11-24:
+
+- All 114 stdlib CI-control tests passed. An independent comparison of the
+  original and corrected runners' complete file lists confirms that only the
+  old standalone owner file leaves portable discovery and its marked entry
+  enters the device tier. Source and gfx938 selections are unchanged.
+- The complete MoE CPU/Gloo file passed 29 tests using the installed Core
+  default, and again using `VLLM_TARGET_ROOT`. These are the same 29 cases,
+  not 58 distinct tests. The original missing-sibling failure is retained;
+  an explicit nonexistent override still fails despite a valid CI root.
+- A real isolated wheel was built and installed. All 144 production payloads
+  match the submitted source; this follow-up changes no production payload.
+- The marked owner entry passed on one assigned gfx936 device, and its child
+  passed all original 12 tests, zero failures/errors/skips. The child reported
+  PCI `0000:09:00.0`, peak tensor allocation 1201664 bytes and reservation
+  33554432 bytes. The independent controller exited naturally in49.83s;
+  14 Torch JIT deprecation warnings remain. The outer one-case report and
+  child 12-case report are separate and are not summed as13 native cases.
+
+That component environment uses Core0.33.0/98a0985, Adapter0.5.22+hcu.1,
+Torch2.13.0/DTK2610 and Plugin0.33.0 with private writable caches and read-only
+dependency/source mounts. Earlier host-runner spawn/bootstrap and inherited
+metadata setup failures were retained and corrected in the orchestration;
+no original product assertion was removed to obtain these results. This is
+not full latest-Core/model, native HiSparse initialization, HiSparse+DFly,
+HumanEval, Graph/performance or gfx836 qualification.

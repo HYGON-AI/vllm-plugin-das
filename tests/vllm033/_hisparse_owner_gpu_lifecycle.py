@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Opt-in physical GPU2 HIP hot-state lifecycle, NOT native init/attention.
+"""Isolated HIP hot-state lifecycle, NOT native init/attention.
+
+The marked CI entry runs this complete suite in a fresh interpreter on its
+single assigned device. Standalone HCU_OWNER_GPU_LIFECYCLE=1 retains the
+original physical-GPU2/PCI binding. Neither route enables itself by default.
 
 Actual Core033 runtime/group TYPES are allocated with __new__, not __init__.
 Real Torch HIP tensors, streams, events and ORIGINAL Core reset are used. No
@@ -12,12 +16,15 @@ from __future__ import annotations
 from contextlib import contextmanager
 import ctypes
 from importlib import import_module, util
+import json
 import os
 from pathlib import Path
 import sys
 
 import pytest
 import torch
+
+pytestmark = pytest.mark.hcu
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "adapter_extension/src/hcu_vllm_das/hisparse_owner_contract.py"
@@ -28,18 +35,21 @@ STATE = ("lru_init", "device_global_indices", "lru_slots", "swap_stats")
 
 @pytest.fixture(scope="module")
 def hip():
-    if os.environ.get("HCU_OWNER_GPU_LIFECYCLE") != "1":
-        pytest.skip("requires explicit isolated physical GPU2 authorization")
-    assert os.environ.get("ROCR_VISIBLE_DEVICES") == "2"
-    assert os.environ.get("HIP_VISIBLE_DEVICES") == "0"
-    assert os.environ.get("CUDA_VISIBLE_DEVICES") == "0"
+    standalone = os.environ.get("HCU_OWNER_GPU_LIFECYCLE") == "1"
+    assert standalone or os.environ.get("VLLM033_HCU_TEST") == "1", (
+        "requires the authorized device tier or explicit physical GPU2 selection")
+    if standalone:
+        assert os.environ.get("ROCR_VISIBLE_DEVICES") == "2"
+        assert os.environ.get("HIP_VISIBLE_DEVICES") == "0"
+        assert os.environ.get("CUDA_VISIBLE_DEVICES") == "0"
     # Establish the physical PCI identity before initializing a Torch context.
     library = ctypes.CDLL("libamdhip64.so")
     bus = ctypes.create_string_buffer(64)
     assert library.hipDeviceGetPCIBusId(bus, 64, 0) == 0
-    assert bus.value.decode().lower() == "0000:5e:00.0"
+    if standalone:
+        assert bus.value.decode().lower() == "0000:5e:00.0"
     assert torch.version.hip and torch.cuda.device_count() == 1
-    device = torch.device("cuda:0")  # This logical 0 is PHYSICAL GPU2 only.
+    device = torch.device("cuda:0")
     free, total = torch.cuda.mem_get_info(device)
     if free < 512 * 1024**2:
         pytest.fail(f"RESOURCE_STOP: only {free} bytes free, no test allocation")
@@ -52,7 +62,11 @@ def hip():
     module = util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    RESOURCE_RECORD.update(physical_gpu=2, logical_gpu=0, pci_bus=bus.value.decode(),
+    RESOURCE_RECORD.update(physical_gpu=2 if standalone else None,
+                           logical_gpu=0, pci_bus=bus.value.decode(),
+                           visibility={name: os.environ.get(name) for name in (
+                               "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
+                               "CUDA_VISIBLE_DEVICES")},
                            free_before=free, total=total, allocator_limit=32*1024**2)
     yield core, module, device
     assert core.HiSparseRuntime.bind_hot_cache is original_bind
@@ -62,6 +76,7 @@ def hip():
                            free_after=torch.cuda.mem_get_info(device)[0])
     assert RESOURCE_RECORD["peak_allocated"] < 8 * 1024**2
     assert RESOURCE_RECORD["peak_reserved"] <= 32 * 1024**2
+    print("HISPARSE_OWNER_GPU_RESOURCE=" + json.dumps(RESOURCE_RECORD, sort_keys=True))
 
 
 def runtime(core, device, stride=4096, union=128):
