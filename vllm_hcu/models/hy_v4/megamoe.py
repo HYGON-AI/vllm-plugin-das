@@ -331,7 +331,7 @@ def install_hy4_w4a8_mega_kernel(method, layer):
     method.moe_kernel = Hy4MegaKernel(mega, packed, buffer, ep, layer.swiglu_limit)
     method._hy4_static_route = method.moe_kernel.route_static if os.getenv("HY4_MEGA_FUSE_EPLB") == "1" else None
     if ep.rank_in_group == 0:
-        init_logger("vllm.hy4.megamoe").info_once(
-            "Installed HY4 W4A8 MegaMoE: revision=%s capacity=%d",
-            git_hash, buffer.num_max_tokens_per_rank,
+        init_logger("vllm.hy4.megamoe").info(
+            "Installed HY4 W4A8 MegaMoE: layer=%s revision=%s capacity=%d",
+            method.layer_name, git_hash, buffer.num_max_tokens_per_rank,
         )
