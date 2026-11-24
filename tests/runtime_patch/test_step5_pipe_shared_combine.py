@@ -11,6 +11,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import Context
 import ctypes
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import MethodType, ModuleType, SimpleNamespace
@@ -59,6 +60,31 @@ def _light_module(path, name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("dense_tuning", ["0", "1"])
+def test_output_pool_accepts_both_dense_algorithm_selectors(monkeypatch, dense_tuning):
+    monkeypatch.setenv("HCU_DP_MOE_PIPE_MIN_TOKENS", "16384")
+    monkeypatch.setenv("HCU_DBO_MIN_TOKENS", "4096")
+    monkeypatch.setenv("HCU_EP_DIRECT_SUM", "16384")
+    monkeypatch.setenv("HCU_DP_MOE_PIPE_UNIFORM", "1")
+    monkeypatch.setenv("HCU_STEP5_DENSE_TUNING", dense_tuning)
+    monkeypatch.setenv("EP_FUSED_MOE_CHUNK", "65536")
+    monkeypatch.delenv("HCU_STEP5_TUNING_CONFIG", raising=False)
+    validate_config = _source(
+        MOE + "dp_pipe_output_pool.py", {"_validate_config"}, {"os": os}
+    )["_validate_config"]
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=16, tensor_parallel_size=1,
+            prefill_context_parallel_size=1, enable_expert_parallel=True,
+            all2all_backend="allgather_reducescatter",
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=5100273664),
+        speculative_config=None,
+    )
+    assert validate_config(config) == 2 * 16 * 8192
 
 
 def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,

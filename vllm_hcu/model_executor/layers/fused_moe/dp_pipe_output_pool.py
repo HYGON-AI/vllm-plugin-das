@@ -211,8 +211,7 @@ def _validate_config(config):
     if os.environ.get("EP_FUSED_MOE_CHUNK") == "65536" and cc.kv_cache_memory_bytes != 5100273664:
         raise RuntimeError("EP64 requires the fixed 4.75GiB KV recipe")
     expected = {"HCU_DP_MOE_PIPE_MIN_TOKENS": "16384", "HCU_DBO_MIN_TOKENS": "4096",
-                "HCU_EP_DIRECT_SUM": "16384", "HCU_DP_MOE_PIPE_UNIFORM": "1",
-                "HCU_STEP5_DENSE_TUNING": "1"}
+                "HCU_EP_DIRECT_SUM": "16384", "HCU_DP_MOE_PIPE_UNIFORM": "1"}
     if (any(os.environ.get(k) != v for k, v in expected.items())
             or os.environ.get("EP_FUSED_MOE_CHUNK") not in ("16384", "32768", "65536")):
         raise RuntimeError("Step5 output-pool settings differ from the supported profile")
