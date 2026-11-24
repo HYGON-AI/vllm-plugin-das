@@ -168,14 +168,35 @@ def _is_hyv4_vl_mooncake_store(vllm_config: object) -> bool:
 
 def _is_hyv4_vl_mooncake_pd_store_producer(vllm_config: object) -> bool:
     """Allow the supported PCP producer to publish to P2P and Store."""
+    model_config = getattr(vllm_config, "model_config", None)
     transfer = getattr(vllm_config, "kv_transfer_config", None)
-    transfer_repr = repr(transfer)
-    return (
-        getattr(transfer, "kv_connector", None) == "MultiConnector"
-        and str(getattr(transfer, "kv_role", None)) == "kv_producer"
-        and "MooncakeConnector" in transfer_repr
-        and "MooncakeStoreConnector" in transfer_repr
-    )
+    if (
+        getattr(model_config, "architectures", None)
+        != ["HYV4VLForConditionalGeneration"]
+        or getattr(transfer, "kv_connector", None) != "MultiConnector"
+        or getattr(transfer, "kv_role", None) != "kv_producer"
+        or getattr(transfer, "kv_connector_module_path", None) is not None
+    ):
+        return False
+
+    extra_config = getattr(transfer, "kv_connector_extra_config", None)
+    connectors = extra_config.get("connectors") if isinstance(extra_config, dict) else None
+    if not isinstance(connectors, list) or len(connectors) != 2:
+        return False
+
+    expected = {"MooncakeConnector", "MooncakeStoreConnector"}
+    for child in connectors:
+        if (
+            not isinstance(child, dict)
+            or child.get("kv_role") != "kv_producer"
+            or child.get("kv_connector_module_path") is not None
+        ):
+            return False
+        name = child.get("kv_connector")
+        if not isinstance(name, str) or name not in expected:
+            return False
+        expected.remove(name)
+    return True
 
 
 def _is_hyv4_vl_mooncake_p2p_producer(vllm_config: object) -> bool:

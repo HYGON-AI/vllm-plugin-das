@@ -127,6 +127,33 @@ class VLConfigGateTests(unittest.TestCase):
         )
         self.assertIs(self.validate(current), True)
 
+    def test_pcp_multi_connector_rejects_unsupported_configs(self):
+        p2p = {"kv_connector": "MooncakeConnector", "kv_role": "kv_producer"}
+        store = {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_producer"}
+        for architecture, parent_module, children in (
+            (TEXT, None, [p2p, store]),
+            (VL, "custom.connector", [p2p, store]),
+            (VL, None, [dict(p2p, kv_role="kv_consumer"), store]),
+            (VL, None, [p2p, dict(store, kv_role="kv_consumer")]),
+            (VL, None, [p2p, dict(store, kv_connector_module_path="custom.connector")]),
+            (VL, None, [p2p, dict(store, kv_connector="OtherConnector",
+                                unrelated="MooncakeStoreConnector")]),
+            (VL, None, [p2p, store, p2p]),
+        ):
+            with self.subTest(architecture=architecture, module=parent_module,
+                              children=children):
+                current = config()
+                current.model_config.architectures = [architecture]
+                current.model_config.is_multimodal_model = architecture == VL
+                current.cache_config.cache_dtype = "fp8_e4m3"
+                current.kv_transfer_config = NS(
+                    kv_connector="MultiConnector", kv_role="kv_producer",
+                    kv_connector_module_path=parent_module,
+                    kv_connector_extra_config={"connectors": children},
+                )
+                with self.assertRaisesRegex(ValueError, "P/D disaggregation"):
+                    self.validate(current)
+
     def test_vl_mooncake_p2p_non_eplb_pcp16_is_admitted(self):
         current = config()
         current.parallel_config.enable_eplb = False
@@ -357,6 +384,13 @@ class VLFixedRouteTests(unittest.TestCase):
                     set_field(moe, path, value)
                     with self.assertRaises(ValueError):
                         self.run_route(route, moe)
+        self.assertEqual(self.calls, [])
+
+    def test_vl_dp16_native_mtp_stays_disabled(self):
+        moe = self.moe("ll")
+        moe._hcu_vllm_config.speculative_config = NS(method="mtp")
+        with self.assertRaisesRegex(ValueError, "does not support MTP"):
+            self.run_route("ll", moe)
         self.assertEqual(self.calls, [])
 
     def test_fixed_route_topology_and_platform_guards(self):

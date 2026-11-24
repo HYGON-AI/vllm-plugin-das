@@ -86,7 +86,13 @@ def test_kv_factory_registers_hcu_connectors_lazily(monkeypatch):
     class MooncakeConnector:
         pass
 
+    class MultiKVConnectorPromMetrics:
+        def observe(self, transfer_stats_data, engine_idx=0):
+            return transfer_stats_data, engine_idx
+
     def fake_import(name):
+        if name == "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector":
+            return SimpleNamespace(MultiKVConnectorPromMetrics=MultiKVConnectorPromMetrics)
         imports.append(name)
         return SimpleNamespace(MooncakeConnector=MooncakeConnector)
 
@@ -100,6 +106,9 @@ def test_kv_factory_registers_hcu_connectors_lazily(monkeypatch):
         assert loader._hcu_connector_target == expected
     assert factory._registry["MooncakeConnector"]() is MooncakeConnector
     assert imports == [patch_kv_connector_factory._HCU_CONNECTORS["MooncakeConnector"][0]]
+    metrics = MultiKVConnectorPromMetrics()
+    metrics._prom_metrics = {"p2p": object()}
+    assert metrics.observe({"p2p": 1, "store": 2}, engine_idx=3) == ({"p2p": 1}, 3)
     assert patch_kv_connector_factory.apply_to_module(module) is False
 
 

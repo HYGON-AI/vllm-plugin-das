@@ -321,15 +321,9 @@ class HYV4VLForConditionalGeneration(
             raise ValueError(
                 "HYV4VL requires rmsnorm_mlp_adapter without extra tokens or post norm"
             )
-        parallel = vllm_config.parallel_config
-        mtp_topology = (
-            (parallel.prefill_context_parallel_size == 16
-             and parallel.data_parallel_size == 1)
-            or (parallel.prefill_context_parallel_size == 1
-                and parallel.data_parallel_size == 16)
-        )
-        if vllm_config.speculative_config is not None and not mtp_topology:
-            raise ValueError("HYV4VL MTP supports PCP16 or DP16 paths")
+        if (vllm_config.speculative_config is not None
+                and vllm_config.parallel_config.prefill_context_parallel_size != 16):
+            raise ValueError("HYV4VL MTP requires the standalone PCP16 path")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         from vllm_hcu.patch.platform.core_fix.patch_vllm_config import (
             validate_hyv4_vl_pcp_quantization,
