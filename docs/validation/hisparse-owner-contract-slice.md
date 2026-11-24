@@ -66,7 +66,8 @@ one slab: general packed/interleaved layouts are not qualified here.
 
 ## Actual CPU results and limitations
 
-Remote: `zhangbin@10.16.1.10`, container `zb_028_faban_torch_1119`, Torch 2.13.0.
+The CPU tests ran in an internal v0.33 validation container with Torch 2.13.0.
+Connection and container identifiers are retained in external validation evidence.
 **45 passed / 0 failed / 0 skipped** in the final remote run.
 
 The suite imports installed Core033 and calls its original bind/PagedCacheView
