@@ -1,10 +1,16 @@
 # HYV4 Flash on vLLM 0.33 (candidate)
 
-The legacy source registration declares `HYV4FlashForCausalLM` and
-`HYV4FlashVLForConditionalGeneration`. The active v0.33 plugin now delivers
-Flash configuration metadata through an Adapter extension, but these model
-implementations and registrations are still absent from that wheel. The
-integration blocker below must be fixed before claiming HCU serving support.
+The active v0.33 wheel now delivers opt-in `HYV4FlashForCausalLM` and
+`HYV4FlashVLForConditionalGeneration` registration through
+`das_hcu_hyv4_flash_model`. Select the `hyv4-flash-model` capability on pinned
+vLLM 0.33.0. Unselected discovery does not import the model or claim ownership.
+The separate optimized HY4/static-EPLB owners remain intact. Configuration and
+registry health do not certify checkpoint accuracy or performance; the dated
+component/runtime evidence below retains its original scope. Current aligned
+Eager and FULL_AND_PIECEWISE text-only accuracy runs are being qualified with
+separate immutable wheel receipts. INT4/token-INT8 W4A8 remains eager TP only;
+active HiSparse runtime, including orphan configs, DFly and Graph, stays closed
+until independently qualified.
 
 ### Configuration port
 

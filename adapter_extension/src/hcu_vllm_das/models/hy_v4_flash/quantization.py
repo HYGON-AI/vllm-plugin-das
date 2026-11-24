@@ -263,6 +263,8 @@ def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
             raise ValueError(
                 "Channel W4A8 requires HCU and flash_w4a8_backend=adapter_reference"
             )
+        if not get_current_vllm_config().model_config.enforce_eager:
+            raise NotImplementedError("Channel W4A8 reference requires eager TP-only execution")
         if for_moe:
             from .w4a8 import HYV4FlashW4A8Config
 

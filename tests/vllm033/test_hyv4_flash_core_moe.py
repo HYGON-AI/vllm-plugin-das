@@ -8,8 +8,7 @@ Numeric tests use real Torch tensors, per-token CPU FP8 round trips on replicate
 projections, and real Gloo all-reduces observed by a communication spy. This does
 not validate native expert quantization, accelerator kernels, or model serving.
 
-Use the CI's VLLM_TARGET_ROOT or the installed Core by default. Set
-HYV4_CORE033_ROOT to explicitly test a different pinned Core source tree.
+Use HYV4_CORE033_ROOT/VLLM_TARGET_ROOT to override the installed Core source.
 This file can run alone with pytest --confcutdir=<this file's directory>.
 """
 
@@ -691,3 +690,39 @@ def test_quant_config_is_prepared_for_dense_and_moe(monkeypatch):
     assert h.active._check_quantization(config, None) is sentinel
     assert h.active._check_quantization(config, None, for_moe=True) is sentinel
     assert calls == [(config, None, False), (config, None, True)]
+
+
+@pytest.mark.parametrize("eager", [False,True])
+def test_channel_w4a8_requires_eager_at_quantization_boundary(monkeypatch,eager):
+    h = _Harness(monkeypatch)
+    current = SimpleNamespace(parallel_config=h.parallel,lora_config=None,
+                              model_config=SimpleNamespace(enforce_eager=eager))
+    monkeypatch.setattr(sys.modules["vllm.config"],"get_current_vllm_config",lambda:current)
+    ct_type = sys.modules["vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors"].CompressedTensorsConfig
+    quant = ct_type()
+    quant.kv_cache_scheme=quant.transform_config=quant.online_quantization_config=None
+    quant.quant_format="pack-quantized"
+    def group(bits):
+        return dict(targets=["Linear"],format="pack-quantized" if bits==4 else "int-quantized",
+                    weights=dict(num_bits=bits,type="int",strategy="channel",symmetric=True,dynamic=False),
+                    input_activations=dict(num_bits=8,type="int",strategy="token",symmetric=True,dynamic=True))
+    quant.config=dict(quant_method="compressed-tensors",format="pack-quantized",
+                      quantization_status="compressed",config_groups={"int4":group(4),"int8":group(8)})
+    runtime=ModuleType("hcu_vllm_das.models.hy_v4_flash.runtime")
+    runtime.is_hcu_platform=lambda:True
+    monkeypatch.setitem(sys.modules,runtime.__name__,runtime)
+    config=_config(flash_w4a8_backend="adapter_reference")
+    if eager:
+        assert h.quantization.prepare_flash_quant_config(config,quant) is quant
+    else:
+        with pytest.raises(NotImplementedError,match="eager"):
+            h.quantization.prepare_flash_quant_config(config,quant)
+
+
+def test_fp8_quantization_retains_graph_admission(monkeypatch):
+    h=_Harness(monkeypatch)
+    current=SimpleNamespace(parallel_config=h.parallel,lora_config=None,
+                            model_config=SimpleNamespace(enforce_eager=False))
+    monkeypatch.setattr(sys.modules["vllm.config"],"get_current_vllm_config",lambda:current)
+    quant=h.fp8_config()
+    assert h.quantization.prepare_flash_quant_config(_config(),quant,for_moe=True) is quant
