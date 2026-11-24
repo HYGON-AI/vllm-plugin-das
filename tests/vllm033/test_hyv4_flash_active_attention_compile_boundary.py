@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention compile-boundary contracts; NOT GPU/serving acceptance.
 
-Default: stdlib-only AST contracts and execution of the exact binder AST with
-explicit configuration doubles. Opt in with HCU_HYV4_ATTENTION_NATIVE_CPU=1 in
-an environment with real Torch/Core033 and the production plugin on PYTHONPATH.
+Installed portable CI runs the AST contracts and the real native-CPU boundary
+case by default with Torch/Core033 and the production plugin installed. A
+stdlib-only local check can select PortableAttentionBoundaryContracts explicitly.
 The native lane spawns a fresh process, hides every GPU, imports the actual
 production module, and adds only this op's CPU dispatch implementation there.
 Context/owner/configuration doubles are explicitly labeled; no attention kernel,
@@ -33,7 +33,6 @@ ARGS = ["hidden_states", "q_c", "positions", "q", "kv_c_normed", "k_pe",
 GPU_MASKS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
              "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL",
              "NVIDIA_VISIBLE_DEVICES")
-NATIVE_ENV = "HCU_HYV4_ATTENTION_NATIVE_CPU"
 CHILD_ENV = "_HCU_HYV4_ATTENTION_CPU_CHILD"
 
 
@@ -246,8 +245,6 @@ class PortableAttentionBoundaryContracts(unittest.TestCase):
                     self.assertIsNone(layer._hcu_flash_attention_owner())
 
 
-@unittest.skipUnless(os.environ.get(NATIVE_ENV) == "1",
-                     "opt-in real Torch/Core CPU boundary lane (not GPU acceptance)")
 class NativeAttentionBoundaryContracts(unittest.TestCase):
     def test_real_production_op_fake_fullgraph_and_live_metadata_in_isolated_cpu_child(self):
         environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
