@@ -342,3 +342,22 @@ merge2 and spatial compression2 must resize to192×192, not remain224×224.
 The video alignment regressions exercise production preprocessing definitions
 with real CPU Torch frames and isolated resize/result-container shells; they
 do not qualify the installed processor, multimodal dispatcher or model.
+
+## Active Engram compilation boundary candidate (2026-11-24)
+
+Active Flash hash preparation uses an output-mutating CUDA/Meta custom op.
+It resolves the hash state from the current engine's first attention layer
+through paired weak references. The per-engine VLLM_COMPILE splitting list
+retains existing entries and adds this leaf: PIECEWISE reads live metadata;
+FULL records the GPU work and persistent inputs. Fake propagation reads no
+owner or runtime metadata. No production CPU dispatch is installed.
+
+The original prepare_hashes/lookup math is unchanged. An actual-wrapper CPU
+witness reproduced profile metadata=None freezing into all -1 hashes; the
+new boundary passed the same cached-FX replay checks, schema/Fake, owner
+isolation/lifetime and splitting-list checks. One actual HIP case additionally
+passed three live FX hash replays and three changed-input HIP Graph replays
+with the existing NgramHashState implementation and padded rows. These are
+boundary/hash component results, not final full-model accuracy acceptance.
+The final required deployment remains FULL_AND_PIECEWISE; complete paired
+Eager/Graph quality and performance validation is separate.

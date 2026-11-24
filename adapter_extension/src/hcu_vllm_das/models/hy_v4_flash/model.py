@@ -229,6 +229,9 @@ class HYV4FlashModel(HYV4ModelWithFactories):
             self.engram_hash = FlashNgramHashState(
                 self.config, dummy=vllm_config.load_config.load_format == "dummy"
             )
+            self.engram_hash.bind_attention_owner(
+                self.layers[0].self_attn.mla_attn, vllm_config
+            )
             for layer_id in self.config.engram_layer_ids:
                 self.layers[layer_id - 1].engram_layer = FlashEngram(
                     vllm_config,

@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Flash frozen n-gram embeddings with TP head sharding and V2 lookback."""
 
+from contextlib import nullcontext
+from weakref import ref
+
 import numpy as np
 import torch
 from torch import nn
@@ -12,7 +15,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.config import CompilationMode
 from vllm.forward_context import get_forward_context
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -22,6 +27,54 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .engram_ops import get_engram_cpu_offload, lookup_rows
 
 logger = init_logger(__name__)
+
+_FLASH_ENGRAM_OP = "vllm::hcu_hyv4_flash_engram_hashes"
+
+
+@eager_break_during_capture
+def _flash_engram_hashes_impl(
+    input_ids: torch.Tensor,
+    lookback: torch.Tensor | None,
+    layer_name: str,
+    output: torch.Tensor,
+) -> None:
+    context = get_forward_context()
+    layer = context.no_compile_layers[layer_name]
+    owner_ref = getattr(layer, "_hcu_flash_engram_hash_owner", None)
+    owner = owner_ref() if owner_ref is not None else None
+    attention_ref = getattr(owner, "_engram_attention_owner_ref", None)
+    if owner is None or attention_ref is None or attention_ref() is not layer:
+        raise RuntimeError("Flash Engram leaf has no live matching owner")
+    metadata = context.attn_metadata
+    # CUDA dispatch is production-only. The CPU arm is exercised solely by
+    # the isolated test's explicit CPU registration, never by model admission.
+    device_scope = (
+        torch.cuda.device(input_ids.device) if input_ids.is_cuda else nullcontext()
+    )
+    with device_scope:
+        output.copy_(owner.prepare_hashes(
+            input_ids, lookback,
+            metadata[layer_name] if isinstance(metadata, dict) else None,
+        ))
+
+
+def _flash_engram_hashes_fake(
+    input_ids: torch.Tensor,
+    lookback: torch.Tensor | None,
+    layer_name: str,
+    output: torch.Tensor,
+) -> None:
+    # Output is allocated by the caller. Fake propagation must not read owners,
+    # metadata or profile branches, nor publish a production CPU implementation.
+    return None
+
+
+direct_register_custom_op(
+    op_name="hcu_hyv4_flash_engram_hashes",
+    op_func=_flash_engram_hashes_impl,
+    mutates_args=["output"],
+    fake_impl=_flash_engram_hashes_fake,
+)
 
 
 class FlashEngramLayout:
@@ -142,15 +195,33 @@ class FlashNgramHashState(NgramHashState):
             )
             self.pad_id = self.layout.token_map[self.layout.pad_token_id]
 
-    @eager_break_during_capture
-    def prepare_hashes_with_output(self, input_ids, lookback, layer_name, output):
-        metadata = get_forward_context().attn_metadata
-        output.copy_(
-            self.prepare_hashes(
-                input_ids,
-                lookback,
-                metadata[layer_name] if isinstance(metadata, dict) else None,
+    def bind_attention_owner(self, layer, vllm_config):
+        previous = getattr(self, "_engram_attention_owner_ref", None)
+        binding = getattr(layer, "_hcu_flash_engram_hash_owner", None)
+        if previous is not None and previous() is not layer:
+            raise RuntimeError("Flash Engram hash state already has another attention owner")
+        if binding is not None and binding() is not self:
+            raise RuntimeError("Flash attention already has another Engram hash owner")
+        self._engram_attention_owner_ref = ref(layer)
+        layer._hcu_flash_engram_hash_owner = ref(self)
+        compilation = vllm_config.compilation_config
+        if compilation.mode != CompilationMode.VLLM_COMPILE:
+            return
+        if compilation.splitting_ops is None:
+            parallel = vllm_config.parallel_config
+            compilation.set_splitting_ops_for_v1(
+                all2all_backend=parallel.all2all_backend,
+                data_parallel_size=parallel.data_parallel_size,
             )
+        existing = list(compilation.splitting_ops)
+        if _FLASH_ENGRAM_OP not in existing:
+            compilation.splitting_ops = [*existing, _FLASH_ENGRAM_OP]
+
+    def prepare_hashes_with_output(self, input_ids, lookback, layer_name, output):
+        # Keep profile-time metadata=None out of the cached compiled graph.
+        # PIECEWISE runs this leaf live; FULL captures its persistent GPU inputs.
+        torch.ops.vllm.hcu_hyv4_flash_engram_hashes(
+            input_ids, lookback, layer_name, output
         )
 
     def prepare_hashes(self, input_ids, lookback, metadata):
