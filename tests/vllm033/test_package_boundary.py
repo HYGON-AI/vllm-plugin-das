@@ -30,6 +30,7 @@ EXPECTED_ENTRY_POINTS = {
         "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
         "das_hcu_step5_config": "hcu_vllm_das.step5_activation:extension_spec",
         "das_hcu_hyv4_flash_config": "hcu_vllm_das.hyv4_flash_config_activation:extension_spec",
+        "das_hcu_hyv4_flash_model": "hcu_vllm_das.hyv4_flash_model_activation:extension_spec",
         "das_hcu_hy4_frontend": "hcu_vllm_das.hy4_frontend:extension_spec",
         "das_hcu_hy4_ct_w4a8": "hcu_vllm_das.hy4_quant_activation:extension_spec",
         "das_hcu_hy4_static": "hcu_vllm_das.hy4_static_activation:extension_spec",
@@ -158,6 +159,9 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
     }
     assert "hcu_vllm_das/dsv41_activation.py" in names
     assert "hcu_vllm_das/hyv4_flash_config_activation.py" in names
+    assert "hcu_vllm_das/hyv4_flash_model_activation.py" in names
+    for module in ("model", "attention", "dfly", "dfly_compat", "quantization", "vl_model", "sparse_backend"):
+        assert f"hcu_vllm_das/models/hy_v4_flash/{module}.py" in names
     assert "hcu_vllm_das/models/hy_v4_flash/configs.py" in names
     assert "hcu_vllm_das/models/hy_v4_flash/vision_config.py" in names
     assert "hcu_vllm_das/quantization/dsv41_channel_fp8.py" in names

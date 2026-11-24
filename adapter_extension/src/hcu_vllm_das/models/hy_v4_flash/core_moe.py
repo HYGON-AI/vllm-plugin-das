@@ -21,17 +21,12 @@ from vllm.models.hy_v4.nvidia.moe import HYV4FeedForward as CoreHYV4FeedForward
 from vllm.models.hy_v4.nvidia.moe import HYV4MoEFused as CoreHYV4MoEFused
 
 
-def _check_quantization(config, quant_config) -> None:
-    # An allowlist deliberately excludes CT W4A8 and legacy adapter wrappers.
-    # Admission is not a guarantee that the platform has the required kernels;
-    # errors from Core's factory/linear construction must propagate unchanged.
-    if getattr(config, "flash_w4a8_backend", "disabled") != "disabled":
-        raise NotImplementedError("Core033 Flash does not support Flash W4A8")
-    if quant_config is not None and quant_config.get_name() != "fp8":
-        raise NotImplementedError(
-            "Core033 Flash admits only unquantized or Core fp8 factory inputs; "
-            "W4A8/compressed-tensors and other quantization are not validated"
-        )
+def _check_quantization(config, quant_config, *, for_moe=False):
+    from hcu_vllm_das.models.hy_v4_flash.quantization import (
+        prepare_flash_quant_config,
+    )
+
+    return prepare_flash_quant_config(config, quant_config, for_moe=for_moe)
 
 
 class HYV4FlashFeedForward(CoreHYV4FeedForward):
@@ -41,7 +36,7 @@ class HYV4FlashFeedForward(CoreHYV4FeedForward):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        _check_quantization(config, quant_config)
+        quant_config = _check_quantization(config, quant_config)
         super().__init__(
             config.hidden_size,
             config.intermediate_size,
@@ -75,7 +70,9 @@ class HYV4FlashMoE(CoreHYV4MoEFused):
         prefix: str = "",
         enable_eplb: bool = False,
     ) -> None:
-        _check_quantization(config, quant_config)
+        quant_config = _check_quantization(config, quant_config, for_moe=True)
+        if quant_config is not None and enable_eplb:
+            raise NotImplementedError("Flash quantized MoE does not admit EPLB")
         latent = getattr(config, "routed_expert_hidden_size", None)
         if latent is None:
             super().__init__(
@@ -187,6 +184,12 @@ class HYV4FlashMoE(CoreHYV4MoEFused):
                 reduce_results=True,
                 swiglu_limit=float(limit) if limit and float(limit) > 0 else None,
             )
+        # W4A8's eager reference combines router slots in deterministic score
+        # order. This is an instance-local Core router, not a global patch.
+        if getattr(config, "flash_w4a8_backend", "disabled") == "adapter_reference":
+            from hcu_vllm_das.models.hy_v4_flash.router import HYV4FlashStableRouter
+
+            self.experts.router = HYV4FlashStableRouter.from_router(self.experts.router)
         self.combine_output_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.sandwich_norm

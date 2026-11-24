@@ -123,6 +123,8 @@ class _Harness:
             data_parallel_size=1,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
             use_sequence_parallel_moe=False,
             enable_eplb=False,
             eplb_config=SimpleNamespace(num_redundant_experts=0),
@@ -288,7 +290,7 @@ class _Harness:
         inject(
             "vllm.config",
             get_current_vllm_config=lambda: SimpleNamespace(
-                parallel_config=self.parallel
+                parallel_config=self.parallel, lora_config=None
             ),
         )
         # Core constructs this group across TP even when expert parallel is off.
@@ -318,6 +320,23 @@ class _Harness:
         inject("vllm.model_executor.layers.activation", SiluAndMul=SiluAndMul)
         inject("vllm.model_executor.layers.layernorm", RMSNorm=RMSNorm)
         inject("vllm.model_executor.layers.quantization", QuantizationConfig=object)
+        # Explicit config doubles for CPU composition; these do not qualify
+        # Core quantized kernels. The actual production admission code runs.
+        class Fp8Config:
+            is_checkpoint_fp8_serialized = True
+            activation_scheme = "dynamic"
+            weight_block_size = [128, 128]
+            store_dtype = "fp8"
+        class CompressedTensorsConfig:
+            pass
+        self.fp8_config = Fp8Config
+        inject("vllm.model_executor.layers.quantization.fp8", Fp8Config=Fp8Config)
+        inject("vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors",
+               CompressedTensorsConfig=CompressedTensorsConfig)
+        self.quantization = _load(monkeypatch,
+            "hcu_vllm_das.models.hy_v4_flash.quantization",
+            ACTIVE.with_name("quantization.py"))
+
         inject("vllm.models.hy_v4.nvidia")
         self.core = _load(monkeypatch, "vllm.models.hy_v4.nvidia.moe", CORE_MOE)
         self.active = _load(monkeypatch, "_flash_active_moe_under_test", ACTIVE)
@@ -393,7 +412,7 @@ def _numeric_worker(rank, tp, rendezvous):
         with pytest.MonkeyPatch.context() as monkeypatch:
             harness = _Harness(monkeypatch, tp, rank)
             x = _weight("input", (6, 7))
-            quant = SimpleNamespace(get_name=lambda: "fp8")
+            quant = harness.fp8_config()
             cases, max_error, wrong_gap = 0, 0.0, 0.0
             for latent in (None, 5):
                 for shared in (0, 1, 2):
@@ -549,7 +568,7 @@ def test_core_identity_loader_metadata_factory_and_gate_contract(monkeypatch):
 @pytest.mark.parametrize("name", ["compressed-tensors", "gptq", "hcu_dsv41_ct_w4a8"])
 def test_unvalidated_quantization_fails_before_factory(monkeypatch, latent, name):
     h = _Harness(monkeypatch)
-    with pytest.raises(NotImplementedError, match="factory inputs"):
+    with pytest.raises(NotImplementedError, match="real Core FP8 or compressed-tensors"):
         h.active.HYV4FlashMoE(
             _config(routed_expert_hidden_size=latent),
             SimpleNamespace(get_name=lambda: name),
@@ -559,7 +578,7 @@ def test_unvalidated_quantization_fails_before_factory(monkeypatch, latent, name
 
 def test_flash_w4a8_fails_before_factory(monkeypatch):
     h = _Harness(monkeypatch)
-    with pytest.raises(NotImplementedError, match="W4A8"):
+    with pytest.raises(ValueError, match="serialized channel W4A8 CT"):
         h.active.HYV4FlashMoE(_config(flash_w4a8_backend="adapter_reference"))
     assert not h.factory_calls
 
@@ -620,7 +639,9 @@ def test_production_imports_only_core_and_no_registration():
         node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     ]
     assert all(
-        module.startswith(("vllm.", "torch", "transformers")) for module in imports
+        module.startswith(("vllm.", "torch", "transformers",
+                           "hcu_vllm_das.models.hy_v4_flash.quantization",
+                           "hcu_vllm_das.models.hy_v4_flash.router")) for module in imports
     )
     text = ACTIVE.read_text(encoding="utf-8")
     for forbidden in (
@@ -656,3 +677,17 @@ def test_latent_rejects_invalid_core_factory_shapes(monkeypatch, changes, match)
     with pytest.raises(ValueError, match=match):
         h.active.HYV4FlashMoE(_config(**changes))
     assert not h.factory_calls
+
+
+def test_quant_config_is_prepared_for_dense_and_moe(monkeypatch):
+    h = _Harness(monkeypatch)
+    calls = []
+    sentinel = object()
+    def prepare(config, quant_config, *, for_moe=False):
+        calls.append((config, quant_config, for_moe))
+        return sentinel
+    monkeypatch.setattr(h.quantization, "prepare_flash_quant_config", prepare)
+    config = _config()
+    assert h.active._check_quantization(config, None) is sentinel
+    assert h.active._check_quantization(config, None, for_moe=True) is sentinel
+    assert calls == [(config, None, False), (config, None, True)]
