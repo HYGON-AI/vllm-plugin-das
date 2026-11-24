@@ -49,6 +49,19 @@ def check_health():
         raise RuntimeError(_failure) from error
 
 
+def prepare_worker_model(model):
+    """Qualify only models that instantiated the provider's PCP attention."""
+    if _state is None:
+        return
+    from hcu_adapter.kernels.pcp_fork import build_classes
+
+    attention_class = build_classes()["attention"]
+    if any(isinstance(module, attention_class) for module in model.modules()):
+        import torch
+
+        prepare_worker_device(torch.device("cuda", torch.cuda.current_device()))
+
+
 def prepare_worker_device(device):
     """Qualify the native operator on the device already bound to this worker."""
     check_health()

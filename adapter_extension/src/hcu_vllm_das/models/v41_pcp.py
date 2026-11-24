@@ -278,14 +278,10 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
 
         if uses_pcp:
-            from ..inverse_rope_policy import selected_mode
-            if selected_mode() == 'hcu':
-                import torch
-                from ..inverse_rope_pcp import prepare_worker_device
+            from ..inverse_rope_pcp import prepare_worker_model
 
-                # Registry inspection imports the classes. Model construction
-                # runs after Worker.init_device selected this rank's GPU.
-                prepare_worker_device(torch.device('cuda', torch.cuda.current_device()))
+            # Model construction follows Worker.init_device.
+            prepare_worker_model(self)
 
         from ..dspark_ll import install_model_entry_reset
         install_model_entry_reset(self, vllm_config, 384)

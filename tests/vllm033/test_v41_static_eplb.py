@@ -104,10 +104,12 @@ def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):
     monkeypatch.setenv('VLLM_HCU_DSV41_PCP_ATTENTION', '1')
     if not fp4:
         cfg.attention_config.resolve_indexer_kv_dtype = lambda _: 'fp8'
-    from hcu_vllm_das import inverse_rope_pcp, inverse_rope_policy, v41_pcp_activation
+    from hcu_adapter.kernels import pcp_fork
+    from hcu_vllm_das import inverse_rope_pcp, v41_pcp_activation
     monkeypatch.setattr(v41_pcp_activation, 'check_health', lambda: None)
-    monkeypatch.setattr(inverse_rope_policy, 'selected_mode', lambda: 'hcu')
+    monkeypatch.setattr(inverse_rope_pcp, '_state', object())
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: 3)
+    attention_cls = fp4_indexer.Fp4PcpAttention if fp4 else pcp_fork.build_classes()['attention']
     calls = []
     device_calls = []
 
@@ -120,6 +122,8 @@ def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):
     def constructor(name):
         def init(self, *, vllm_config, prefix):
             torch.nn.Module.__init__(self)
+            self.attn = attention_cls.__new__(attention_cls)
+            torch.nn.Module.__init__(self.attn)
             calls.append((name, vllm_config, prefix))
         return init
 
@@ -131,6 +135,38 @@ def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):
     assert calls == [(expected, cfg, 'target')]
     assert device_calls == [torch.device('cuda', 3)]
     assert outer._hcu_static_eplb_config is (cfg if static else None)
+
+
+@pytest.mark.parametrize('mode,admitted', [('stock', True), ('native', False)])
+@pytest.mark.parametrize('provider_bound', [False, True])
+def test_outer_skips_inverse_rope_on_core_attention(chain, monkeypatch, mode, admitted,
+                                                   provider_bound):
+    from hcu_adapter.kernels import pcp_fork
+    from hcu_vllm_das import inverse_rope_pcp, inverse_rope_policy, v41_pcp_activation
+
+    cfg = static_config(chain.cfg)
+    cfg.additional_config = {}
+    cfg.attention_config.resolve_indexer_kv_dtype = lambda _: 'fp8'
+    monkeypatch.setenv('VLLM_HCU_DSV41_PCP_ATTENTION', '1')
+    monkeypatch.setattr(v41_pcp_activation, 'check_health', lambda: None)
+    monkeypatch.setattr(inverse_rope_policy, 'selected_mode', lambda: 'hcu')
+    monkeypatch.setattr(inverse_rope_pcp, '_state', object() if provider_bound else None)
+    monkeypatch.setattr(pcp_fork, 'selected_mode', lambda: mode)
+    monkeypatch.setattr(models, 'validate_config', lambda _: admitted)
+    monkeypatch.setattr(models, 'use_host_target', lambda _: False)
+    monkeypatch.setattr(models, 'check_native_contract', lambda: None)
+    monkeypatch.setattr(models.native, '_select_dsv4_attn_cls', lambda _: torch.nn.Identity)
+    monkeypatch.setattr(torch.cuda, 'current_device',
+                        lambda: pytest.fail('Core attention should not query a GPU for inverse RoPE'))
+
+    def construct(self, *, vllm_config, prefix):
+        torch.nn.Module.__init__(self)
+        self.attn = models.select_attention(vllm_config)()
+
+    monkeypatch.setattr(models, '_OUTER_INIT', construct)
+    monkeypatch.setattr(models.native_vl.DeepseekV41ForCausalLM, '__init__', construct)
+    outer = models.HcuV41PcpForCausalLM(vllm_config=cfg)
+    assert isinstance(outer.attn, torch.nn.Identity)
 
 
 def test_fp4_static_namespaces_preserve_native_and_swa(chain, monkeypatch):
