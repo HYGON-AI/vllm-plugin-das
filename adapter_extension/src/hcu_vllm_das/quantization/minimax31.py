@@ -3,7 +3,6 @@
 
 Uses the existing DAS numerical implementation and official vLLM model loaders.
 Importing this module does not activate the legacy platform/general plugins.
-The legacy implementation is supplied by the same checkout on PYTHONPATH.
 """
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ import re
 import torch
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 
-from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+from .slimquant_w4a8 import (
     SlimQuantW4A8Int8Config, SlimQuantW4A8Int8LinearMethod,
     SlimQuantW4A8Int8AiterMoEMethod,
 )
@@ -135,6 +134,7 @@ class MiniMax31W8A8LinearMethod(SlimQuantW4A8Int8LinearMethod):
 class MiniMax31W4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
     """Packed expert layout shared by preload and the BoltOPs Triton path."""
     supports_pre_processed_weights = True
+    supports_int8_allgatherv_input = False
     @property
     def requires_device_loading(self):
         # The native packer requires device weights on fresh load. IPC restore
@@ -309,4 +309,9 @@ def after_minimax31_model_load(context):
         return
     model = context.worker.model_runner.model
     restore_minimax31_router_aliases(model)
+    if getattr(context.vllm_config.model_config.hf_config,"hcu_minimax_decode",None) is not None:
+        from ..parallel.minimax31_decode import validate_scope,restore_execution_state
+        validate_scope(context.vllm_config)
+        restore_execution_state(model,context.worker.device)
+        return
     restore_minimax31_scratch(model, context.worker.device)

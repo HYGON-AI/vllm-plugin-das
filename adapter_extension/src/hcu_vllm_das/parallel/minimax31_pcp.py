@@ -217,7 +217,9 @@ class MiniMax31PCPSparseAttention(_original_sparse):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         from .minimax31_config import artifacts
-        self._hcu_msa_extension_dir = artifacts().msa_extension_dir
+        deployment = artifacts()
+        self._hcu_msa_extension_dir = deployment.msa_extension_dir
+        self._hcu_msa_stage2_receipt = deployment.msa_stage2_receipt
         self._hcu_native_msa = self._hcu_msa_extension_dir is not None
         self._hcu_fp8_index = self.indexer.index_cache.dtype == torch.float8_e4m3fn
         if self._hcu_fp8_index and not self._hcu_native_msa:
@@ -229,6 +231,32 @@ class MiniMax31PCPSparseAttention(_original_sparse):
         self.attn_backend = pcp_backend(self.attn_backend)
         cache = self.indexer.index_cache
         cache.backend_cls = pcp_backend(cache.backend_cls)
+
+    def _try_compact_cache_write(self, qkv, slots):
+        # Both maps already describe the rank-major PCP gather. Keep the main
+        # and index slot maps independent, including their -1 padding.
+        rows = qkv.shape[0]
+        if (rows not in (2048, 4096, 6144, 8192) or not self._hcu_native_msa
+                or not self._hcu_fp8_index or not _prefill_enabled()
+                or self.skip_index_topk or self.use_aiter_sparse_pa
+                or not self.kv_cache.numel() or qkv.dtype != torch.bfloat16
+                or qkv.stride(1) != 1 or self.kv_size != 512
+                or qkv.size(1) != self.q_size + self.index_q_size + 1152):
+            return False
+        from .minimax31_msa import ensure_native_cache
+        from .minimax31_prefill_ops import pcp_write_rows, prefill_fp8_transport
+
+        side = self.indexer.index_cache
+        binding = ensure_native_cache(self)
+        main_slots, index_slots = slots[self.layer_name], slots[side.prefix]
+        if not pcp_write_rows.supports_layout(
+            qkv, rows * 8, main_slots, index_slots, binding.key_writer, side.kv_cache,
+        ):
+            return False
+        encoded = prefill_fp8_transport.gather_fp8(self, qkv, main_slots, gather_cache_rows)
+        pcp_write_rows.write(encoded, main_slots, index_slots, binding.key_writer,
+                             side.kv_cache, tile_rows=16, kv_groups=8, warps=8)
+        return True
 
     def forward(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -257,59 +285,60 @@ class MiniMax31PCPSparseAttention(_original_sparse):
             self.rotary_emb.cos_sin_cache, positions,
             self.num_heads, self.num_kv_heads, self.rotary_emb.rotary_dim,
             self.q_norm.variance_epsilon, **common)
-        kv_end = self.q_size + 2 * self.kv_size
-        rows = qkv[:, self.q_size:kv_end]
-        if not self.skip_index_topk:
-            index_k_start = kv_end + self.index_q_size
-            if self._hcu_native_msa and _prefill_enabled():
-                from .minimax31_prefill import pack_rows
-                rows = pack_rows((rows, qkv[:, index_k_start:]))
-            else:
-                rows = torch.cat((rows, qkv[:, index_k_start:]), dim=-1)
-        gathered = gather_cache_rows(rows, slots[self.layer_name])
-        k = gathered[:, :self.kv_size].view(-1, self.num_kv_heads, self.head_dim)
-        v = gathered[:, self.kv_size:2*self.kv_size].view_as(k)
-        index_k = None if self.skip_index_topk else gathered[:, 2*self.kv_size:]
-        if self.use_aiter_sparse_pa:
-            key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
-            page_slots = self._get_aiter_sparse_pa_slot_mapping(
-                slots[self.layer_name], key_cache, value_cache)
-            self._insert_aiter_sparse_pa_kv(
-                k, v, index_k, page_slots,
-                None if index_k is None else slots[self.indexer.index_cache.prefix],
-                key_cache, value_cache)
-        elif self.kv_cache.numel():
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                triton_reshape_and_cache_flash)
-            if self._hcu_native_msa:
-                from .minimax31_msa import ensure_native_cache
-                binding = ensure_native_cache(self)
-                keys, values = binding.key_writer, binding.value_writer
-            else:
-                keys, values = self.kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
-            fused_store = (self._hcu_native_msa and index_k is not None
-                           and _prefill_enabled())
-            if fused_store:
-                from .minimax31_prefill_triton import store_pcp_cache
-                store_pcp_cache(gathered, slots[self.layer_name],
-                    slots[self.indexer.index_cache.prefix], keys, values,
-                    self.indexer.index_cache.kv_cache, self._k_scale, self._v_scale)
+        if not self._try_compact_cache_write(qkv, slots):
+            kv_end = self.q_size + 2 * self.kv_size
+            rows = qkv[:, self.q_size:kv_end]
+            if not self.skip_index_topk:
+                index_k_start = kv_end + self.index_q_size
+                if self._hcu_native_msa and _prefill_enabled():
+                    from .minimax31_prefill import pack_rows
+                    rows = pack_rows((rows, qkv[:, index_k_start:]))
+                else:
+                    rows = torch.cat((rows, qkv[:, index_k_start:]), dim=-1)
+            gathered = gather_cache_rows(rows, slots[self.layer_name])
+            k = gathered[:, :self.kv_size].view(-1, self.num_kv_heads, self.head_dim)
+            v = gathered[:, self.kv_size:2*self.kv_size].view_as(k)
+            index_k = None if self.skip_index_topk else gathered[:, 2*self.kv_size:]
+            if self.use_aiter_sparse_pa:
+                key_cache, value_cache = self.get_aiter_sparse_pa_kv_cache()
+                page_slots = self._get_aiter_sparse_pa_slot_mapping(
+                    slots[self.layer_name], key_cache, value_cache)
+                self._insert_aiter_sparse_pa_kv(
+                    k, v, index_k, page_slots,
+                    None if index_k is None else slots[self.indexer.index_cache.prefix],
+                    key_cache, value_cache)
+            elif self.kv_cache.numel():
+                from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                    triton_reshape_and_cache_flash)
+                if self._hcu_native_msa:
+                    from .minimax31_msa import ensure_native_cache
+                    binding = ensure_native_cache(self)
+                    keys, values = binding.key_writer, binding.value_writer
+                else:
+                    keys, values = self.kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+                fused_store = (self._hcu_native_msa and index_k is not None
+                               and _prefill_enabled())
+                if fused_store:
+                    from .minimax31_prefill_triton import store_pcp_cache
+                    store_pcp_cache(gathered, slots[self.layer_name],
+                        slots[self.indexer.index_cache.prefix], keys, values,
+                        self.indexer.index_cache.kv_cache, self._k_scale, self._v_scale)
 
-            else:
-                triton_reshape_and_cache_flash(
-                    k, v, keys, values, slots[self.layer_name], self.kv_cache_dtype,
-                    self._k_scale, self._v_scale)
-            if index_k is not None and not fused_store:
-                from vllm.models.minimax_m3.amd.ops.sparse_pa import (
-                    minimax_m3_insert_index_cache)
-                if self._hcu_fp8_index:
-                    # Unit dequantization scale; saturate before the stock
-                    # scatter converts BF16 to E4M3FN. Prefix and append use
-                    # this same path, including PCP gathered rows.
-                    index_k = index_k.clamp(-448.0, 448.0)
-                minimax_m3_insert_index_cache(
-                    index_k, self.indexer.index_cache.kv_cache,
-                    slots[self.indexer.index_cache.prefix])
+                else:
+                    triton_reshape_and_cache_flash(
+                        k, v, keys, values, slots[self.layer_name], self.kv_cache_dtype,
+                        self._k_scale, self._v_scale)
+                if index_k is not None and not fused_store:
+                    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+                        minimax_m3_insert_index_cache)
+                    if self._hcu_fp8_index:
+                        # Unit dequantization scale; saturate before the stock
+                        # scatter converts BF16 to E4M3FN. Prefix and append use
+                        # this same path, including PCP gathered rows.
+                        index_k = index_k.clamp(-448.0, 448.0)
+                    minimax_m3_insert_index_cache(
+                        index_k, self.indexer.index_cache.kv_cache,
+                        slots[self.indexer.index_cache.prefix])
         if self._hcu_native_msa:
             from .minimax31_msa import run_native_attention
             if self._hcu_fp8_index and index_query is not None:
@@ -418,9 +447,12 @@ class MiniMax31PCPModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         from .minimax31_config import artifacts
+        from .minimax31_msa import prepare_native_prefill
         from .minimax31_static_contract import from_model_config
         if self.pcp_manager is not None:
-            self.pcp_manager._hcu_native_msa = artifacts(self.vllm_config).msa_extension_dir is not None
+            deployment = artifacts(self.vllm_config)
+            prepare_native_prefill(deployment)
+            self.pcp_manager._hcu_native_msa = deployment.msa_extension_dir is not None
             self.pcp_manager._hcu_static = from_model_config(self.vllm_config.model_config) is not None
 
     @guard_model_forward

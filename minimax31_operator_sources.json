@@ -1,0 +1,284 @@
+{
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_decode_ops/__init__.py": {
+    "installed_sha256": "a27ebdaf9ee3af90d2e4f3e46d15cd516c4adcc08407e396bcf5b6ceeb24e2af",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/moe_route_prep_20261121/deploy_route.py",
+    "origin_sha256": "5f26592289416bb0af5913052ea159ba382841b83a962686c0bca7818cc98833"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_decode_ops/attention_bs128.py": {
+    "installed_sha256": "66ae0c7162834e9af795b9e8cd4e5ce0f2923bd1f5a9472a8b134975f9222d0f",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/ab02/minimax31_decode_attention.py",
+    "origin_sha256": "474a585625561b1700aaa69e7763f9ccd815bcbc3f270221d9787ac506b381d8"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_decode_ops/attention_expanded.py": {
+    "installed_sha256": "917fb117f98bed1e8d30950fa5725f9584258a323d96a6e9b83c0513b1bbc8e2",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_online_acceptance_20261121/accuracy_repair_20261121/decode_cross_batch_20261121/expanded/minimax31_decode_attention.py",
+    "origin_sha256": "0711cc07601417dee06295a0618da56a2fedd5ae319c36fabb32de5b2c1db1c3"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_decode_ops/draft_int8.py": {
+    "installed_sha256": "167286679e0ebdb9e93aea3905e399d18fc4dc3785ccff9ab9b8a7357db48c84",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/draft_int8_20261121/deploy_draft_int8.py",
+    "origin_sha256": "167286679e0ebdb9e93aea3905e399d18fc4dc3785ccff9ab9b8a7357db48c84"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_decode_ops/moe_result.py": {
+    "installed_sha256": "5afa90f676d22ef2ad1740295aedb9f46a3f7e0a9339bfd09ee3a6262d34a876",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/moe_result_fusion_20261121/moe_result.py",
+    "origin_sha256": "22a76a11a9a20761f48f574f63c12a210f35b812022c20b1946428941a60da3e"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_decode_ops/route.py": {
+    "installed_sha256": "8d0922f31f7a7216fb0f49640152dd750765cfece95d7165af6fdb672bf39c04",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/moe_route_prep_20261121/deploy_route.py",
+    "origin_sha256": "5f26592289416bb0af5913052ea159ba382841b83a962686c0bca7818cc98833"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/__init__.py": {
+    "installed_sha256": "a27ebdaf9ee3af90d2e4f3e46d15cd516c4adcc08407e396bcf5b6ceeb24e2af",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/moe_route_prep_20261121/deploy_route.py",
+    "origin_sha256": "5f26592289416bb0af5913052ea159ba382841b83a962686c0bca7818cc98833"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/pcp_write_rows.py": {
+    "installed_sha256": "d53f387b63334b5f7bfb9c1188aed6c49929fddae81aa7ea649531c27e149ab2",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/pcp-and-shared/pcp_write_rows.py",
+    "origin_sha256": "2bbc08c38e9fd5d0b6b7b815360dfb98ff91edf0d38e64e30b3a192db0852f8a"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_attention_helpers.py": {
+    "additional_origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/live_shared/probe_msa_tiles.py",
+    "additional_origin_sha256": "0e05eaa01fca43f9579d7e43b4a98266d76fd796e7d0f8e6f77b95849f625ef8",
+    "installed_sha256": "269cc21132eb51a8282ad8e5c36014a55fe9b95872d31f8e45aa1d0e30d9aa49",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/live_shared/probe_paged_msa.py",
+    "origin_sha256": "34668d70055bd0727a900c2ae4f64dc5bd0950c2fb0635f2524167ea9872d8aa"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_c4_attention_gap.py": {
+    "installed_sha256": "b36355c3304f3590db214951491b2de5945ab9aaae7bf86fa8a4415dffdab560",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/c4-final-gap/overlay/prefill_c4_attention_gap.py",
+    "origin_sha256": "f361fd9181b5ee4c0436d68a31c178e7b961f203781b4a175fbc87fc76f75fda"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_c4_meta.py": {
+    "installed_sha256": "6af80c8872c72a3fe66d1cc8b412b6925dff37d854e568d263ad5d9c4e1d1e2f",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/c4-moe-rms/metadata-overlay/prefill_c4_meta.py",
+    "origin_sha256": "ea3e7ff0e70636f3500f0521cf4b143993335db38a19dcaaa0d4b775f3d4c774"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_c4_moe_rms.py": {
+    "installed_sha256": "178644c9ce6767f8db33b0db3fdb5d5f430378fb3b7ad7736358e1b11b2432de",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/c4-moe-rms/scale-overlay/prefill_c4_moe_rms.py",
+    "origin_sha256": "0ab136fc3e8ad217bb7809e2c501e22d4fae5f6f0a6aa5369e26d40c0b649b53"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_c4_norm.py": {
+    "installed_sha256": "b57410e6308015d2b37b88bac9e59070374d8fdbcb23bcdb1539d7f1efac6716",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/c4-final-gap/overlay/prefill_c4_norm.py",
+    "origin_sha256": "38b3d2f9eca1d02f5042498a07a18aed19c4dc988c7de3e89e1e4d35a57af52d"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_cache_fused.py": {
+    "installed_sha256": "05e72e9585808bf0118e765897d4ba1694918c55e17415b5eab1998251c6fe95",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/pcp-and-shared/overlay/prefill_cache_fused.py",
+    "origin_sha256": "69e6399b21a69493d206a9cb8beda16802cf537a20a0824da110b1b4d2858cb4"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_compact_meta.py": {
+    "installed_sha256": "89f3168fcf1d92f6fc68d53bb20459cced9f488cdd133926b0c8f6bac23930cf",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/live_shared/prefill_compact_meta.py",
+    "origin_sha256": "89f3168fcf1d92f6fc68d53bb20459cced9f488cdd133926b0c8f6bac23930cf"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_fp8_transport.py": {
+    "installed_sha256": "4d443ad4b849410fb88d9fcada6d06cf11425f16ac7dea051bf55a99b155991a",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/live_shared/prefill_fp8_transport.py",
+    "origin_sha256": "1f29df1531705854905237b6b1e60e89af8c3f14a9ee50206debbc91dd81eb19"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_runtime_candidate.py": {
+    "installed_sha256": "290afc1b2357b1e3a04baefc0be0a65b245b49f282b849c24d552c99c810d6ca",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/stage1-stage2/deferred-fill/runtime/overlay/prefill_runtime_candidate.py",
+    "origin_sha256": "a0c68ab04fc9fc3e726e61d3f627f7574736af181788495be76ead5c3939216c"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_shared_oai.py": {
+    "installed_sha256": "08c7f7d785f4bdd4f545e9073716b704f9955a93d18a56293196eb1790a2d386",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/pcp-and-shared/overlay/prefill_shared_oai.py",
+    "origin_sha256": "08c7f7d785f4bdd4f545e9073716b704f9955a93d18a56293196eb1790a2d386"
+  },
+  "adapter_extension/src/hcu_vllm_das/parallel/minimax31_prefill_ops/prefill_stage2_runtime.py": {
+    "installed_sha256": "d616a80de258ba4d80b409d685d1a77619de6812c81c8f4a6cf38046e112531b",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/minimax31_prefill_goal_20261123/c4_scatter_trace_20261124/stage1-stage2/deferred-fill/runtime/overlay/prefill_stage2_runtime.py",
+    "origin_sha256": "ce443ee987f6c0dd254a06871d7975c4f154adda953f9a41a873cf8ba022288a"
+  },
+  "csrc/minimax31/execution_arena/async_pool.cpp": {
+    "installed_sha256": "18960aa1dbf31d2c27c01ea2cde41ce147d756fb52a872765110cb36eb87fa1b",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/async_pool.cpp",
+    "origin_sha256": "18960aa1dbf31d2c27c01ea2cde41ce147d756fb52a872765110cb36eb87fa1b"
+  },
+  "csrc/minimax31/hisparse_base/bindings.cpp": {
+    "installed_sha256": "17ffd1a1bba6689bd1002ee65d7e2753f525e28d020522ea151528753b58407b",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/hisparse_native/bindings.cpp",
+    "origin_sha256": "17ffd1a1bba6689bd1002ee65d7e2753f525e28d020522ea151528753b58407b"
+  },
+  "csrc/minimax31/hisparse_base/io_kernels.h": {
+    "installed_sha256": "bd3e455a179bb2ae12d9f343c4acd68a0c3bff2ccd7864eb645fdf6cd5b55f48",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/hisparse_native/io_kernels.h",
+    "origin_sha256": "bd3e455a179bb2ae12d9f343c4acd68a0c3bff2ccd7864eb645fdf6cd5b55f48"
+  },
+  "csrc/minimax31/hisparse_base/ops.cu": {
+    "installed_sha256": "3cce7cb1dc5c078b1fcfc9c9d8657a2f145022842b4f11a0cfc027414054ff55",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/hisparse_native/ops.cu",
+    "origin_sha256": "3cce7cb1dc5c078b1fcfc9c9d8657a2f145022842b4f11a0cfc027414054ff55"
+  },
+  "csrc/minimax31/hisparse_base/ops.hip": {
+    "installed_sha256": "29b5b306b3173c46cd412cb24c606de3f11dd499b4cad0808966b417794d6040",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/hisparse_native/ops.hip",
+    "origin_sha256": "29b5b306b3173c46cd412cb24c606de3f11dd499b4cad0808966b417794d6040"
+  },
+  "csrc/minimax31/hisparse_base/plan_kernel.h": {
+    "installed_sha256": "3a2a287799c6126d053a3a9fcfafbe7920f1bafcd5b26e1a6574ec10719a19d5",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/hisparse_native/plan_kernel.h",
+    "origin_sha256": "3a2a287799c6126d053a3a9fcfafbe7920f1bafcd5b26e1a6574ec10719a19d5"
+  },
+  "csrc/minimax31/hisparse_base/setup_hisparse.py": {
+    "installed_sha256": "2d9a5d03d2fc2091b8f2167796232813ede546826a292c3985ca5368bf678b03",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_implementation_20261117/hisparse_native/setup_hisparse.py",
+    "origin_sha256": "2d9a5d03d2fc2091b8f2167796232813ede546826a292c3985ca5368bf678b03"
+  },
+  "csrc/minimax31/hisparse_delta_swap/bindings.cpp": {
+    "installed_sha256": "7f2bddb1502c350cc0f9418b02b1459487cb76946c3a69e12d34d3ecaae21c2e",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/bindings.cpp",
+    "origin_sha256": "7f2bddb1502c350cc0f9418b02b1459487cb76946c3a69e12d34d3ecaae21c2e"
+  },
+  "csrc/minimax31/hisparse_delta_swap/plan_delta.h": {
+    "installed_sha256": "9e23f6c1d0900d9f924c2111ffed5dfdf82a88a6b3112d664196fc30f693a63b",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/plan_delta.h",
+    "origin_sha256": "9e23f6c1d0900d9f924c2111ffed5dfdf82a88a6b3112d664196fc30f693a63b"
+  },
+  "csrc/minimax31/hisparse_delta_swap/planner.cu": {
+    "installed_sha256": "9510610470f801f864af5871f03ad1624bc6ee81ee3338928ec579b68072a700",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/planner.cu",
+    "origin_sha256": "9510610470f801f864af5871f03ad1624bc6ee81ee3338928ec579b68072a700"
+  },
+  "csrc/minimax31/hisparse_delta_swap/planner.hip": {
+    "installed_sha256": "cb00846ce9210dd3ba2ff8ad0a98108ee69a3b36344be81fa693e0ec7980a707",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/planner.hip",
+    "origin_sha256": "cb00846ce9210dd3ba2ff8ad0a98108ee69a3b36344be81fa693e0ec7980a707"
+  },
+  "csrc/minimax31/hisparse_delta_swap/setup.py": {
+    "installed_sha256": "d73e7eb0ab8ef7b53bd33d60d030c07877e1d2237194f02e4e69a3501bb37581",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/setup.py",
+    "origin_sha256": "d73e7eb0ab8ef7b53bd33d60d030c07877e1d2237194f02e4e69a3501bb37581"
+  },
+  "csrc/minimax31/hisparse_delta_swap/swap.cu": {
+    "installed_sha256": "4ff1490d9e19656efd268292185d71f8294971dd17d3960c13ed95727113dbdf",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/swap.cu",
+    "origin_sha256": "4ff1490d9e19656efd268292185d71f8294971dd17d3960c13ed95727113dbdf"
+  },
+  "csrc/minimax31/hisparse_delta_swap/swap.hip": {
+    "installed_sha256": "95d45c957feb86f66253322bccd311ad42b4f6d4fb2f54e07cbcc9907370820f",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_delta_swap/swap.hip",
+    "origin_sha256": "95d45c957feb86f66253322bccd311ad42b4f6d4fb2f54e07cbcc9907370820f"
+  },
+  "csrc/minimax31/hisparse_mirror_commit/bindings.cpp": {
+    "installed_sha256": "703dbb9124b645653afb2a74b7fdcc07b67a67847a7978bb04101d0fe9221794",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_mirror_commit/bindings.cpp",
+    "origin_sha256": "703dbb9124b645653afb2a74b7fdcc07b67a67847a7978bb04101d0fe9221794"
+  },
+  "csrc/minimax31/hisparse_mirror_commit/commit.cu": {
+    "installed_sha256": "aae6cc065770b21516cd2ff660ea24b9bc1b36128adcd7cfcbabb3e01692fb5d",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_mirror_commit/commit.cu",
+    "origin_sha256": "aae6cc065770b21516cd2ff660ea24b9bc1b36128adcd7cfcbabb3e01692fb5d"
+  },
+  "csrc/minimax31/hisparse_mirror_commit/commit.hip": {
+    "installed_sha256": "f8273f234d16e94e78acea5d61e2796e0beb5f5332cd909bef14a09b23a0dab1",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_mirror_commit/commit.hip",
+    "origin_sha256": "f8273f234d16e94e78acea5d61e2796e0beb5f5332cd909bef14a09b23a0dab1"
+  },
+  "csrc/minimax31/hisparse_mirror_commit/setup.py": {
+    "installed_sha256": "081fbd0bf4a9bd16921064df341e8c72eacc2fe2c0fcaec66b75c9d177f8a708",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_mirror_commit/setup.py",
+    "origin_sha256": "081fbd0bf4a9bd16921064df341e8c72eacc2fe2c0fcaec66b75c9d177f8a708"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/bindings.cpp": {
+    "installed_sha256": "3e4a5ebeaacfcfaefe8822eb8f7c3bb9638f62235ebf78a8020cfc932c7b64cf",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/bindings.cpp",
+    "origin_sha256": "3e4a5ebeaacfcfaefe8822eb8f7c3bb9638f62235ebf78a8020cfc932c7b64cf"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/commit.cu": {
+    "installed_sha256": "49e6ef38ad3a9d3c919363dae0760251934c6f53855d86eec3e28c3490711243",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/commit.cu",
+    "origin_sha256": "49e6ef38ad3a9d3c919363dae0760251934c6f53855d86eec3e28c3490711243"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/commit.hip": {
+    "installed_sha256": "bf03062e57fc733c2c941fc40f57359e4d58258416b61aa06f6b7aef11f48ec5",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/commit.hip",
+    "origin_sha256": "bf03062e57fc733c2c941fc40f57359e4d58258416b61aa06f6b7aef11f48ec5"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/plan_delta.h": {
+    "installed_sha256": "222e4990ee666df41685d95581521f6b9fd74c20ff01d8be0cbedc62d4ec2783",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/plan_delta.h",
+    "origin_sha256": "222e4990ee666df41685d95581521f6b9fd74c20ff01d8be0cbedc62d4ec2783"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/planner.cu": {
+    "installed_sha256": "0a8d72c3e79b9a991806ca326120c0438e86e56e54a7ff4a9075b0480d26bd0d",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/planner.cu",
+    "origin_sha256": "0a8d72c3e79b9a991806ca326120c0438e86e56e54a7ff4a9075b0480d26bd0d"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/planner.hip": {
+    "installed_sha256": "b0f1b12bb88a93d5c5c6c8847256ac45dd87d81d93968fdcadc5d73c7bfeb932",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/planner.hip",
+    "origin_sha256": "b0f1b12bb88a93d5c5c6c8847256ac45dd87d81d93968fdcadc5d73c7bfeb932"
+  },
+  "csrc/minimax31/hisparse_resident_20261121/setup.py": {
+    "installed_sha256": "76860c5cf0031a02ec798bce6f9aaeb1a7b6ea82cc6f653de828ffb678759b34",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_20261121/setup.py",
+    "origin_sha256": "76860c5cf0031a02ec798bce6f9aaeb1a7b6ea82cc6f653de828ffb678759b34"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/bindings.cpp": {
+    "installed_sha256": "ad0c413bc4b1554c425801aa53248fc74d63acf2b8c05ddb852658d4d3da8750",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/bindings.cpp",
+    "origin_sha256": "ad0c413bc4b1554c425801aa53248fc74d63acf2b8c05ddb852658d4d3da8750"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/commit.cu": {
+    "installed_sha256": "49e6ef38ad3a9d3c919363dae0760251934c6f53855d86eec3e28c3490711243",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/commit.cu",
+    "origin_sha256": "49e6ef38ad3a9d3c919363dae0760251934c6f53855d86eec3e28c3490711243"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/commit.hip": {
+    "installed_sha256": "bf03062e57fc733c2c941fc40f57359e4d58258416b61aa06f6b7aef11f48ec5",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/commit.hip",
+    "origin_sha256": "bf03062e57fc733c2c941fc40f57359e4d58258416b61aa06f6b7aef11f48ec5"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/plan_delta.h": {
+    "installed_sha256": "273a450bf61887b4b7cd9b73b0e11a43a8caadb751d662154d0174b6d06b31e2",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/plan_delta.h",
+    "origin_sha256": "273a450bf61887b4b7cd9b73b0e11a43a8caadb751d662154d0174b6d06b31e2"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/planner.cu": {
+    "installed_sha256": "fbff2307454fee18e2d5755f42f150f9306743edfcc51d2b5d8cdb432c3533da",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/planner.cu",
+    "origin_sha256": "fbff2307454fee18e2d5755f42f150f9306743edfcc51d2b5d8cdb432c3533da"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/planner.hip": {
+    "installed_sha256": "630be52d96814b42a924e4888f5a53f59635576a44cf8ea5e049f7d8b3d5e772",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/planner.hip",
+    "origin_sha256": "630be52d96814b42a924e4888f5a53f59635576a44cf8ea5e049f7d8b3d5e772"
+  },
+  "csrc/minimax31/hisparse_resident_fused_20261121/setup.py": {
+    "installed_sha256": "cd60d1898bb76e166cf25ecc00fc541b520de48e1bb53acbf40bd865130cbc02",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/hisparse_resident_fused_20261121/setup.py",
+    "origin_sha256": "cd60d1898bb76e166cf25ecc00fc541b520de48e1bb53acbf40bd865130cbc02"
+  },
+  "csrc/minimax31/span_planner/bindings.cpp": {
+    "installed_sha256": "beaeb0183151e3b395cc20f0f016f6126e6e345647d90df6a98b8f02aa7b6c7f",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/attention_reuse/original_page_spans/fused_planner/bindings.cpp",
+    "origin_sha256": "beaeb0183151e3b395cc20f0f016f6126e6e345647d90df6a98b8f02aa7b6c7f"
+  },
+  "csrc/minimax31/span_planner/plan_spans.h": {
+    "installed_sha256": "d4614935738be0435b7fd3c219ebbcf6e280ef870f312d8f50f696d20d62a6e4",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/attention_reuse/original_page_spans/fused_planner/plan_spans.h",
+    "origin_sha256": "d4614935738be0435b7fd3c219ebbcf6e280ef870f312d8f50f696d20d62a6e4"
+  },
+  "csrc/minimax31/span_planner/planner.cu": {
+    "installed_sha256": "6a0586097d4827c69c66a4b1f2e1a1c86767f6987739660efc4ebf6f9762140a",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/attention_reuse/original_page_spans/fused_planner/planner.cu",
+    "origin_sha256": "6a0586097d4827c69c66a4b1f2e1a1c86767f6987739660efc4ebf6f9762140a"
+  },
+  "csrc/minimax31/span_planner/planner.hip": {
+    "installed_sha256": "96626a0190404c1ec3467a09dcbabfdde5e2b680dbf43627c67ce9f88611861a",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/attention_reuse/original_page_spans/fused_planner/planner.hip",
+    "origin_sha256": "96626a0190404c1ec3467a09dcbabfdde5e2b680dbf43627c67ce9f88611861a"
+  },
+  "csrc/minimax31/span_planner/setup.py": {
+    "installed_sha256": "70a4263b795ee9b25b0f4bd0a2cfcf1538e0dceb2c49180bdae4773587a0e7b1",
+    "origin": "/home/xiesl/inference/verify_torch213_image/task_dir/support_minmax_31_pcp8_ep8_perf/decode_frozen_bs128_loop_20261120/attention_reuse/original_page_spans/fused_planner/setup.py",
+    "origin_sha256": "70a4263b795ee9b25b0f4bd0a2cfcf1538e0dceb2c49180bdae4773587a0e7b1"
+  }
+}

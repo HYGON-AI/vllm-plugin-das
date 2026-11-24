@@ -1,0 +1,54 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <hip/hip_runtime.h>
+
+__global__ void swap_verify_page_suffix(
+        const int64_t* sources, const int32_t* destinations, const int32_t* counts,
+        const int32_t* ranges, const int32_t* real, const uint4* host_k, const uint4* host_v,
+        uint4* device_k, uint4* device_v, int64_t stride) {
+    const int row = blockIdx.x / 4;
+    if (row / 4 >= real[0]) return;
+    const int head = row % 4;
+    const int selected = counts[row];
+    for (int item = blockIdx.x % 4; item < selected; item += 4) {
+        const int64_t index = row * stride + item;
+        const int range = ranges[index];
+        const int begin = range & 255;
+        const int end = range >> 8;
+        const int64_t from = sources[index] * 4096;
+        const int64_t to = int64_t(destinations[index]) * 4096;
+        for (int v = begin * 8 + threadIdx.x; v < end * 8; v += blockDim.x) {
+            const int lane = (v / 8 * 4 + head) * 8 + v % 8;
+            const auto key = host_k[from + lane];
+            const auto value = host_v[from + lane];
+            device_k[to + lane] = key;
+            device_v[to + lane] = value;
+        }
+    }
+}
+
+static void* accessible(const at::Tensor& tensor) {
+    if (tensor.is_cuda()) return tensor.data_ptr();
+    void* mapped = nullptr;
+    auto code = hipHostGetDevicePointer(&mapped, tensor.data_ptr(), 0);
+    TORCH_CHECK(code == hipSuccess, "host history must be device-mapped");
+    return mapped;
+}
+
+void swap_delta(const at::Tensor& src, const at::Tensor& dst, const at::Tensor& counts,
+                const at::Tensor& ranges, const at::Tensor& real,
+                const at::Tensor& hk, const at::Tensor& hv,
+                const at::Tensor& dk, const at::Tensor& dv) {
+    c10::cuda::CUDAGuard guard(src.device());
+    TORCH_CHECK(src.sizes() == dst.sizes() && src.sizes() == ranges.sizes() &&
+                src.is_contiguous() && dst.is_contiguous() && ranges.is_contiguous(),
+                "invalid suffix swap plan");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    hipLaunchKernelGGL(swap_verify_page_suffix, dim3(src.size(0) * 4), dim3(64), 0, stream,
+        src.data_ptr<int64_t>(), dst.data_ptr<int>(), counts.data_ptr<int>(),
+        ranges.data_ptr<int>(), real.data_ptr<int>(),
+        (const uint4*)accessible(hk), (const uint4*)accessible(hv),
+        (uint4*)dk.data_ptr(), (uint4*)dv.data_ptr(), src.stride(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
