@@ -192,10 +192,10 @@ class HcuCTMaskedExperts(_Experts):
     def __init__(self,moe,quant,weights,ops,capacity,dispatchers):
         super().__init__(moe,quant,max_num_tokens=capacity,num_dispatchers=dispatchers)
         self.weights=weights;self.ops=ops
-        from .clamped_int8_admission import admitted
-        self._live_row_activation = admitted(
-            ops, weights, self.w1_scale, self.w2_scale,
-            quant.gemm1_clamp_limit, masked=True)
+        from .clamped_int8_admission import masked_qualifier
+        self._qualify_live_activation = masked_qualifier(
+            ops, weights, self.w1_scale, self.w2_scale, quant.gemm1_clamp_limit)
+        self._live_row_activation = self._qualify_live_activation is not None
         self._small_batch_hint = False
         hint_mode, _ = hcu_env.resolve('HCU_DSV41_W4A8_MOE_EXPECTED_M', host='vllm')
         local_experts = int(self.w1_scale.shape[0])
@@ -236,7 +236,8 @@ class HcuCTMaskedExperts(_Experts):
                           gateup, counts, hint, use_hint)
         limit=self.quant_config.gemm1_clamp_limit
         activation_hint=hint if use_hint else t
-        if self._live_row_activation:
+        if (self._live_row_activation
+                and self._qualify_live_activation(t, activation_hint)):
             from .clamped_int8_triton import clamped_int8_2304
             mid,ms=clamped_int8_2304(gateup,counts,masked=True,expected_m=activation_hint)
         elif limit is not None and limit>0:

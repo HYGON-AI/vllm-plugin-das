@@ -26,12 +26,13 @@ def test_receiver_valid_rows_match_public_quantizer(width):
     assert torch.equal(actual_s[valid], expected_s.view(experts, tokens, 1)[valid])
 
 
-@pytest.mark.parametrize("experts", [32, 96])
-def test_dp4_activation_passes_native_byte_qualification(experts):
+@pytest.mark.parametrize("experts,rows,hint", [
+    (32, 1024, 16), (96, 1024, 80), (32, 1024, 1024), (32, 7, 3)])
+def test_activation_passes_native_byte_qualification_at_actual_geometry(experts, rows, hint):
     from hcu_vllm_das.moe.clamped_int8_admission import admitted
     from hcu_vllm_das.moe.ct_w4a8_runtime import get_ops
     placeholder = torch.empty(1, device="cuda")
     w1_scale = torch.empty(experts, 4608, 1, device="cuda")
     w2_scale = torch.empty(experts, 5120, 1, device="cuda")
     assert admitted(get_ops(), (placeholder, placeholder), w1_scale, w2_scale,
-                    10, masked=True)
+                    10, masked=True, rows=rows, expected_m=hint)
