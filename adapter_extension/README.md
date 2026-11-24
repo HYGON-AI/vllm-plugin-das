@@ -193,10 +193,20 @@ activate their inherited mapping, and spawned children discover the installed
 entry point. The capability can be required using the existing Adapter
 `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
 
-This is configuration parsing support only. The active wheel still lacks
-Flash model execution and model registration. MR-level Ready status reflects
-scoped source/component review, not closure of the
-[model integration and runtime gates](../docs/hy4_flash.md).
+The optional `das_hcu_hyv4_flash_model` entry point delivers the active Flash
+model implementation. Select it with
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model` on pinned vLLM 0.33.0.
+Unselected discovery imports no model and claims no model capability. This
+model owns the `HYV4FlashForCausalLM`/`HYV4FlashVLForConditionalGeneration` names;
+the separate optimized HY4 static-EPLB architecture and its entry points remain
+available. Flash quantized/latent parallel admission remains narrower than
+that static path and must not be treated as EPLB qualification.
+
+Activation health certifies registry/config/DFly ownership only. Checkpoint,
+DFly generation, HiSparse admission, changed-input Graph replay and measured
+performance need their own installed-artifact validation. See the
+[model integration and runtime gates](../docs/hy4_flash.md). In particular,
+HiSparse plus DFly or an unqualified Graph path remains unsupported.
 
 ## DSV4.1 HCU decode defaults
 
