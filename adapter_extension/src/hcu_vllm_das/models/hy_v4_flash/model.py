@@ -62,6 +62,10 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
         or vllm_config.lora_config is not None
     ):
         raise ValueError("HYV4 Flash does not support KV transfer or LoRA")
+    if vllm_config.attention_config.hisparse_config is not None:
+        raise NotImplementedError(
+            "Active Flash HiSparse runtime, including Graph and DFly, remains unqualified"
+        )
     spec = vllm_config.speculative_config
     if spec is not None:
         method = getattr(spec, "method", None)

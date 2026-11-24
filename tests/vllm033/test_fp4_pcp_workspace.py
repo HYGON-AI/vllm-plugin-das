@@ -70,9 +70,16 @@ def test_pcp8_without_speculation_and_fp8_route_unchanged(chain, monkeypatch):
     assert models.select_attention(cfg) is v41_pcp.HcuV41PcpAttention
 
 
+@pytest.mark.parametrize('pcp', [4, 8])
+def test_latest_adapter_native_pcp4_and_pcp8_remain_admitted(chain, pcp):
+    cfg = pcp_config(chain.cfg)
+    cfg.parallel_config.prefill_context_parallel_size = pcp
+    assert validate_config(cfg)
+
+
 @pytest.mark.parametrize('field,value', [
     ('data_parallel_size', 8), ('tensor_parallel_size', 2),
-    ('prefill_context_parallel_size', 4), ('decode_context_parallel_size', 2),
+    ('prefill_context_parallel_size', 2), ('decode_context_parallel_size', 2),
     ('enable_eplb', True), ('enable_expert_parallel', False),
     ('all2all_backend', 'deepep_low_latency')])
 def test_pcp_domain_remains_narrow(chain, field, value):
