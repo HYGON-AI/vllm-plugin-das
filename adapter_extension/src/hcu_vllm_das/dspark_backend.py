@@ -32,7 +32,7 @@ def _validate(config):
 
     if (_owned_quant_kind(config) != "ct_w4a8"
             or not native_decode_dspark(config) or is_owned_draft(config)):
-        raise ValueError("W4A8 draft LL requires the native CT DP8/EP8 target")
+        raise ValueError("W4A8 draft LL requires the native CT TP1 DP/EP target")
     # Reuse all default feature, topology and graph capacity checks without
     # constructing any model, communicator or transport resource.
     draft_config(config)
@@ -41,7 +41,10 @@ def _validate(config):
 
     from .dspark_ll_quant import receiver_quantizer_available
 
-    validate_legacy_ipc(Buffer)
+    parallel = getattr(config.speculative_config, 'target_parallel_config', None)
+    if parallel is None:
+        parallel = config.parallel_config
+    validate_legacy_ipc(Buffer, parallel.data_parallel_size)
     if not receiver_quantizer_available():
         raise ValueError("W4A8 draft LL requires vLLM public per-token INT8 quantization")
     return True

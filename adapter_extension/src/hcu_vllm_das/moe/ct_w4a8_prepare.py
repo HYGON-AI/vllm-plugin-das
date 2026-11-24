@@ -59,7 +59,8 @@ class HcuCTLLPrepareAndFinalize(DeepEPLLPrepareAndFinalize):
             raise ValueError('HCU LL input exceeds checked token capacity')
         if self.preserve_agrs_quantization and (
                 num_experts != 128 or a1.shape[1] != 5120
-                or self.num_dispatchers() != 8):
+                or self.num_dispatchers() <= 1
+                or num_experts % self.num_dispatchers()):
             raise ValueError('W4A8 BF16 wire is reserved for the admitted draft geometry')
         # v0.33 core routers emit int32 topk_ids; the legacy v0.29 plugin
         # path used int64. Accept both, reject anything else.

@@ -104,7 +104,7 @@ def _matches_native(native, device, experts, masked):
 def admitted(ops, weights, w1_scale, w2_scale, limit, *, masked):
     """Unknown providers, shapes and devices retain their existing operator."""
     experts = int(w1_scale.shape[0])
-    if (limit != 10 or experts not in ((16, 48) if masked else (16,))
+    if (limit != 10 or experts <= 0 or (not masked and experts != 16)
             or tuple(w1_scale.shape) != (experts, 4608, 1)
             or tuple(w2_scale.shape) != (experts, 5120, 1)
             or weights[0].device.type != "cuda"):

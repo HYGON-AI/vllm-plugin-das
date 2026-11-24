@@ -48,7 +48,7 @@ def validate_topology(config, moe):
             from hcu_vllm_das.dspark_graph import native_decode_dspark, validate_graph_capacity
 
             if not native_decode_dspark(config):
-                errors.append('DSpark AG-RS Graph requires native V41 DP8/EP8')
+                errors.append('DSpark AG-RS Graph requires native V41 TP1 DP/EP')
             else:
                 validate_graph_capacity(config, moe)
     elif actual.all2all_backend not in ('deepep_high_throughput','deepep_low_latency'):

@@ -190,15 +190,14 @@ class HcuCTMaskedExperts(_Experts):
         super().__init__(moe,quant,max_num_tokens=capacity,num_dispatchers=dispatchers)
         self.weights=weights;self.ops=ops
         from .clamped_int8_admission import admitted
-        self._live_row_activation = (capacity == 256 and dispatchers == 8
-            and admitted(ops, weights, self.w1_scale, self.w2_scale,
-                         quant.gemm1_clamp_limit, masked=True))
+        self._live_row_activation = admitted(
+            ops, weights, self.w1_scale, self.w2_scale,
+            quant.gemm1_clamp_limit, masked=True)
         self._small_batch_hint = False
         hint_mode, _ = hcu_env.resolve('HCU_DSV41_W4A8_MOE_EXPECTED_M', host='vllm')
         local_experts = int(self.w1_scale.shape[0])
         if (hint_mode == '1'
-                and capacity == 256 and dispatchers == 8
-                and local_experts in (16, 48)
+                and local_experts * dispatchers in (128, 384)
                 and tuple(self.w1_scale.shape[:2]) == (local_experts, 4608)
                 and tuple(self.w2_scale.shape[:2]) == (local_experts, 5120)
                 and quant.gemm1_clamp_limit == 10
@@ -222,8 +221,8 @@ class HcuCTMaskedExperts(_Experts):
         counts=expert_tokens_meta.expert_num_tokens
         # The hint selects kernels. Device counts still bound every expert's rows.
         hint = t
-        use_hint = self._small_batch_hint and (e, global_num_experts, topk_ids.shape[1]) in (
-            (48, 384, 6), (16, 128, 3))
+        use_hint = (self._small_batch_hint and e * self.num_dispatchers == global_num_experts
+                    and (global_num_experts, topk_ids.shape[1]) in ((384, 6), (128, 3)))
         if use_hint:
             hint = expected_m(topk_ids.shape[0], self.num_dispatchers, topk_ids.shape[1],
                               global_num_experts, t)
