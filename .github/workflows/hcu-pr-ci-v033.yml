@@ -314,7 +314,7 @@ jobs:
           persist-credentials: false
       - name: Trust checked-out workspace for package metadata
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Installed Channel-FP8 DeepGEMM numerical contract
+      - name: Installed gfx938 DeepGEMM and AITER INT8 Graph contracts
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
         run: python -I tools/run_v033_ci.py --tier device-gfx938 --junit v033-device.xml

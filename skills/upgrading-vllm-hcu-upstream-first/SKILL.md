@@ -235,6 +235,13 @@ structural admission still needs the original registry/native/device tests.
 
 1. Freeze Core/Adapter/Plugin sources and dependency heads. Check capability
    and ABI compatibility instead of introducing an exact-wheel runtime lock.
+   A public backend selection such as `--moe-backend aiter` is already explicit:
+   do not require a second private capability variable just to register that
+   backend. Test default discovery on gfx936 and gfx938, preserve official
+   auto/triton policy, optional-provider failures and fatal publication guards.
+   Capability requirements may remain optional deployment assertions. Test
+   actual workers without inherited requirement variables, then keep native
+   numeric/Graph and model gates separate from successful registration.
 2. Run affected CPU contracts, then installed native numerics and Graph
    replay with changing inputs, then the relevant real model/topology.
    Keep the requested backend, Graph, prefix, MTP and precision settings.

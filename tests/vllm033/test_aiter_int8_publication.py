@@ -44,7 +44,7 @@ def _fork_check(action):
     raise AssertionError("owned fork did not finish before the deadline")
 
 
-def _scenario(case, error_kind="runtime"):
+def _scenario(case, error_kind="runtime", activation="required", architecture="gfx938"):
     import torch
     from hcu_adapter.bridges import vllm as host
     from hcu_adapter.extensions import (
@@ -63,15 +63,25 @@ def _scenario(case, error_kind="runtime"):
             rendered.append("unsafe rendering")
             raise KeyboardInterrupt("error rendering must not precede the latch")
 
-    failure = {"runtime": RuntimeError, "interrupt": KeyboardInterrupt,
+    class ReenteringError(Exception):
+        def __str__(self):
+            rendered.append("reenter")
+            owner.activate(context)
+            raise AssertionError("reentrant activation must refuse")
+
+    failure = {"runtime": RuntimeError, "missing": ModuleNotFoundError,
+               "commit": ExtensionCommitError, "reenter": ReenteringError,
+               "interrupt": KeyboardInterrupt,
                "unprintable": Unprintable}[error_kind]("injected boundary failure")
-    phase = "register" if case == "fork-after-failure" else case
+    phase = ("register" if case == "fork-after-failure" else
+             "prepare" if case == "optional-unavailable" else case)
     point = next(p for p in distribution("hcu-vllm-das-plugin").entry_points
                  if p.name == "das_hcu_aiter_int8")
     later = SimpleNamespace(name="later-owner", load=lambda: lambda: ExtensionSpec(
         "later-owner", 1, 1, {"test-later-owner"}, lambda _: calls.append("later")))
     context = ExtensionContext("0.5.22", "0.33.0",
-                               requested_capabilities={owner.CAPABILITY})
+        requested_capabilities={owner.CAPABILITY} if activation == "required" else (),
+        requested_extensions={point.name} if activation == "extension" else ())
     assert registry.get_int8_moe_backend("aiter") is None
 
     def discover():
@@ -96,7 +106,7 @@ def _scenario(case, error_kind="runtime"):
         native_file.write_bytes(b"CPU fixture, never loaded as a native library")
         frozen = FrozenFiles.capture({"native": native_file})
         chip = ModuleType("aiter.jit.utils.chip_info")
-        chip.get_gfx = lambda: "gfx938"
+        chip.get_gfx = lambda: architecture
         asm_dir = folder + "/"
         original_register = registry.register_int8_moe_backend
 
@@ -127,14 +137,29 @@ def _scenario(case, error_kind="runtime"):
         with patch.dict(os.environ, {"AITER_ASM_DIR": asm_dir}), \
              patch.dict(sys.modules, {"aiter": ModuleType("aiter"),
                  "aiter.moe": ModuleType("aiter.moe"), chip.__name__: chip}), \
-             patch.object(host, "detect_hcu", return_value=host.HcuDetection(True, "gfx938", "")), \
+             patch.object(host, "detect_hcu", return_value=host.HcuDetection(True, architecture, "")), \
              patch.object(owner, "_prepare_identity", side_effect=prepare), \
              patch.object(registry, "register_int8_moe_backend", side_effect=register), \
              patch.object(FrozenFiles, "validate_paths", side_effect=validate_paths), \
              patch.object(torch.cuda, "_lazy_init", forbidden), \
              patch.object(torch.cuda, "current_device", forbidden), \
              patch.object(torch.cuda, "get_device_properties", forbidden):
-            if phase in {"prepare", "register", "health"}:
+            if case == "optional-unavailable":
+                assert not context.requested_capabilities and not context.requested_extensions
+                reports = discover()
+                unavailable = next(r for r in reports if r.entry_point_name == point.name)
+                assert unavailable.status is ExtensionStatus.FAILED
+                assert 'cannot prepare optional' in unavailable.reason
+                assert next(r for r in reports if r.entry_point_name == later.name).status is ExtensionStatus.ACTIVE
+                assert calls == ['prepare', 'later']
+                assert registry.get_int8_moe_backend('aiter') is None
+                assert owner._unavailable and not owner._failure and not owner._publishing
+                for action in (lambda: owner.activate(context), owner.check_health,
+                               lambda: host.require_extension_healthy(owner.CAPABILITY)):
+                    with pytest.raises(RuntimeError):
+                        action()
+                assert calls == ['prepare', 'later']  # No late repair/acquisition.
+            elif phase in {"prepare", "register", "health"}:
                 with pytest.raises(ExtensionCommitError) as rejected:
                     discover()
                 assert len(rejected.value.reports) == 1
@@ -153,7 +178,7 @@ def _scenario(case, error_kind="runtime"):
                         action()
                 assert calls.count("register") == count and "later" not in calls
                 assert calls.count("prepare") == prepared
-                assert not rendered
+                assert rendered == (["reenter"] if error_kind == "reenter" else [])
                 if case == "fork-after-failure":
                     _fork_check(refused_in_child)
             else:
@@ -202,7 +227,7 @@ def _scenario(case, error_kind="runtime"):
                 error_render_calls=len(rendered), gpu_initialized=False)
 
 
-def _run(case, error_kind="runtime"):
+def _run(case, error_kind="runtime", activation="required", architecture="gfx938"):
     import hcu_vllm_das
     package_root = str(Path(hcu_vllm_das.__file__).resolve().parent.parent)
     env = dict(os.environ, HCU_ADAPTER_HOST="none", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
@@ -215,12 +240,12 @@ def _run(case, error_kind="runtime"):
             "d=runpy.run_path(sys.argv[2]);print(" + repr(TAG)
             + "+json.dumps(d['_scenario'](*sys.argv[3:])))")
     result = subprocess.run([sys.executable, "-I", "-B", "-c", code,
-        package_root, __file__, case, error_kind], env=env,
+        package_root, __file__, case, error_kind, activation, architecture], env=env,
         capture_output=True, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     rows = [json.loads(line[len(TAG):]) for line in result.stdout.splitlines()
             if line.startswith(TAG)]
-    assert len(rows) == 1 and rows[0]["error_render_calls"] == 0
+    assert len(rows) == 1 and rows[0]["error_render_calls"] == (error_kind == "reenter")
     assert rows[0]["gpu_initialized"] is False
     return rows[0]
 
@@ -237,3 +262,33 @@ def test_idempotence_and_actual_process_boundaries(case):
     if case.startswith("fork-") and not hasattr(os, "fork"):
         pytest.skip("requires real CPU fork")
     assert _run(case)["register_calls"] == 1
+
+
+@pytest.mark.parametrize("architecture", ["gfx936", "gfx938"])
+@pytest.mark.parametrize("case", ["normal", "concurrent", "fork-after-active"])
+def test_default_discovery_publishes_without_private_requirements(case, architecture):
+    assert _run(case, activation="automatic", architecture=architecture)["register_calls"] == 1
+
+
+@pytest.mark.parametrize("architecture", ["gfx936", "gfx938"])
+@pytest.mark.parametrize("error_kind", ["runtime", "missing"])
+def test_optional_preparation_failure_keeps_other_backends_available(architecture, error_kind):
+    assert _run("optional-unavailable", error_kind, activation="automatic",
+                architecture=architecture)["register_calls"] == 0
+
+
+@pytest.mark.parametrize("phase", ["register", "health"])
+def test_default_publication_failure_still_stops_later_owners(phase):
+    assert _run(phase, activation="automatic")["register_calls"] == 1
+
+
+def test_explicit_entry_point_requirement_remains_a_strict_startup_assertion():
+    assert _run("prepare", activation="extension")["register_calls"] == 0
+
+
+def test_optional_preparation_does_not_hide_an_inherited_fatal_error():
+    assert _run("prepare", "commit", activation="automatic")["register_calls"] == 0
+
+
+def test_optional_error_rendering_cannot_hide_reentrant_activation_failure():
+    assert _run("prepare", "reenter", activation="automatic")["register_calls"] == 0
