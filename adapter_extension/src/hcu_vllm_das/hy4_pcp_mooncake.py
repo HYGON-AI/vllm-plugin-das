@@ -10,6 +10,7 @@ from vllm.distributed.parallel_state import get_pcp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector as native
 
 from hcu_adapter.infra.native_namespace import bind_native
+from hcu_adapter.infra.kill_switch import op_disabled
 
 
 def _validate(config):
@@ -41,6 +42,30 @@ def _init_native(worker, config, engine_id, cache_config):
 
 
 class HY4PCPMooncakeWorker(native.MooncakeConnectorWorker):
+    async def _build_transfer_params(self, ready_reqs, agent_meta,
+                                     local_regions, remote_regions):
+        build = native.MooncakeConnectorWorker._build_transfer_params
+        if op_disabled('hy4_mooncake_grouping_reuse'):
+            return await build(self, ready_reqs, agent_meta, local_regions, remote_regions)
+
+        # Core copies per-region block lists. Cache by their complete values,
+        # not object identity, so packed/shared groups retain their semantics.
+        # This cache is invocation-local: later prefix hits or KV allocations
+        # must never reuse an earlier request's transfer plan.
+        grouped = {}
+        group = native.group_concurrent_contiguous
+
+        def reuse(source, destination):
+            key = (tuple(source), tuple(destination))
+            result = grouped.get(key)
+            if result is None:
+                result = group(source, destination)
+                grouped[key] = result
+            return result
+
+        build = bind_native(build, {'group_concurrent_contiguous': reuse})
+        return await build(self, ready_reqs, agent_meta, local_regions, remote_regions)
+
     def __init__(self, vllm_config, engine_id, kv_cache_config):
         self._native_entered = False
         _validate(vllm_config)

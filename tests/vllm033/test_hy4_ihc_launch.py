@@ -72,7 +72,7 @@ def test_launch_bindings_keep_native_code_and_precision():
         assert original.__globals__['_PRE_STAGE1_WARPS'] == 8
         assert original.__globals__['_PRE_STAGE2_WARPS'] == 4
     assert owned.TunedHCPre.forward.__code__ is owned.hc.HYV4HCPreLayer.forward.__code__
-    assert owned.TunedHCPre.forward.__globals__['triton_ihc_pre'] is owned.tuned_pre
+    assert owned.TunedHCPre.forward.__globals__['triton_ihc_pre'] is owned._pre
     assert owned.hc.HYV4HCPreLayer.forward.__globals__['triton_ihc_pre'] is owned.kernels.triton_ihc_pre
     assert owned.TunedDecoder.forward is owned.native.HYV4DecoderLayer.forward
     assert owned.TunedDecoder._forward_ihc.__code__ is owned.native.HYV4DecoderLayer._forward_ihc.__code__

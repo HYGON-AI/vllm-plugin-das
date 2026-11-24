@@ -193,7 +193,6 @@ class HcuHY4StaticMTP(_StaticProtocol, HcuHY4CTMTP):
         plan = _preflight(vllm_config, draft=True)
         _MTP_INIT(self, vllm_config=vllm_config, prefix=prefix)
         dense_fusion.attach(self.model, vllm_config)
-        fused_routing.attach(self.model, vllm_config)
         self._hcu_static_cfg = vllm_config
         self._hcu_static_expected_plan = plan
         _publish_protocol(self, [layer.mtp_block.mlp for layer in self.model.layers.values()],

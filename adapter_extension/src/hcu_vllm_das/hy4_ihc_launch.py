@@ -8,6 +8,7 @@ this policy; the master rollback or an unset child retains native layers.
 """
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.models.hy_v4.amd import hc, model as native, triton_ihc as kernels
 
@@ -46,9 +47,44 @@ tuned_pre = bind_constructor(kernels.triton_ihc_pre, _LAUNCH)
 tuned_chain = bind_constructor(kernels.triton_ihc_post_pre_rms_norm, _LAUNCH)
 
 
+def _vendor_topology(cfg=None):
+    cfg = get_current_vllm_config() if cfg is None else cfg
+    model, parallel = cfg.model_config, cfg.parallel_config
+    return (getattr(model.hf_config, 'model_type', None) == 'hy_v4'
+            and not model.is_multimodal_model and model.enforce_eager
+            and (parallel.tensor_parallel_size, parallel.pipeline_parallel_size,
+                 parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size,
+                 parallel.data_parallel_size) == (1, 1, 16, 1, 1))
+
+
+def _use_vendor(x):
+    return (custom_ops_enabled() and _flag('HCU_VLLM_HY4_IHC_VENDOR', default=False)
+            and _vendor_topology() and x.device.type == 'cuda'
+            and x.dtype == torch.bfloat16 and x.ndim == 3
+            and x.shape[0] >= 378 and tuple(x.shape[1:]) == (4, 6144)
+            and x.is_contiguous())
+
+
+def _vendor():
+    from hcu_adapter.bridges import vllm_ihc
+    return vllm_ihc
+
+
+def _pre(x, weight, scale, base, magnitude, hc_eps, norm_eps):
+    function = _vendor().pre if _use_vendor(x) else tuned_pre
+    return function(x, weight, scale, base, magnitude, hc_eps, norm_eps)
+
+
+def _chain(x, residual, post, weight, scale, base, norm_weight,
+           magnitude, hc_eps, norm_eps):
+    function = _vendor().post_pre_rms_norm if _use_vendor(residual) else tuned_chain
+    return function(x, residual, post, weight, scale, base, norm_weight,
+                    magnitude, hc_eps, norm_eps)
+
+
 class TunedHCPre(hc.HYV4HCPreLayer):
     forward = bind_constructor(hc.HYV4HCPreLayer.forward,
-                               {'triton_ihc_pre': tuned_pre})
+                               {'triton_ihc_pre': _pre})
 
 
 class TunedHCLayer(hc.HYV4HCLayer):
@@ -60,11 +96,14 @@ class TunedDecoder(native.HYV4DecoderLayer):
     __init__ = bind_constructor(native.HYV4DecoderLayer.__init__,
                                {'HYV4HCLayer': TunedHCLayer})
     _forward_ihc = bind_constructor(native.HYV4DecoderLayer._forward_ihc,
-        {'triton_ihc_post_pre_rms_norm': tuned_chain})
+        {'triton_ihc_post_pre_rms_norm': _chain})
 
 
 def selected(cfg):
     use_tuned = enabled(cfg)
     if use_tuned:
         logger.info_once('HY4 native iHC launch 4/4 enabled for gfx938 backbone')
+        if _flag('HCU_VLLM_HY4_IHC_VENDOR', default=False) and _vendor_topology(cfg):
+            _vendor().validate_abi()
+            logger.info_once('HY4 PCP16 BoltOps iHC selected for rows >= 378')
     return use_tuned
