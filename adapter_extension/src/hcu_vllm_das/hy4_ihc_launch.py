@@ -7,8 +7,8 @@ decoder loop, checkpoint parameters and graph lifecycle. Restart to change
 this policy; the master rollback or an unset child retains native layers.
 """
 import torch
+from types import MethodType
 
-from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.models.hy_v4.amd import hc, model as native, triton_ihc as kernels
 
@@ -47,8 +47,7 @@ tuned_pre = bind_constructor(kernels.triton_ihc_pre, _LAUNCH)
 tuned_chain = bind_constructor(kernels.triton_ihc_post_pre_rms_norm, _LAUNCH)
 
 
-def _vendor_topology(cfg=None):
-    cfg = get_current_vllm_config() if cfg is None else cfg
+def _vendor_topology(cfg):
     model, parallel = cfg.model_config, cfg.parallel_config
     return (getattr(model.hf_config, 'model_type', None) == 'hy_v4'
             and not model.is_multimodal_model and model.enforce_eager
@@ -59,7 +58,7 @@ def _vendor_topology(cfg=None):
 
 def _use_vendor(x):
     return (custom_ops_enabled() and _flag('HCU_VLLM_HY4_IHC_VENDOR', default=False)
-            and _vendor_topology() and x.device.type == 'cuda'
+            and x.device.type == 'cuda'
             and x.dtype == torch.bfloat16 and x.ndim == 3
             and x.shape[0] >= 378 and tuple(x.shape[1:]) == (4, 6144)
             and x.is_contiguous())
@@ -84,7 +83,7 @@ def _chain(x, residual, post, weight, scale, base, norm_weight,
 
 class TunedHCPre(hc.HYV4HCPreLayer):
     forward = bind_constructor(hc.HYV4HCPreLayer.forward,
-                               {'triton_ihc_pre': _pre})
+                               {'triton_ihc_pre': tuned_pre})
 
 
 class TunedHCLayer(hc.HYV4HCLayer):
@@ -96,7 +95,43 @@ class TunedDecoder(native.HYV4DecoderLayer):
     __init__ = bind_constructor(native.HYV4DecoderLayer.__init__,
                                {'HYV4HCLayer': TunedHCLayer})
     _forward_ihc = bind_constructor(native.HYV4DecoderLayer._forward_ihc,
-        {'triton_ihc_post_pre_rms_norm': _chain})
+        {'triton_ihc_post_pre_rms_norm': tuned_chain})
+
+
+_VENDOR_PRE_FORWARD = bind_constructor(hc.HYV4HCPreLayer.forward,
+                                      {'triton_ihc_pre': _pre})
+_VENDOR_DECODER_FORWARD = bind_constructor(native.HYV4DecoderLayer._forward_ihc,
+    {'triton_ihc_post_pre_rms_norm': _chain})
+
+
+def attach_vendor(model, cfg):
+    """Capture config admission during construction; no config lookup in forward."""
+    if (not _flag('HCU_VLLM_HY4_IHC_VENDOR', default=False)
+            or not enabled(cfg) or not _vendor_topology(cfg)):
+        return model
+    candidates = []
+    for layer in model.modules():
+        if not isinstance(layer, native.HYV4DecoderLayer):
+            continue  # Native MTP uses a distinct NVIDIA decoder.
+        owners = (layer.hc_attn_layer.hc_pre, layer.hc_mlp_layer.hc_pre)
+        existing = getattr(layer, '_hcu_vendor_ihc', False)
+        expected_pre = _VENDOR_PRE_FORWARD if existing else TunedHCPre.forward
+        expected_decoder = _VENDOR_DECODER_FORWARD if existing else TunedDecoder._forward_ihc
+        if (layer._forward_ihc.__func__ is not expected_decoder
+                or any(type(owner) is not TunedHCPre or owner.hpc_op is not None
+                       or owner.forward.__func__ is not expected_pre for owner in owners)):
+            raise RuntimeError('HY4 vendor iHC instance already has another owner')
+        candidates.append((layer, owners))
+    if not candidates:
+        raise RuntimeError('HY4 vendor iHC found no admitted backbone layers')
+    # Validate all owners before publishing any binding. Core reads parameters
+    # on each call, so reloads never retain an earlier weight object.
+    for layer, owners in candidates:
+        for owner in owners:
+            owner.forward = MethodType(_VENDOR_PRE_FORWARD, owner)
+        layer._forward_ihc = MethodType(_VENDOR_DECODER_FORWARD, layer)
+        layer._hcu_vendor_ihc = True
+    return model
 
 
 def selected(cfg):

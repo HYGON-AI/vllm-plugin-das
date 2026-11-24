@@ -26,7 +26,8 @@ def make_ct_backbone(*, vllm_config, prefix=''):
     hy4_dp_metadata.prepare(vllm_config)
     cls = HcuHY4CTLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4CTBackbone
     return fused_routing.attach(
-        dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config), vllm_config)
+        dense_fusion.attach(ihc_launch.attach_vendor(
+            cls(vllm_config=vllm_config, prefix=prefix), vllm_config), vllm_config), vllm_config)
 
 
 def make_ct_predictor(*, vllm_config, prefix=''):

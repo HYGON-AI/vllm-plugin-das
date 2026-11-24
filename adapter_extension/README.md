@@ -124,6 +124,18 @@ native launch. MTP is unchanged. This defaults off; unset the child or disable
 the master and restart to roll back. Reduction ordering can change slightly;
 component tests do not replace checkpoint accuracy or serving measurements.
 
+With the paired Adapter iHC bridge, text-only eager PCP16 can additionally set
+`HCU_VLLM_HY4_IHC_VENDOR=1`. Only contiguous BF16 inputs with at least 378 rows
+use BoltOps pre/post plus Core RMS; smaller inputs and D retain the Core chain.
+Topology is captured on owned backbone instances during construction. Native
+decoder bodies, live checkpoint parameters and BF16 rounding boundaries remain.
+This option defaults off and requires whole-model accuracy/performance validation.
+
+The owned HY4 Mooncake worker reuses equal block-ID groupings only within one
+native builder call. `HCU_DISABLE_OPS=hy4_mooncake_grouping_reuse` restores the
+unmodified builder. Transfer regions, byte offsets and descriptor validation
+remain native.
+
 HY4 W4A8 PCP16 prefills can opt into per-token INT8 DeepEP HT transport with
 `VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_HT_INT8_DISPATCH=1` (default off).
 This quantizes source rows before dispatch; Core retains receive metadata,

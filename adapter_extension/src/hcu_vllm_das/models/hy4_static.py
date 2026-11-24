@@ -86,7 +86,8 @@ def make_static_backbone(*, vllm_config, prefix=''):
     hy4_dp_metadata.prepare(vllm_config)
     cls = HcuHY4StaticLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4StaticBackbone
     return fused_routing.attach(
-        dense_fusion.attach(cls(vllm_config=vllm_config, prefix=prefix), vllm_config), vllm_config)
+        dense_fusion.attach(ihc_launch.attach_vendor(
+            cls(vllm_config=vllm_config, prefix=prefix), vllm_config), vllm_config), vllm_config)
 
 
 _OUTER_INIT = bind_constructor(native.HYV4ForCausalLM.__init__,
