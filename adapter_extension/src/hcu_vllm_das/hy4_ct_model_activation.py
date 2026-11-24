@@ -35,7 +35,8 @@ def activate(context):
     # models at the next extension priority. It must keep sole registry ownership.
     if ('hy4-static-eplb' in context.requested_capabilities
             or 'das_hcu_hy4_static' in context.requested_extensions
-            or 'hy4-ct-w4a8' not in context.requested_capabilities):
+            or not ('hy4-ct-w4a8' in context.requested_capabilities
+                    or 'das_hcu_hy4_ct_w4a8' in context.requested_extensions)):
         return
     if _publication is not None:
         check_health()

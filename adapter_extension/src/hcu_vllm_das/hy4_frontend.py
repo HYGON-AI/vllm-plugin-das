@@ -50,15 +50,18 @@ def activate(context):
             raise ExtensionCommitError("ByteLevel published state unavailable") from error
         if not valid:
             raise ExtensionCommitError("ByteLevel published policy/owner changed; restart")
-        _state = (os.getpid(), *_state[1:])
-        return
-    mode = _mode()
+        mode = _state[1]
+    else:
+        mode = _mode()
     required = (
         'das_hcu_hy4_frontend' in context.requested_extensions
         or 'bytelevel-prompt-tail' in context.requested_capabilities
     )
     if required and not mode:
         raise ValueError(f'ByteLevel provider requires {_FLAG}=1')
+    if _state is not None:
+        _state = (os.getpid(), *_state[1:])
+        return
     if not mode:
         _state = (os.getpid(), False, None, None, None)
         return
