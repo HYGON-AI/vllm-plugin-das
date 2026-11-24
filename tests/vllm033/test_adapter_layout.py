@@ -26,6 +26,7 @@ NAMES = {
     "dsv41_dspark_registration": "features.dsv41.dsv41_dspark_registration",
     "dsv41_draft_weight_alias": "features.dsv41.dsv41_draft_weight_alias",
     "dsv41_int8_linear": "features.dsv41.dsv41_int8_linear",
+    "ct_w4a8_masked_activation": "features.ct_w4a8.masked_activation",
     "channel_fp8_empty_linear": "features.ct_w4a8.channel_fp8_empty_linear",
     "ct_w4a8_packed_loader": "features.ct_w4a8.ct_w4a8_packed_loader",
 }
