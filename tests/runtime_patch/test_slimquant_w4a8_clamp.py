@@ -26,6 +26,11 @@ from vllm_hcu.model_executor.layers.quantization import (
 
 @pytest.fixture
 def cpu_ops(monkeypatch):
+    # The no-driver vLLM probe supplies a language placeholder without float
+    # dtypes. These tests double GPU leaf operations; use host dtype metadata
+    # only in those consumers and restore their namespaces after each test.
+    import triton.language as tl
+
     quantized = []
     gemms = []
 
@@ -79,6 +84,7 @@ def cpu_ops(monkeypatch):
 
     monkeypatch.setattr(utils, "per_token_quant_int8", per_token_quant)
     for module in (triton_moe, fused_moe):
+        monkeypatch.setattr(module, "tl", tl)
         monkeypatch.setattr(module, "invoke_fused_moe_triton_kernel", gemm)
         monkeypatch.setattr(module, "_prepare_expert_assignment", assignment)
         monkeypatch.setattr(
@@ -110,6 +116,10 @@ def _inputs(dtype, limit=10.0):
         activation=MoEActivation.SILU,
         num_experts=1,
         swiglu_limit=limit,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        activation_situ_beta=None,
+        activation_situ_linear_beta=None,
         moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
     )
     method = SimpleNamespace(
