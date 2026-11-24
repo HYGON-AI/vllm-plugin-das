@@ -212,7 +212,24 @@ def _load_custom_allreduce_source(monkeypatch: pytest.MonkeyPatch) -> ModuleType
     )
     hcu_ops_module = _module("vllm_hcu.hcu_ops")
 
+    dist = _module("torch.distributed")
+    dist.Backend = SimpleNamespace(NCCL="nccl")
+    dist.ProcessGroup = object
+
+    class _FakeDevice:
+        def __init__(self, spec: int | str) -> None:
+            del spec
+            self.type = "cuda"
+            self.index = 0
+
+    torch = _module("torch")
+    torch.distributed = dist
+    torch.device = _FakeDevice
+    torch.ops = SimpleNamespace()
+
     modules = {
+        "torch": torch,
+        "torch.distributed": dist,
         "vllm": vllm,
         "vllm.envs": envs,
         "vllm.distributed": distributed,
