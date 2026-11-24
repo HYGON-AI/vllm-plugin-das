@@ -88,7 +88,9 @@ class TunedMaskedExperts(HcuCTMaskedExperts):
         # Reuse the complete upstream fallback and CPU DP metadata semantics.
         estimate = BatchedDeepGemmExperts.estimate_expected_m(
             self, global_num_experts, capacity, topk)
-        return min(capacity, max(128, estimate))
+        # A large floor selects oversized HIPC tiles for small decode batches.
+        # Device counts still cover every live row, including hot experts.
+        return min(capacity, max(32, estimate))
 
 
 def make_ll_experts(moe, quant, weights, ops, prepare):
@@ -99,6 +101,6 @@ def make_ll_experts(moe, quant, weights, ops, prepare):
     if not _supported(cfg, moe, quant, prepare):
         return HcuCTMaskedExperts(moe, quant, weights, ops, capacity, dispatchers)
     private_ops = tuned_ops(ops)
-    logger.info_once('HY4 LL HIPC tuning enabled: expected-M floor128, '
+    logger.info_once('HY4 LL HIPC tuning enabled: expected-M floor32, '
                      'persistent64, v0.25 FP32 clamp-quant math')
     return TunedMaskedExperts(moe, quant, weights, private_ops, capacity, dispatchers)

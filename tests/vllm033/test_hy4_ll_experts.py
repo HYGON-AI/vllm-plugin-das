@@ -107,7 +107,8 @@ def test_backbone_and_mtp_can_use_same_quant_math(monkeypatch, model_type):
     assert owned._supported(*args)
 
 
-@pytest.mark.parametrize('vector,want', [(None, 512), ([0]*16, 128), ([32]*16, 128),
+@pytest.mark.parametrize('vector,want', [(None, 512), ([0]*16, 32), ([4]*16, 32),
+    ([24]*16, 32), ([32]*16, 32), ([64]*16, 32),
     ([512]*16, 256), ([2048]*16, 512)])
 def test_native_cpu_dp_hint_keeps_missing_metadata_fallback(vector, want):
     owned = module()
@@ -117,6 +118,13 @@ def test_native_cpu_dp_hint_keeps_missing_metadata_fallback(vector, want):
     instance = owned.TunedMaskedExperts.__new__(owned.TunedMaskedExperts)
     with override_forward_context(context):
         assert instance.expected_m(256, 512, 8) == want
+
+
+@pytest.mark.parametrize('experts,capacity,topk', [(272,512,8), (256,256,8), (256,512,4)])
+def test_other_expert_geometry_keeps_capacity_fallback(experts, capacity, topk):
+    owned = module()
+    instance = owned.TunedMaskedExperts.__new__(owned.TunedMaskedExperts)
+    assert instance.expected_m(experts, capacity, topk) == capacity
 
 
 def test_private_ops_keep_shared_provider_and_fixed_clamp_abi(monkeypatch):
