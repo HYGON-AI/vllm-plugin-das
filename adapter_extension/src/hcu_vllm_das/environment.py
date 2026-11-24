@@ -36,6 +36,18 @@ def custom_ops_enabled() -> bool:
     return _flag(_MASTER_SWITCH, default=False)
 
 
+def gdn_policy() -> tuple[str, str]:
+    """Optional leaf providers; official backend selection remains in Core."""
+    selected = []
+    for stage in ("PREFILL", "DECODE"):
+        name = "VLLM_HCU_GDN_" + stage + "_BACKEND"
+        value = os.environ.get(name, "triton").strip().lower()
+        if value not in {"triton", "hcu-boltops", "hcu-aiter"}:
+            raise ValueError(name + " must be triton, hcu-boltops or hcu-aiter")
+        selected.append(value)
+    return tuple(selected) if custom_ops_enabled() else ("triton", "triton")
+
+
 def rms_norm_enabled() -> bool:
     """Return whether the migrated LightOp RMSNorm paths are enabled."""
 

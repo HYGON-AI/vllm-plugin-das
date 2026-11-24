@@ -28,6 +28,7 @@ EXPECTED_ENTRY_POINTS = {
         "das_hcu_v41_indexer": "hcu_vllm_das.v41_indexer_activation:extension_spec",
         "das_hcu_v41_pcp": "hcu_vllm_das.v41_pcp_activation:extension_spec",
         "das_hcu_fp4_packer": "hcu_vllm_das.fp4_packer:extension_spec",
+        "das_hcu_gdn_fla": "hcu_vllm_das.gdn_activation:extension_spec",
         "das_hcu_step5_config": "hcu_vllm_das.step5_activation:extension_spec",
         "das_hcu_wo_a_token_major": "hcu_vllm_das.wo_a_token_major:extension_spec",
     }

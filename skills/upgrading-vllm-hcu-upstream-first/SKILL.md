@@ -265,6 +265,15 @@ For explicit FP8 KV names, writer bytes, mixed query/cache dtypes and native
 Flash prefill/decode boundaries, read [Flash KV formats](references/flash-kv-formats.md).
 
 Graph capture or HTTP health alone does not establish successful generation.
+For MTP observations, derive the draft-model field and concrete class from the
+selected runner and model registry before launching a full checkpoint. MRV2
+uses `speculator.model`; Qwen3.5 MoE resolves to `Qwen3_5MoeMTP`, rather than
+the dense `Qwen3_5MTP` base. Bind the worker's class and source to that selected
+architecture, and separately verify trained layers, shared embeddings, restored
+gate weights and nonzero drafted/accepted tokens. Replay a failed read-only
+observer against its saved response before repeating a costly model run;
+preserve that failed attempt and its completed cleanup.
+
 When workspace planning moves to construction, build the real layer in CPU
 regressions with explicit native leaf doubles and exercise its frozen plan.
 Mutate the source configuration afterward and verify reservation and reuse at
@@ -293,6 +302,18 @@ backend selector authoritative: a selected whole-op/fused route can bypass the
 leaf aliases, so require execution evidence rather than counting activation as
 coverage. Python guards do not execute inside an already captured device Graph;
 serving health must also cover the host boundary before Graph replay.
+An installed native test using public startup must call the target Core's
+general-plugin loader before checking the ACTIVE Adapter owner. Plain pytest
+does not execute serving startup, and host/required-capability environment
+variables alone do not activate extensions. Retain the required-owner check;
+verify the ordinary CI entry without a harness that silently preloads plugins.
+Keep serving-worker policy and completed Python provider submissions separate
+from GPU trace events: a Graph replay may expose `hipGraphLaunch` without
+individual decode-node kernels. Identify prepared fallbacks per leaf; an
+AITER stage policy can still execute BoltOPs chunk-O/recompute. Compare with
+a stock arm that verifies every consumer alias still binds canonical Core.
+Retain per-task raw losses even when fence-normalized tests all pass; do not
+transfer a frozen model result to a head that inherits new target code.
 Inspect actual optional-provider signatures even when the public version is
 unchanged. BoltOPs chunk-O has an audited trailing `full_chunks=None` variant;
 retain masked varlen semantics rather than forcing full chunks. Distinguish
@@ -490,8 +511,9 @@ when a conflict reveals a newer merged implementation. Check expected head and
 live base again before a normal non-forced publication.
 
 Inspect the actual fork job environment before relying on variables/secrets.
-An authorized published release digest can supply an explicit project baseline
-when variables are unavailable; preserve overrides and reject mutable/foreign
+Only when the project's trusted policy explicitly permits a recorded baseline,
+an authorized published release digest can supply it when variables are unavailable;
+otherwise retain required configuration. Preserve overrides and reject mutable/foreign
 images. On Actions runner v2.338.2, an empty container credentials object is
 valid while present empty username/password fields fail template validation.
 Omit unavailable fields for forks; never send secrets to them or relax gates.
@@ -499,6 +521,17 @@ After checkout restores its temporary HOME, package metadata may still hit Git
 ownership refusal. Trust only the exact checkout path in the ephemeral job,
 never `safe.directory=*`, and verify another foreign checkout remains rejected.
 A successful container start still requires the actual selected tests to pass.
+
+When PR checks never appear, resolve the workflow's actual event context before
+changing labels or pushing again. Current GitHub.com `pull_request_target` uses
+the receiving repository's default branch; older GHES versions can use the PR
+base. Check the applicable [event documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_target),
+default ref and workflow file there. Landing it only on another release branch
+may leave the PR entry absent. A manual dispatch returning 204 is accepted:
+observe its run before retrying. A target-only run does not test a PR head.
+Retain trusted authorization, exact-head checkout, credential isolation and
+device/aggregate gates when choosing a repair within the authorized branch scope.
+Zero check contexts or conflict-free mergeability do not establish CI success.
 
 A workflow can intentionally skip its GPU job for pull_request_target events.
 Treat the automatic green summary as structural evidence only. If the project
@@ -658,6 +691,24 @@ Check each job's actual driver: direct benchmark scripts may execute even
 when another job's pytest session is paused. Count JUnit launcher cases,
 CSV measurement rows and numerical regression cases separately; selected
 benchmark timings do not qualify unrelated kernels or model accuracy.
+
+Derive grouped key/value head counts from the actual checkpoint and the
+selected Core's sharding/replication rules. Cover each new per-rank geometry
+when changing TP, even if its head ratio matches an already-tested TP1 shape.
+Keep prefill, packed decode and speculative varlen/accepted-state Graph
+coverage. Add only missing cases and bind their receipts to the actual
+installation's package RECORDs; component parity does not qualify TP
+communication, model quality or performance, and older counts stay separate.
+Interpret shutdown logs against the selected Core source: `mode=abort` may
+mean the default zero-timeout request policy rather than an OS abort. Record
+actual exit codes, process release and native leak reports independently;
+successful exits do not resolve nanobind leaks.
+For a suspected frozen-heap leak, compare the public `freeze_gc_heap()` helper
+and natural interpreter exit in hidden-device base/candidate processes before
+running a model. Keep serving-time freezing intact. Verify shutdown duration,
+child-process release and `force killing remaining processes` logs: a parent
+exit of 0 cannot establish natural worker cleanup. An import-only fix does not
+qualify serving or waive the exit-latency tradeoff of final cyclic collection.
 
 For same-host Mooncake HIP IPC, inspect ROCR visibility separately from each
 process's HIP/CUDA compute mask. The tested DTK2610/gfx938 runtime crashes on
