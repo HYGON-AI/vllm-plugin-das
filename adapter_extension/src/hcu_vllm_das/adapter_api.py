@@ -22,7 +22,10 @@ _RELOCATED = {
     "dsv41_dspark_registration": "hcu_adapter.features.dsv41.dsv41_dspark_registration",
     "dsv41_draft_weight_alias": "hcu_adapter.features.dsv41.dsv41_draft_weight_alias",
     "dsv41_int8_linear": "hcu_adapter.features.dsv41.dsv41_int8_linear",
+    "ct_w4a8_masked_activation": "hcu_adapter.features.ct_w4a8.masked_activation",
     "channel_fp8_empty_linear": "hcu_adapter.features.ct_w4a8.channel_fp8_empty_linear",
+    "lightop_int8_linear": "hcu_adapter.features.ct_w4a8.lightop_int8_linear",
+    "cpu_metadata": "hcu_adapter.features.cpu_metadata",
     "ct_w4a8_packed_loader": "hcu_adapter.features.ct_w4a8.ct_w4a8_packed_loader"
 }
 
