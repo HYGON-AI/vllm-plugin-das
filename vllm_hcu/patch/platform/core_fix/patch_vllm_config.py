@@ -153,6 +153,62 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
             raise ValueError("HYV4 PCP MTP does not support EPLB outside static W4A8 PCP16.")
 
 
+def _is_hyv4_vl_mooncake_store(vllm_config: object) -> bool:
+    """Return whether this is the narrowly supported HYV4-VL Store path."""
+    model_config = getattr(vllm_config, "model_config", None)
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    return (
+        getattr(model_config, "architectures", None)
+        == ["HYV4VLForConditionalGeneration"]
+        and getattr(transfer, "kv_connector", None) == "MooncakeStoreConnector"
+        and getattr(transfer, "kv_role", None) == "kv_both"
+        and getattr(transfer, "kv_connector_module_path", None) is None
+    )
+
+
+def _is_hyv4_vl_mooncake_pd_store_producer(vllm_config: object) -> bool:
+    """Allow the supported PCP producer to publish to P2P and Store."""
+    model_config = getattr(vllm_config, "model_config", None)
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        getattr(model_config, "architectures", None)
+        != ["HYV4VLForConditionalGeneration"]
+        or getattr(transfer, "kv_connector", None) != "MultiConnector"
+        or getattr(transfer, "kv_role", None) != "kv_producer"
+        or getattr(transfer, "kv_connector_module_path", None) is not None
+    ):
+        return False
+
+    extra_config = getattr(transfer, "kv_connector_extra_config", None)
+    connectors = extra_config.get("connectors") if isinstance(extra_config, dict) else None
+    if not isinstance(connectors, list) or len(connectors) != 2:
+        return False
+
+    expected = {"MooncakeConnector", "MooncakeStoreConnector"}
+    for child in connectors:
+        if (
+            not isinstance(child, dict)
+            or child.get("kv_role") != "kv_producer"
+            or child.get("kv_connector_module_path") is not None
+        ):
+            return False
+        name = child.get("kv_connector")
+        if not isinstance(name, str) or name not in expected:
+            return False
+        expected.remove(name)
+    return True
+
+
+def _is_hyv4_vl_mooncake_p2p_producer(vllm_config: object) -> bool:
+    """Allow the supported PCP producer to publish KV through Mooncake P2P."""
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    return (
+        getattr(transfer, "kv_connector", None) == "MooncakeConnector"
+        and str(getattr(transfer, "kv_role", None)) == "kv_producer"
+        and getattr(transfer, "kv_connector_module_path", None) is None
+    )
+
+
 def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
     """Admit standalone W4A8 PCP16 and the static image producer."""
     parallel = vllm_config.parallel_config
@@ -161,7 +217,19 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
     raw_quantization = getattr(
         getattr(model, "hf_config", None), "quantization_config", None
     )
-    if vllm_config.kv_transfer_config is None and not parallel.enable_eplb:
+    mooncake_store = (
+        _is_hyv4_vl_mooncake_store(vllm_config)
+        or _is_hyv4_vl_mooncake_pd_store_producer(vllm_config)
+    )
+    if mooncake_store and getattr(
+        getattr(vllm_config, "cache_config", None), "cache_dtype", None
+    ) not in ("fp8_e4m3", "fp8_ds_mla"):
+        raise ValueError("HYV4-VL MooncakeStore PCP requires FP8 E4M3 KV cache.")
+    if (
+        vllm_config.kv_transfer_config is None
+        or mooncake_store
+        or _is_hyv4_vl_mooncake_p2p_producer(vllm_config)
+    ) and not parallel.enable_eplb:
         expected = {
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 1,
@@ -210,7 +278,14 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
         or raw_quantization.get("format") != "pack-quantized"
         or getattr(getattr(vllm_config, "kernel_config", None), "moe_backend", None)
         != "deep_gemm"
-        or vllm_config.speculative_config is not None
+        or (
+            vllm_config.speculative_config is not None
+            and not (
+                _is_hyv4_vl_mooncake_store(vllm_config)
+                or _is_hyv4_vl_mooncake_pd_store_producer(vllm_config)
+                or _is_hyv4_vl_mooncake_p2p_producer(vllm_config)
+            )
+        )
         or vllm_config.kv_transfer_config is None
         or not feature.expert_map_path
         or feature.expert_map_record_path
@@ -222,7 +297,7 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
         )
     ):
         raise ValueError(
-            "HYV4-VL PCP requires no MTP, PP1/TP1/PCP16/DP1/DCP1/EP16, "
+            "HYV4-VL PCP requires PP1/TP1/PCP16/DP1/DCP1/EP16, "
             "fixed DeepEP HT/DeepGEMM, compressed-tensors static W4A8 EPLB "
             "R0 (or experimental R16), and a Mooncake producer."
         )
@@ -425,13 +500,19 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         )
         is not None
     ):
-        # kv_role is the validated KVTransferConfig role, not kv_rank or a
-        # connector-name heuristic. kv_both includes a consumer and is excluded.
+        # Accept the registered producer role or the explicitly supported
+        # HYV4-VL Mooncake Store path; do not infer support from connector name.
         if not (
-            (is_hyv4 or is_hyv4_vl)
-            and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnector"
-            and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
-            and getattr(kv_transfer_config, "kv_connector_module_path", "") is None
+            _is_hyv4_vl_mooncake_store(vllm_config)
+            or _is_hyv4_vl_mooncake_pd_store_producer(vllm_config)
+            or (
+                (is_hyv4 or is_hyv4_vl)
+                and getattr(kv_transfer_config, "kv_connector", None)
+                == "MooncakeConnector"
+                and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+                and getattr(kv_transfer_config, "kv_connector_module_path", "")
+                is None
+            )
         ):
             raise ValueError(
                 "HCU PCP P/D disaggregation requires HYV4 PP1 with the registered "
