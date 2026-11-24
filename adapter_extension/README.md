@@ -99,6 +99,59 @@ operator, so the plugin neither registers nor ships a `SiluAndMul` override.
 No model, topology, FP8-KV, or broad performance support is implied by these
 operator-level capabilities.
 
+## HY4 frontend migration
+
+`das_hcu_hy4_frontend` provides bounded native ByteLevel prompt priming with
+`VLLM_HCU_ENABLE_BYTELEVEL_DETOKENIZER_TAIL=1` (default off). Core keeps its
+detokenization and stop handling. Adapter owns admission and process health;
+the Plugin does not register a platform/general entry point. Source revisions,
+ownership, CPU evidence and the remaining W4A8/PCP/R16 gates are recorded in
+[the HY4 migration ledger](../docs/validation/hy4-v033-migration.md).
+
+The separate `das_hcu_hy4_ct_w4a8` capability supplies the distinct
+`hcu_hy4_ct_w4a8` configuration through the paired Adapter's CT registration
+transaction. It reuses the existing packed W4A8 method and Core loader/runner;
+other model types and quantization formats keep their original selection.
+Require `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hy4-ct-w4a8` for HY4 validation.
+This is a source candidate: offline-R16 model binding, native ABI, checkpoint
+accuracy and performance remain open in the ledger.
+
+The owned HY4 CT/static backbone can opt into native iHC launch tuning with
+`VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_IHC_LAUNCH=1`. It uses the original
+Core kernels with stage-1/stage-2 warps 4/4 on gfx938, BF16, hidden size 6144,
+HC multiplier 4, MRV2 and compilation mode 0. Other configurations retain the
+native launch. MTP is unchanged. This defaults off; unset the child or disable
+the master and restart to roll back. Reduction ordering can change slightly;
+component tests do not replace checkpoint accuracy or serving measurements.
+
+With the paired Adapter iHC bridge, text-only eager PCP16 can additionally set
+`HCU_VLLM_HY4_IHC_VENDOR=1`. Only contiguous BF16 inputs with at least 378 rows
+use BoltOps pre/post plus Core RMS; smaller inputs and D retain the Core chain.
+Topology is captured on owned backbone instances during construction. Native
+decoder bodies, live checkpoint parameters and BF16 rounding boundaries remain.
+This option defaults off and requires whole-model accuracy/performance validation.
+
+The owned HY4 Mooncake worker reuses equal block-ID groupings only within one
+native builder call. `HCU_DISABLE_OPS=hy4_mooncake_grouping_reuse` restores the
+unmodified builder. Transfer regions, byte offsets and descriptor validation
+remain native.
+
+HY4 W4A8 PCP16 prefills can opt into per-token INT8 DeepEP HT transport with
+`VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_HT_INT8_DISPATCH=1` (default off).
+This quantizes source rows before dispatch; Core retains receive metadata,
+communication handles and finalize. Inputs below 756 source tokens per rank
+keep BF16 transport. Admission requires gfx938, BF16, eager MRV2, synchronous
+scheduling, TP1/PP1/DP1/DCP1, HT16, and no DBO, ubatching, LoRA or online EPLB.
+The child or master can be disabled before restarting to retain the existing
+prepare path. CPU contracts and 16-rank transport/scale equivalence are covered;
+whole-model accuracy and serving performance are separate validation gates.
+
+The same HY4 PCP16 HT scope can opt into the legacy LightOp expert output
+gather with `HCU_VLLM_HY4_EXPERT_GATHER=1` (default off). Adapter owns the
+provider bridge; the owned expert instance retains the native permutation,
+GEMMs, activation and finalize. Disabling the child or custom-ops master
+restores native gather. No process-wide Core binding is changed.
+
 ## Standalone Step5 MTP configuration
 
 `das_hcu_step5_config` declares the `step5-standalone-mtp-config` capability.
@@ -579,6 +632,59 @@ export VLLM_HCU_USE_CUSTOM_RMS_NORM=0
 
 For complete removal, uninstall `hcu-vllm-das-plugin`; the adapter and vLLM
 remain installed and retain platform ownership.
+
+## Optional HY4 LL tuning
+
+```bash
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export HCU_VLLM_HY4_LL_TUNING=1
+```
+
+This defaults to off and requires Adapter's
+`hcu_adapter.features.ct_w4a8.masked_activation` provider. It is restricted to
+text HY4 W4A8 on gfx938: BF16, DP16/EP16, TP/PP/PCP/DCP1, DeepEP LL,
+H6144/I2048, 256 experts with top-k8, a 32-token per-rank capacity, positive
+SwiGLU clamp, and FULL Graph with compilation mode 0. Other configurations
+retain the original experts and providers.
+
+The two masked GEMMs reuse Core's CPU DP estimate with a 128-token scheduling
+floor; missing DP metadata retains the full-capacity hint. Device counts and
+capacity remain unchanged. The Adapter uses 64 persistent slots per expert and
+the v0.25 FP32 SwiGLU/INT8 quantization math. This differs from the current
+LightOp vendor path's rounding and requires model accuracy validation.
+Component timings do not establish serving throughput or TTFT improvements.
+
+Restart with `HCU_VLLM_HY4_LL_TUNING=0` to disable this policy, or
+`VLLM_HCU_USE_CUSTOM_OPS=0` for the master rollback. P-side HT/static EPLB is
+unaffected.
+
+## Optional HY4 fused routing
+
+```bash
+export VLLM_HCU_USE_CUSTOM_OPS=1
+export HCU_VLLM_HY4_FUSED_ROUTING=1
+```
+
+This defaults to off. The owned HY4 backbone and MTP routers reuse Core's
+`fused_topk_bias` for sigmoid routing with one expert group, renormalization,
+256 experts and top-k8. The original `GroupedTopKRouter` class, routing method,
+parameters, callbacks and `select_experts` remain unchanged.
+
+Admission requires text HY4 BF16 H6144 on gfx938, MRV2, compilation mode 0,
+DP16/EP16 with TP/PP/PCP/DCP1 and DeepEP LL. LoRA, online EPLB, elastic EP,
+DBO, multiple ubatches, batch-invariant mode and AITER MoE retain native routing.
+Unsupported tensor metadata also retains native routing. P-side HT/static EPLB
+is unaffected.
+
+Core consumes the device padding mask: padded expert IDs become -1 while
+their normalized/scaled weights remain unchanged. Single-device operator and
+changing-input Graph checks passed; actual 16-rank LL dispatch, experts,
+combine and whole-model validation remain outstanding. Component speedups
+are not serving throughput or TTFT measurements.
+
+Restart with `HCU_VLLM_HY4_FUSED_ROUTING=0` to disable this policy, or
+`VLLM_HCU_USE_CUSTOM_OPS=0` for the master rollback. Changing a captured policy
+requires restarting the service.
 
 ## Adapter directory layouts
 

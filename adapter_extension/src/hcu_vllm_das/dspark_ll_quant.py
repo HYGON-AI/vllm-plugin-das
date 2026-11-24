@@ -88,15 +88,15 @@ def quantize_receiver(x, counts):
     device counts and leaves padding unspecified for the masked GEMM.
     """
     if (x.dtype != torch.bfloat16 or x.ndim != 3
-            or x.shape[0] not in (16, 48) or x.shape[1] <= 0 or x.shape[2] != 5120
-            or x.shape[1] % 8 != 0 or not x.is_cuda or not x.is_contiguous()
+            or x.shape[0] <= 0 or x.shape[1] <= 0 or x.shape[2] != 5120
+            or not x.is_cuda or not x.is_contiguous()
             or counts.dtype != torch.int32 or counts.shape != x.shape[:1]
             or counts.device != x.device or not counts.is_contiguous()):
-        raise ValueError('W4A8 draft receiver requires the contiguous DP8 LL layout')
+        raise ValueError('W4A8 draft receiver requires contiguous expert/token/H5120 LL buffers')
     quantize = _receiver_quantizer()
     if quantize is None:
         raise RuntimeError('W4A8 draft LL receiver selected without a quantizer')
-    if x.shape[0] == 16 and x.shape[1] <= 2048 and _live_rows_enabled(x.device):
+    if x.shape[1] <= 2048 and _live_rows_enabled(x.device):
         q = torch.empty_like(x, dtype=torch.int8)
         scales = torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32)
         row_stride = min(32, x.shape[1])

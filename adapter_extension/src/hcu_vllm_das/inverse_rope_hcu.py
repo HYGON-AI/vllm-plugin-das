@@ -84,12 +84,14 @@ def _probe_mode(original, operator, device):
     return matches.pop()
 
 
-def prepare_operator(original):
+def prepare_operator(original, device=None):
     """Bind Core-matching native arithmetic before model execution/Graph capture."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Prepare inverse RoPE before Graph capture")
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     operator = load_operator()
-    mode = _probe_mode(original, operator, torch.device("cuda", torch.cuda.current_device()))
+    mode = _probe_mode(original, operator, device)
     return partial(operator, fuse_cosine=mode)
 
 

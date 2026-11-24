@@ -91,7 +91,9 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
     if isinstance(native,DeepEPHTPrepareAndFinalize):
         if native.num_dispatchers()!=moe.moe_parallel_config.ep_size:
             raise RuntimeError('DeepEP HT group disagrees with loaded MoE')
-        return HcuCTHTPrepareAndFinalize(native.buffer,native.num_dispatchers(),native.dp_size,native.rank_expert_offset)
+        prepare = HcuCTHTPrepareAndFinalize(native.buffer,native.num_dispatchers(),native.dp_size,native.rank_expert_offset)
+        from hcu_vllm_das.hy4_ht_int8 import select_prepare
+        return select_prepare(prepare, config, moe)
     raise RuntimeError('HCU W4A8 requires a fixed native HT/LL prepare object')
 
 
@@ -147,6 +149,7 @@ class HcuCTContiguousExperts(_Experts):
     ALIGNMENT=256
     def __init__(self,moe,quant,weights,ops):
         super().__init__(moe,quant);self.weights=weights;self.ops=ops
+        self._gather = deepgemm_unpermute_and_reduce
         from .clamped_int8_admission import admitted
         self._live_row_activation = admitted(ops, weights, self.w1_scale,
             self.w2_scale, quant.gemm1_clamp_limit, masked=False)
@@ -181,7 +184,7 @@ class HcuCTContiguousExperts(_Experts):
         down=_resize_cache(workspace2,(aligned,k))
         self.ops.gemm_contiguous((mid,ms),(self.weights[1],self.w2_scale),down,indices)
         weights=torch.ones_like(topk_weights) if apply_router_weight_on_input else topk_weights
-        deepgemm_unpermute_and_reduce(a=down,topk_ids=topk_ids,topk_weights=weights,
+        self._gather(a=down,topk_ids=topk_ids,topk_weights=weights,
             inv_perm=inverse,expert_map=expert_map,output=output)
 
 
@@ -189,16 +192,15 @@ class HcuCTMaskedExperts(_Experts):
     def __init__(self,moe,quant,weights,ops,capacity,dispatchers):
         super().__init__(moe,quant,max_num_tokens=capacity,num_dispatchers=dispatchers)
         self.weights=weights;self.ops=ops
-        from .clamped_int8_admission import admitted
-        self._live_row_activation = (capacity == 256 and dispatchers == 8
-            and admitted(ops, weights, self.w1_scale, self.w2_scale,
-                         quant.gemm1_clamp_limit, masked=True))
+        from .clamped_int8_admission import masked_qualifier
+        self._qualify_live_activation = masked_qualifier(
+            ops, weights, self.w1_scale, self.w2_scale, quant.gemm1_clamp_limit)
+        self._live_row_activation = self._qualify_live_activation is not None
         self._small_batch_hint = False
         hint_mode, _ = hcu_env.resolve('HCU_DSV41_W4A8_MOE_EXPECTED_M', host='vllm')
         local_experts = int(self.w1_scale.shape[0])
         if (hint_mode == '1'
-                and capacity == 256 and dispatchers == 8
-                and local_experts in (16, 48)
+                and local_experts * dispatchers in (128, 384)
                 and tuple(self.w1_scale.shape[:2]) == (local_experts, 4608)
                 and tuple(self.w2_scale.shape[:2]) == (local_experts, 5120)
                 and quant.gemm1_clamp_limit == 10
@@ -209,6 +211,8 @@ class HcuCTMaskedExperts(_Experts):
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.BatchedExperts
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceDelegate()
+    def expected_m(self, global_num_experts, capacity, topk):
+        return capacity
     def workspace_shapes(self,M,N,K,topk,global_num_experts,local_num_experts,expert_tokens_meta,activation):
         total=self.max_num_tokens*self.num_dispatchers
         if M!=total: raise ValueError('LL received token extent differs from checked capacity')
@@ -221,9 +225,9 @@ class HcuCTMaskedExperts(_Experts):
         if t!=self.max_num_tokens*self.num_dispatchers: raise ValueError('LL input exceeds expert workspace contract')
         counts=expert_tokens_meta.expert_num_tokens
         # The hint selects kernels. Device counts still bound every expert's rows.
-        hint = t
-        use_hint = self._small_batch_hint and (e, global_num_experts, topk_ids.shape[1]) in (
-            (48, 384, 6), (16, 128, 3))
+        hint = self.expected_m(global_num_experts,t,topk_ids.shape[-1])
+        use_hint = (self._small_batch_hint and e * self.num_dispatchers == global_num_experts
+                    and (global_num_experts, topk_ids.shape[1]) in ((384, 6), (128, 3)))
         if use_hint:
             hint = expected_m(topk_ids.shape[0], self.num_dispatchers, topk_ids.shape[1],
                               global_num_experts, t)
@@ -231,11 +235,13 @@ class HcuCTMaskedExperts(_Experts):
         self._masked_gemm((hidden_states, a1q_scale), (self.weights[0], self.w1_scale),
                           gateup, counts, hint, use_hint)
         limit=self.quant_config.gemm1_clamp_limit
-        if self._live_row_activation:
+        activation_hint=hint if use_hint else t
+        if (self._live_row_activation
+                and self._qualify_live_activation(t, activation_hint)):
             from .clamped_int8_triton import clamped_int8_2304
-            mid,ms=clamped_int8_2304(gateup,counts,masked=True,expected_m=hint)
+            mid,ms=clamped_int8_2304(gateup,counts,masked=True,expected_m=activation_hint)
         elif limit is not None and limit>0:
-            mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=hint)
+            mid,ms=self.ops.clamp_quant_ep(gateup,limit=limit,mask_m=counts,expect_m=activation_hint)
         else:
             mid,ms=self.ops.silu_quant_ep(gateup,tokens_per_expert=counts)
         self._masked_gemm((mid, ms), (self.weights[1], self.w2_scale), output, counts,
@@ -249,5 +255,6 @@ class HcuCTMaskedExperts(_Experts):
 
 def make_experts(moe,quant,weights,ops,prepare):
     if prepare.activation_format==mk.FusedMoEActivationFormat.BatchedExperts:
-        return HcuCTMaskedExperts(moe,quant,weights,ops,prepare.max_num_tokens_per_rank(),prepare.num_dispatchers())
+        from hcu_vllm_das.hy4_ll_experts import make_ll_experts
+        return make_ll_experts(moe,quant,weights,ops,prepare)
     return HcuCTContiguousExperts(moe,quant,weights,ops)

@@ -240,6 +240,7 @@ _EPLB_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
 class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
         self._hcu_static_eplb_config = None
+        uses_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         if static_eplb.enabled(vllm_config):
             static_eplb.validate_config(vllm_config)
             self._hcu_static_eplb_config = vllm_config
@@ -247,7 +248,7 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         if fp4_applicable(vllm_config):
             from ..fp4_indexer import preflight
             preflight(vllm_config)
-            if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            if uses_pcp:
                 from ..v41_pcp_activation import pcp_enabled
                 if not pcp_enabled():
                     raise ValueError('FP4 PCP attention requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
@@ -258,25 +259,29 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
             init = (_FP4_EPLB_OUTER_INIT if self._hcu_static_eplb_config is not None
                     else _FP4_OUTER_INIT)
             init(self, vllm_config=vllm_config, prefix=prefix)
-            from ..dspark_ll import install_model_entry_reset
-            install_model_entry_reset(self, vllm_config, 384)
-            return
-        from ..v41_pcp_activation import check_health
-        check_health()
-        check_native_contract()
-        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
-            from ..v41_pcp_activation import pcp_enabled
-            if not pcp_enabled():
-                raise ValueError('PCP attention requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
-        if self._hcu_static_eplb_config is not None:
-            _EPLB_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
-        elif validate_config(vllm_config):
-            _OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
-        elif use_host_target(vllm_config):
-            _HOST_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
         else:
-            # PCP1 without the explicit host route remains fully native.
-            super().__init__(vllm_config=vllm_config, prefix=prefix)
+            from ..v41_pcp_activation import check_health
+            check_health()
+            check_native_contract()
+            if uses_pcp:
+                from ..v41_pcp_activation import pcp_enabled
+                if not pcp_enabled():
+                    raise ValueError('PCP attention requires VLLM_HCU_DSV41_PCP_ATTENTION=1')
+            if self._hcu_static_eplb_config is not None:
+                _EPLB_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+            elif validate_config(vllm_config):
+                _OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+            elif use_host_target(vllm_config):
+                _HOST_OUTER_INIT(self, vllm_config=vllm_config, prefix=prefix)
+            else:
+                # PCP1 without the explicit host route remains fully native.
+                super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        if uses_pcp:
+            from ..inverse_rope_pcp import prepare_worker_model
+
+            # Model construction follows Worker.init_device.
+            prepare_worker_model(self)
 
         from ..dspark_ll import install_model_entry_reset
         install_model_entry_reset(self, vllm_config, 384)
