@@ -32,6 +32,7 @@ def isolated_policy(monkeypatch):
     monkeypatch.setattr(pcp_rope_policy, "_process_arch", lambda _pid: "gfx938")
     monkeypatch.setattr(inverse_rope_pcp, "_state", None)
     monkeypatch.setattr(inverse_rope_pcp, "_failure", None)
+    monkeypatch.setattr(inverse_rope_pcp, "_worker_routes", {})
     return config["ops"]
 
 
@@ -202,8 +203,13 @@ def test_real_core_forward_applies_inverse_only_to_unrotated_rows(
     monkeypatch.setitem(sys.modules, "vllm.platforms", NS(
         current_platform=NS(is_rocm=lambda: True)))
     monkeypatch.setattr(hcu_env, "arch_name", lambda: "gfx938")
-    def prepare(original):
+    device = torch.device("cpu")
+    prepared = []
+
+    def prepare(original, bound_device):
         assert original is stock_inverse
+        assert bound_device == device
+        prepared.append(bound_device)
         return native
 
     monkeypatch.setattr(inverse, "prepare_operator", prepare)
@@ -218,6 +224,12 @@ def test_real_core_forward_applies_inverse_only_to_unrotated_rows(
     assert base.forward_mqa is namespace["forward_mqa"]
     assert base.forward_mqa.__globals__["rocm_inverse_rope_rows_"] is stock_inverse
     assert base._forward_prefill is stock_prefill
+    assert prepared == []
+    with pytest.raises(RuntimeError, match="was not qualified"):
+        inverse_rope_pcp._worker_inverse(torch.empty(0), None, None, 64)
+    inverse_rope_pcp.prepare_worker_device(device)
+    inverse_rope_pcp.prepare_worker_device(device)
+    assert prepared == [device]
 
     def decode(**arguments):
         arguments["output"].fill_(5)
