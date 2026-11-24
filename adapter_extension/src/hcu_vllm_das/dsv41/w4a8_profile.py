@@ -16,7 +16,9 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 from vllm.v1.worker.workspace import current_workspace_manager
 
-from ..moe.ct_w4a8_runtime import HcuCTContiguousExperts
+from .profile_worker import HT_FIXED_CAPACITY_KEY
+from ..moe.ct_w4a8_prepare import fixed_ht_batch_capacity
+from ..moe.ct_w4a8_runtime import HcuCTContiguousExperts, contiguous_aligned_rows
 from ..quantization.ct_w4a8 import NAME
 from ..quantization.ct_w4a8_method import HcuCTW4A8MoEMethod
 from ..quantization.dsv41_channel_fp8 import _is_v41
@@ -32,8 +34,8 @@ def uses_w4a8_pcp_profile(config):
         envs.VLLM_USE_V2_MODEL_RUNNER
         and envs.VLLM_MOE_SKIP_PADDING
         and (p.tensor_parallel_size, p.data_parallel_size,
-             p.pipeline_parallel_size, p.prefill_context_parallel_size,
-             p.decode_context_parallel_size) == (1, 1, 1, 8, 1)
+             p.pipeline_parallel_size, p.decode_context_parallel_size) == (1, 1, 1, 1)
+        and p.prefill_context_parallel_size in (4, 8)
         and p.enable_expert_parallel
         and p.all2all_backend == "deepep_high_throughput"
         and config.kernel_config.moe_backend == "deep_gemm"
@@ -62,10 +64,7 @@ def routed_token_bound(max_tokens, max_reqs, decode_query_len, pcp_size, shard_d
 
 def contiguous_workspace_bytes(num_tokens, topk, local_experts, intermediate, hidden):
     """Upper bound when all admitted expert assignments reach the same rank."""
-    alignment = HcuCTContiguousExperts.ALIGNMENT
-    assignments = num_tokens * topk
-    padded = assignments + min(assignments, local_experts) * (alignment - 1)
-    rows = (padded + alignment - 1) // alignment * alignment
+    rows = contiguous_aligned_rows(num_tokens, topk, local_experts)
     # Both scratch views use BF16. The shared output view is bounded by
     # the first scratch view because every received row has a local route.
     return rows * (max(intermediate, hidden) + max(2 * intermediate, hidden)) * 2
@@ -120,13 +119,17 @@ class W4A8PcpProfileRunner(GPUModelRunner):
 
     def execute_model(self, scheduler_output, *args, **kwargs):
         manager = self.pcp_manager
-        if not (kwargs.get("is_profile") and kwargs.get("dummy_run")
+        profile_target = (kwargs.get("is_profile") and kwargs.get("dummy_run")
                 and kwargs.get("skip_attn_for_dummy_run")
-                and isinstance(manager, W4A8ProfilePCPManager)):
-            return super().execute_model(scheduler_output, *args, **kwargs)
+                and isinstance(manager, W4A8ProfilePCPManager))
+        capacity = self._fixed_ht_capacity(scheduler_output, profile_target, kwargs)
+        if not profile_target:
+            with fixed_ht_batch_capacity(capacity):
+                return super().execute_model(scheduler_output, *args, **kwargs)
         manager.profile_target = True
         try:
-            result = super().execute_model(scheduler_output, *args, **kwargs)
+            with fixed_ht_batch_capacity(capacity):
+                result = super().execute_model(scheduler_output, *args, **kwargs)
             state = self.execute_model_state
             original = manager.profile_batch
             assert state is not None and original is not None
@@ -152,6 +155,29 @@ class W4A8PcpProfileRunner(GPUModelRunner):
         finally:
             manager.profile_target = False
             manager.profile_batch = None
+
+    def _fixed_ht_capacity(self, scheduler_output, profile_target, execute_options):
+        config = getattr(self, "vllm_config", None)
+        extra = getattr(config, "additional_config", None) or {}
+        if not extra.get(HT_FIXED_CAPACITY_KEY):
+            return None
+        if profile_target:
+            tokens, requests = self.max_num_tokens, self.max_num_reqs
+        elif not execute_options.get("dummy_run") and not execute_options.get("is_profile"):
+            # All PCP ranks see the same scheduler batch before partitioning.
+            # Rank-local tensor shapes alone cannot bound other senders.
+            tokens = scheduler_output.total_num_scheduled_tokens
+            requests = len(scheduler_output.num_scheduled_tokens)
+        else:
+            return None
+        manager = self.pcp_manager
+        # Use fixed dispatch for prefill-sized batches. For small batches,
+        # the fixed expert workspace and launches on otherwise empty ranks
+        # dominate; keep Core's dynamic receive and empty-rank fast path.
+        if tokens < manager.pcp_world_size * HcuCTContiguousExperts.ALIGNMENT:
+            return None
+        return routed_token_bound(tokens, requests, self.decode_query_len,
+                                  manager.pcp_world_size, manager.shard_decode_requests)
 
 
 class W4A8PcpProfileWorker(Worker):

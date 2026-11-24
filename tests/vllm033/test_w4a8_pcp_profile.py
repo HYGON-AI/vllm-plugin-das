@@ -33,22 +33,23 @@ def make_batch(counts, padded=0):
     return Batch(ids, np.asarray(counts), offsets, torch.zeros_like(ids, dtype=torch.bool))
 
 
-def make_manager(rank):
+def make_manager(rank, ranks=8):
     manager = object.__new__(profile.W4A8ProfilePCPManager)
-    manager.pcp_rank, manager.pcp_world_size, manager.dcp_world_size = rank, 8, 1
+    manager.pcp_rank, manager.pcp_world_size, manager.dcp_world_size = rank, ranks, 1
     manager.shard_decode_requests = False
     return manager
 
 
 @pytest.mark.parametrize("counts,padded", [([256] * 128, 0), ([1, 19, 221, 301], 31)])
-def test_profile_assigns_each_prefill_row_once_using_core_pcp(counts, padded):
+@pytest.mark.parametrize("ranks", [4, 8])
+def test_profile_assigns_each_prefill_row_once_using_core_pcp(counts, padded, ranks):
     batch = make_batch(counts, padded)
     ownership = []
-    for rank in range(8):
-        mask, owned = profile.target_profile_padding(make_manager(rank), batch)
+    for rank in range(ranks):
+        mask, owned = profile.target_profile_padding(make_manager(rank, ranks), batch)
         ownership.append(~mask)
         if len(counts) == 128:
-            assert owned == 4096
+            assert owned == 32768 // ranks
         assert not batch.input_ids.any()
     totals = torch.stack(ownership).sum(0)
     torch.testing.assert_close(totals[:batch.num_tokens], torch.ones_like(totals[:batch.num_tokens]))
@@ -68,12 +69,13 @@ def test_workspaces_cover_top6_and_replicated_decode_with_eplb():
     assert reserved >= actual_rows * 2 * 5120 * 2
 
 
-def test_selects_only_native_eager_w4a8_with_padding_support(monkeypatch):
+@pytest.mark.parametrize("ranks", [4, 8])
+def test_selects_only_native_eager_w4a8_with_padding_support(monkeypatch, ranks):
     monkeypatch.setattr(profile.envs, "VLLM_USE_V2_MODEL_RUNNER", True)
     monkeypatch.setattr(profile.envs, "VLLM_MOE_SKIP_PADDING", True)
     monkeypatch.delenv("VLLM_HCU_DSV41_PCP_PROFILE_WORKER", raising=False)
     parallel = NS(tensor_parallel_size=1, data_parallel_size=1, pipeline_parallel_size=1,
-                  prefill_context_parallel_size=8, decode_context_parallel_size=1,
+                  prefill_context_parallel_size=ranks, decode_context_parallel_size=1,
                   enable_expert_parallel=True, all2all_backend="deepep_high_throughput")
     config = NS(
         parallel_config=parallel, kernel_config=NS(moe_backend="deep_gemm"),
