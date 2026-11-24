@@ -34,6 +34,14 @@ class FlashSparseImpl(CoreSinkImpl):
             raise NotImplementedError("HYV4 Flash sparse attention requires PCP=DCP=1")
         super().__init__(*args, **kwargs)
         self._hcu_ops = get_flashmla_ops() if is_hcu_platform() else None
+        # Qualify the current worker device once, outside compilation/capture.
+        # The native 512-column layout is qualified only on gfx938.
+        self._hcu_window_device = None
+        if self._hcu_ops is not None and torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+            if arch == "gfx938":
+                self._hcu_window_device = torch.device("cuda", device)
         self._install_hisparse_hook()
 
     def _install_hisparse_hook(self):
@@ -242,6 +250,34 @@ class FlashSparseImpl(CoreSinkImpl):
             result = out
         return result[:, :heads], lse[:, :heads]
 
+    def _use_window_fp8_prefix(self, q, cache, indices):
+        # Both window and compressed attention inherit this implementation.
+        # Classify the live producer: DFly may replace its shared buffer after
+        # construction, and an explicit Core buffer setter clears _indexer.
+        from .swa import FlashWindowIndexer
+
+        owner = getattr(self, "_indexer", None)
+        if (self._hcu_window_device is None
+                or type(owner) is not FlashWindowIndexer
+                or type(owner.window) is not int or owner.window != 512):
+            return False
+        source = owner.topk_indices_buffer
+        return (
+            q.device == self._hcu_window_device
+            and q.ndim == 4 and q.shape[0] == 1
+            and q.shape[2] in (8, 16) and q.shape[3] == 576
+            and q.dtype == torch.bfloat16
+            and self.fp8_decode_padded_heads == 64
+            and cache.device == q.device and cache.dtype == torch.uint8
+            and cache.ndim == 3 and cache.shape[-1] == 656
+            and source.ndim == 2 and source.shape[-1] == 2048
+            and source.dtype == torch.int32 and source.device == q.device
+            and indices.ndim == 3
+            and indices.shape == (1, q.shape[1], 2048)
+            and indices.dtype == torch.int32 and indices.device == q.device
+            and indices.stride(-1) == 1
+        )
+
     def _fp8_flash_mla_kernel(
         self,
         q: torch.Tensor,
@@ -253,6 +289,9 @@ class FlashSparseImpl(CoreSinkImpl):
             return super()._fp8_flash_mla_kernel(
                 q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
             )
+        use_window_prefix = self._use_window_fp8_prefix(
+            q, kv_c_and_k_pe_cache, topk_indices
+        )
         heads = q.shape[2]
         padded = self.fp8_decode_padded_heads
         sinks = self._sinks_for_query(q, 2, padded)
@@ -267,6 +306,13 @@ class FlashSparseImpl(CoreSinkImpl):
             scheduler = kernel_metadata.scheduler_metadata
             table = kernel_metadata.dummy_block_table
             lengths = kernel_metadata.cache_lens
+        if use_window_prefix:
+            # Core has already remapped physical indices. Window producers
+            # populate only the first 512 columns; preserve the shared 2048
+            # source and its scheduler for compressed attention.
+            topk_indices = topk_indices[..., :512]
+            if kernel_metadata is not None:
+                scheduler, _ = self._hcu_ops.get_metadata()
         result, lse = self._hcu_ops.with_kvcache(
             q=q,
             k_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(-2),
