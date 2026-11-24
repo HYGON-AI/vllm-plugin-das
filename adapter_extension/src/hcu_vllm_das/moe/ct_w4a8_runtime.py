@@ -149,6 +149,7 @@ class HcuCTContiguousExperts(_Experts):
     ALIGNMENT=256
     def __init__(self,moe,quant,weights,ops):
         super().__init__(moe,quant);self.weights=weights;self.ops=ops
+        self._gather = deepgemm_unpermute_and_reduce
         from .clamped_int8_admission import admitted
         self._live_row_activation = admitted(ops, weights, self.w1_scale,
             self.w2_scale, quant.gemm1_clamp_limit, masked=False)
@@ -183,7 +184,7 @@ class HcuCTContiguousExperts(_Experts):
         down=_resize_cache(workspace2,(aligned,k))
         self.ops.gemm_contiguous((mid,ms),(self.weights[1],self.w2_scale),down,indices)
         weights=torch.ones_like(topk_weights) if apply_router_weight_on_input else topk_weights
-        deepgemm_unpermute_and_reduce(a=down,topk_ids=topk_ids,topk_weights=weights,
+        self._gather(a=down,topk_ids=topk_ids,topk_weights=weights,
             inv_perm=inverse,expert_map=expert_map,output=output)
 
 
