@@ -104,9 +104,18 @@ def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):
     monkeypatch.setenv('VLLM_HCU_DSV41_PCP_ATTENTION', '1')
     if not fp4:
         cfg.attention_config.resolve_indexer_kv_dtype = lambda _: 'fp8'
-    from hcu_vllm_das import v41_pcp_activation
+    from hcu_vllm_das import inverse_rope_pcp, inverse_rope_policy, v41_pcp_activation
     monkeypatch.setattr(v41_pcp_activation, 'check_health', lambda: None)
+    monkeypatch.setattr(inverse_rope_policy, 'selected_mode', lambda: 'hcu')
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 3)
     calls = []
+    device_calls = []
+
+    def qualify(device):
+        assert len(calls) == 1
+        device_calls.append(device)
+
+    monkeypatch.setattr(inverse_rope_pcp, 'prepare_worker_device', qualify)
 
     def constructor(name):
         def init(self, *, vllm_config, prefix):
@@ -120,6 +129,7 @@ def test_outer_selects_composed_constructor(chain, monkeypatch, fp4, static):
     expected = ('_FP4_EPLB_OUTER_INIT' if static else '_FP4_OUTER_INIT') if fp4 else (
         '_EPLB_OUTER_INIT' if static else '_OUTER_INIT')
     assert calls == [(expected, cfg, 'target')]
+    assert device_calls == [torch.device('cuda', 3)]
     assert outer._hcu_static_eplb_config is (cfg if static else None)
 
 

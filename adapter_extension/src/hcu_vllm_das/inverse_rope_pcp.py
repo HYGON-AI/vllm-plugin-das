@@ -20,6 +20,7 @@ from .inverse_rope_policy import selected_mode
 _FORWARD_MQA_HASH = "6394555a5e86a54c484fc1dc08ac4dd525fa42f0881df164f078010b7f9868e6"
 _state = None
 _failure = None
+_worker_routes = {}
 
 
 def _require_source(function):
@@ -48,7 +49,31 @@ def check_health():
         raise RuntimeError(_failure) from error
 
 
+def prepare_worker_device(device):
+    """Qualify the native operator on the device already bound to this worker."""
+    check_health()
+    if _state is None:
+        raise RuntimeError("V41 PCP inverse RoPE did not bind the attention class")
+    if device in _worker_routes:
+        return
+    from .inverse_rope_hcu import prepare_operator, route
+    from vllm.logger import init_logger
+
+    original_inverse = _state[2].__globals__["rocm_inverse_rope_rows_"]
+    operator = prepare_operator(original_inverse, device)
+    _worker_routes[device] = route(original_inverse, operator)
+    init_logger(__name__).info("HCU V41 PCP inverse RoPE qualified on %s", device)
+
+
+def _worker_inverse(output, positions, cos_sin_cache, rope_head_dim):
+    inverse = _worker_routes.get(output.device)
+    if inverse is None:
+        raise RuntimeError(f"V41 PCP inverse RoPE was not qualified on {output.device}")
+    return inverse(output, positions, cos_sin_cache, rope_head_dim)
+
+
 def prepare_forward_mqa(base):
+    """Bind the reviewed Python call site without running GPU work."""
     global _state
     check_health()
     if _state is not None:
@@ -62,15 +87,14 @@ def prepare_forward_mqa(base):
     _require_source(original)
     arch_name = _adapter_module('hcu_env').arch_name
     from vllm.platforms import current_platform
-    from .inverse_rope_hcu import prepare_operator, route
 
     if not current_platform.is_rocm() or arch_name() != "gfx938":
         raise RuntimeError("V41 PCP inverse RoPE requires real gfx938 HIP")
 
     namespace = dict(original.__globals__)
-    original_inverse = namespace["rocm_inverse_rope_rows_"]
-    namespace["rocm_inverse_rope_rows_"] = route(
-        original_inverse, prepare_operator(original_inverse))
+    if not callable(namespace.get("rocm_inverse_rope_rows_")):
+        raise RuntimeError("V41 PCP forward_mqa inverse RoPE call target is missing")
+    namespace["rocm_inverse_rope_rows_"] = _worker_inverse
     run = FunctionType(original.__code__, namespace, original.__name__,
                        original.__defaults__, original.__closure__)
     run.__kwdefaults__ = original.__kwdefaults__
