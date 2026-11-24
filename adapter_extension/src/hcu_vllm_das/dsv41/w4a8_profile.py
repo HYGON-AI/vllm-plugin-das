@@ -2,6 +2,7 @@
 """Profile real PCP expert ownership without shrinking the padded activation probe."""
 
 from dataclasses import replace
+from math import prod
 
 import numpy as np
 import torch
@@ -18,7 +19,11 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from .profile_worker import HT_FIXED_CAPACITY_KEY
 from ..moe.ct_w4a8_prepare import fixed_ht_batch_capacity
-from ..moe.ct_w4a8_runtime import HcuCTContiguousExperts, contiguous_aligned_rows
+from ..moe.ct_w4a8_runtime import (
+    HcuCTContiguousExperts,
+    contiguous_aligned_rows,
+    contiguous_workspace_shapes,
+)
 from ..quantization.ct_w4a8 import NAME
 from ..quantization.ct_w4a8_method import HcuCTW4A8MoEMethod
 from ..quantization.dsv41_channel_fp8 import _is_v41
@@ -65,9 +70,14 @@ def routed_token_bound(max_tokens, max_reqs, decode_query_len, pcp_size, shard_d
 def contiguous_workspace_bytes(num_tokens, topk, local_experts, intermediate, hidden):
     """Upper bound when all admitted expert assignments reach the same rank."""
     rows = contiguous_aligned_rows(num_tokens, topk, local_experts)
-    # Both scratch views use BF16. The shared output view is bounded by
-    # the first scratch view because every received row has a local route.
-    return rows * (max(intermediate, hidden) + max(2 * intermediate, hidden)) * 2
+    quantized, expert, output = contiguous_workspace_shapes(
+        num_tokens, rows, 2 * intermediate, hidden,
+    )
+    # The modular kernel aliases the output with workspace13. The workspace
+    # manager rounds the two simultaneous allocations to 256 bytes each.
+    first_bytes = max(prod(quantized), prod(output)) * 2
+    second_bytes = prod(expert) * 2
+    return sum((size + 255) // 256 * 256 for size in (first_bytes, second_bytes))
 
 
 class W4A8ProfilePCPManager(PCPManager):

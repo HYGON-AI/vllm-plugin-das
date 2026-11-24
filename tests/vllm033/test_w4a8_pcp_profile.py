@@ -61,12 +61,15 @@ def test_workspaces_cover_top6_and_replicated_decode_with_eplb():
     assert routed == 32768 + 7 * 128 * 6
     assert profile.routed_token_bound(32768, 128, 6, 8, True) == 32768
     reserved = profile.contiguous_workspace_bytes(routed, 6, 52, 2304, 5120)
-    assert 4 * 2**30 < reserved < 5 * 2**30
+    assert 3 * 2**30 < reserved < 4 * 2**30
     assignments = np.zeros(52, dtype=np.int64)
     assignments[:51] = 257
     assignments[-1] = routed * 6 - assignments.sum()
     actual_rows = (((assignments + 255) // 256) * 256).sum()
-    assert reserved >= actual_rows * 2 * 5120 * 2
+    # INT8 permutation and activation use one byte, and the other scratch
+    # buffer holds BF16 GEMM output.
+    assert reserved >= actual_rows * 5120 * 3
+    assert profile.contiguous_workspace_bytes(32768, 6, 52, 2304, 5120) == 3075 * 2**20
 
 
 @pytest.mark.parametrize("ranks", [4, 8])

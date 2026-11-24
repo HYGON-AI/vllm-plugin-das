@@ -237,6 +237,18 @@ def contiguous_aligned_rows(tokens, topk, local_experts):
     return (assignments + padding + alignment - 1) // alignment * alignment
 
 
+def contiguous_workspace_shapes(tokens, aligned_rows, gate_width, hidden_width):
+    # workspace13 is allocated in the output dtype and viewed as INT8 for
+    # both permutation and activation. Count pairs of INT8 values per slot.
+    int8_width = max(hidden_width, gate_width // 2)
+    packed_width = (int8_width + 1) // 2
+    return (
+        (aligned_rows, packed_width),
+        (aligned_rows, max(gate_width, hidden_width)),
+        (tokens, hidden_width),
+    )
+
+
 def _aligned_expert_row_count(counts, alignment):
     # ep_scatter writes a prefix of independently aligned expert segments.
     padded = torch.bitwise_and(counts + alignment - 1, -alignment)
@@ -265,7 +277,7 @@ class HcuCTContiguousExperts(_Experts):
 
     def workspace_shapes(self,M,N,K,topk,global_num_experts,local_num_experts,expert_tokens_meta,activation):
         aligned = self._aligned_rows(M, topk, local_num_experts, expert_tokens_meta)
-        return (aligned,max(N//2,K)),(aligned,max(N,K)),(M,K)
+        return contiguous_workspace_shapes(M, aligned, N, K)
     def apply(self,output,hidden_states,w1,w2,topk_weights,topk_ids,activation,global_num_experts,expert_map,
               a1q_scale,a2_scale,workspace13,workspace2,expert_tokens_meta,apply_router_weight_on_input):
         if hidden_states.shape[0]==0: return
