@@ -308,14 +308,17 @@ class FlashEmbedding(nn.Module):
 
     def _lookup(self, parameter, indices, out, *, scale=False):
         view_name = "_uva_scale" if scale else "_uva_weight"
-        view = getattr(self, view_name)
-        if view is None:
-            view = (
-                get_accelerator_view_from_cpu_tensor(parameter)
-                if self.cpu_offload
-                else parameter
-            )
-            setattr(self, view_name, view)
+        # Resident weights already are accelerator tensors. Caching a Parameter
+        # with setattr would register it a second time on this Module and move
+        # the existing None attribute out of __dict__. AOT side-effect replay
+        # then tries to delete that missing attribute on the next invocation.
+        # Only CPU-offloaded weights need a separate cached UVA tensor view.
+        view = parameter
+        if self.cpu_offload:
+            view = getattr(self, view_name)
+            if view is None:
+                view = get_accelerator_view_from_cpu_tensor(parameter)
+                setattr(self, view_name, view)
         row_bytes = parameter.element_size() * (1 if scale else self.dim)
         _lookup_ple_embedding_from_pinned_kernel[(indices.numel(),)](
             view.view(torch.uint8),

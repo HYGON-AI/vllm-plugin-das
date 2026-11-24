@@ -167,7 +167,7 @@ def reuse_case():
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_dfly_kv_alias_becomes_writable_only_after_storage_validation(reuse_case, device):
+def test_dfly_kv_alias_survives_storage_validation(reuse_case, device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires GPU")
     from vllm_hcu.models.hy_v4_flash.nvidia.dfly_target_reuse import HYV4DFlyTargetReuse
@@ -182,8 +182,9 @@ def test_dfly_kv_alias_becomes_writable_only_after_storage_validation(reuse_case
         dest.mla_attn.kv_cache = source.mla_attn.kv_cache.view_as(source.mla_attn.kv_cache)
     reuse.validate_storage()
     for source, dest in reuse.layer_pairs:
-        assert dest.mla_attn.kv_sharing_target_layer_name is None
-        # The alias is removed only as allocator metadata; storage stays shared.
+        assert dest.mla_attn.kv_sharing_target_layer_name == source.mla_attn.layer_name
+        # Keep allocation metadata for later initialization; storage remains
+        # writable through the draft-owned Core033 MLA slot mapping.
         dest.mla_attn.kv_cache[:, 1:7].fill_(23)
         assert torch.all(source.mla_attn.kv_cache[:, 1:7] == 23)
         assert torch.all(source.mla_attn.kv_cache[:, 7:] == 0)
