@@ -4,8 +4,8 @@ Build and install **one vllm-hcu wheel from this branch on both nodes**. The
 same installation serves Native Prefill (TP1/DP16/EP16) and DeepEP/DeepGEMM
 Decode (TP4/DP4/EP16). Switch profiles after stopping the current service.
 No plugin source overlays, runtime loaders or edits to installed boltops are
-required. Model weights, tokenizer, expert placement and tuning data remain
-external deployment assets.
+required. Provide the model weights, tokenizer, expert placement and EP
+fused-MoE table as deployment assets.
 
 The Native profile keeps its FP32 Gemma norm / Torch quantization producer,
 EP64 scratch and bounded DBO output pool. The Decode profile selects the
@@ -25,11 +25,9 @@ cp scripts/step5_dualnode/config.env.example scripts/step5_dualnode/config.env
 
 Fill the two node addresses, interfaces, model/tokenizer paths, asset root and
 local cache directory. Use the same wheel and asset contents on both nodes.
-Prefill requires the qualified hipBLASLt build matched by its Dense recipe.
-This PR uses AITER `hipb_mm` for the tuned Dense plans, including a checksum
-of the loaded hipBLASLt library. It does not require the old Step5 Dense C++
-extension. Validate the merged PR revision rather than reusing wheel results
-from the earlier dual-node branch.
+Both Prefill profiles use AITER `hipb_mm` with hipBLASLt's default algorithm
+selection for FP8 dense GEMM. Install matching DTK hipBLASLt and device
+libraries on both nodes.
 Decode requires DeepEP's layered LL/rail mapping ABI and the HCU DeepGEMM
 channel-FP8 build. The earlier Decode measurements used source `7da8cd9` with
 code-object V5. The WASP128 profile below uses the pinned nightly API; changing
@@ -43,7 +41,6 @@ Required external asset layout:
 assets/
   expert_placement_decode.pt
   prefill/
-    dense-qualified.json
     step5_ep16_moe_table.json
     expert_placement_prefill_8192_ep16_20261020.pt
     expert_placement_prefill_e23_static_tokenhash_sz_20261029.json
