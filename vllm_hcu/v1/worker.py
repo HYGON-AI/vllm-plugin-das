@@ -292,6 +292,17 @@ class HcuGPUWorker(Worker):
 
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
+            from vllm_hcu.runtime_compat.step5 import (
+                configure_step5_deepep_hca,
+                is_step5_tp4_deepep_ll,
+            )
+
+            configure_step5_deepep_hca(self.vllm_config, self.local_rank)
+            cache_root = os.environ.get("STEP5_TRITON_KERNEL_CACHE")
+            if cache_root and is_step5_tp4_deepep_ll(self.vllm_config):
+                cache_dir = os.path.join(cache_root, f"gpu{self.local_rank}")
+                os.makedirs(cache_dir, exist_ok=True)
+                os.environ["TRITON_CACHE_DIR"] = cache_dir
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 

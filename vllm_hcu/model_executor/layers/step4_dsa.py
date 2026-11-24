@@ -2756,6 +2756,7 @@ class Step4DSAState:
         max_num_reqs: int = 0,
         max_model_len: int = 0,
         spec_query_len: int = 1,
+        step5_ll_allocation_barrier: bool = False,
     ) -> None:
         self.num_layers = num_layers
         self.geometry = geometry
@@ -2766,6 +2767,7 @@ class Step4DSAState:
         # no longer than this may be rolled back by rejection after the step,
         # so the regions it closes are kept recoverable; 1 disables that.
         self.spec_query_len = int(spec_query_len)
+        self._step5_ll_allocation_barrier = bool(step5_ll_allocation_barrier)
         # One row past the allocator's capacity, never handed out by the table.
         # The vectorized decode path writes every request's tail unconditionally
         # and sends the requests that have no tail here, which keeps the scatter
@@ -2883,6 +2885,16 @@ class Step4DSAState:
                 "capture time. The capture warmup must run at least one eager "
                 "step through the DSA layers first."
             )
+        # First-use allocations may synchronize HIP. Do not let a fast Step5
+        # rank enter LL receive while another rank grows its DSA summary pool.
+        step5_ep_cpu_group = None
+        if self._step5_ll_allocation_barrier:
+            import torch.distributed as step5_dist
+            from vllm.distributed import get_ep_group
+
+            step5_ep_cpu_group = get_ep_group().cpu_group
+            step5_dist.barrier(group=step5_ep_cpu_group)
+            torch.cuda.synchronize(device)
         # Read the block count and block size from whichever rank the cache
         # arrived in. On 0.28's fused 4-D page ([B, H, N, 2 * head_size]) the
         # naive shape[1]/shape[2] pair reads H (== 1 at TP8) as the block count
@@ -2930,6 +2942,9 @@ class Step4DSAState:
             2 * self.pending_key.numel() * self.pending_key.element_size() / 2**20,
         )
         self._allocate_graph_buffers(rows, device)
+        if step5_ep_cpu_group is not None:
+            torch.cuda.synchronize(device)
+            step5_dist.barrier(group=step5_ep_cpu_group)
 
     def _allocate_graph_buffers(self, pool_rows: int, device: torch.device) -> None:
         """Persistent decode-schedule buffers and the fixed-width score pool.

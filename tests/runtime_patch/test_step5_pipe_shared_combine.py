@@ -7,7 +7,7 @@ GPU kernels, NCCL transport and stream fences are replaced at their boundaries.
 from __future__ import annotations
 
 import ast
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import Context
 import ctypes
 import importlib.util
@@ -64,6 +64,22 @@ def _light_module(path, name):
 def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
              ep_combine=True, inline=True, uniform=False):
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    # Exercise the production no-pool lease rather than replacing its context
+    # manager with a no-op. Only its explicit GPU device identity is adapted:
+    # these fixtures use real CPU tensors and must never create a GPU backend.
+    monkeypatch.setenv("HCU_STEP5_DP_PIPE_OUTPUT_POOL", "0")
+    pool_name = "pipe_shared_output_pool_cpu"
+    pool_spec = importlib.util.spec_from_file_location(
+        pool_name, ROOT / (MOE + "dp_pipe_output_pool.py"))
+    pool = importlib.util.module_from_spec(pool_spec)
+    monkeypatch.setitem(sys.modules, pool_name, pool)
+    pool_spec.loader.exec_module(pool)
+
+    def cpu_device_key(device):
+        assert torch.device(device).type == "cpu"
+        return ("pipe-shared-cpu", 0)
+
+    monkeypatch.setattr(pool, "_device_key", cpu_device_key)
     policy = _light_module(MOE + "combine_runtime.py", "pipe_shared_policy")
     henvs = _light_module("vllm_hcu/platforms/envs.py", "pipe_shared_envs")
     # The old source lacks these helpers. Let the same regression reach its
@@ -74,6 +90,8 @@ def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
     ctx = SimpleNamespace(dp_metadata=SimpleNamespace(
         get_chunk_sizes_across_dp_rank=lambda: list(sizes)))
     events = []
+    reader_events = []
+    streams = []
     ca = SimpleNamespace(
         disabled=False,
         should_custom_ar=lambda value: value.numel() * value.element_size() <= 8 * 1024**2,
@@ -94,7 +112,9 @@ def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
     runner_ns["_EP_COMBINE"] = state
 
     class Stream:
-        cuda_stream = 0
+        def __init__(self):
+            self.cuda_stream = len(streams)
+            streams.append(self)
 
         def wait_stream(self, other):
             pass
@@ -134,10 +154,12 @@ def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
                     view(src, count, dtype))
 
         def ncclReduce(self, src, dst, count, dtype, op, root, comm, stream):
+            reader_events.append(("reduce", stream))
             if root == rank and count:
                 view(dst, count, dtype).copy_(view(src, count, dtype) * len(sizes))
 
         def ncclReduceScatter(self, src, dst, count, dtype, op, comm, stream):
+            reader_events.append(("reduce-scatter", stream))
             value = view(src, count * len(sizes), dtype).view(len(sizes), count)[rank]
             view(dst, count, dtype).copy_(value * len(sizes))
 
@@ -216,6 +238,7 @@ def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
 
     pipe_ns = _source(MOE + "modular_kernel.py", {"_dp_pipe_apply"}, dict(
         torch=torch, henvs=henvs, suspend_ep_shared_add=suspend,
+        output_lease=pool.output_lease,
         dbo_enabled=lambda: dbo, join_dp_moe_pipe=lambda: None,
         FusedMoEActivationFormat=SimpleNamespace(Standard="standard"),
         _DP_MOE_PIPE_MIN_TOKENS=1, _EP_DIRECT_SUM=0, _DP_PIPE_UNIFORM=uniform,
@@ -254,7 +277,9 @@ def _runtime(monkeypatch, *, dbo=True, sizes=(64, 64, 64, 64), rank=0,
 
     return SimpleNamespace(call=call, arm=arm, state=state, events=events,
                            handoff=handoff, policy=policy, expert=expert,
-                           runner_ns=runner_ns, sizes=sizes, rank=rank)
+                           runner_ns=runner_ns, sizes=sizes, rank=rank,
+                           pipe_ns=pipe_ns, output_pool=pool,
+                           reader_events=reader_events, streams=streams)
 
 
 def test_dbo_pipe_keeps_shared_output_for_runner(monkeypatch):
@@ -265,6 +290,40 @@ def test_dbo_pipe_keeps_shared_output_for_runner(monkeypatch):
     torch.testing.assert_close(result, torch.full_like(shared, 11))
     assert runtime.events == [("shared-add", False, 256)]
     assert runtime.state.added_to is None and not runtime.state.done
+
+
+@pytest.mark.parametrize("dbo,uniform", [(True, True), (False, False)])
+def test_pipeline_lease_fences_the_actual_final_reader(monkeypatch, dbo, uniform):
+    runtime = _runtime(monkeypatch, dbo=dbo, uniform=uniform)
+    leases = []
+
+    class RecordingPool:
+        def release(self, lane, stream, **kwargs):
+            # Record the pool boundary reached by the real production _Lease.
+            # The actual NCCL CPU boundary must already have read moe_full.
+            assert runtime.reader_events
+            assert runtime.reader_events[-1][1] == stream.cuda_stream
+            runtime.reader_events.append(("release", stream.cuda_stream))
+
+    @contextmanager
+    def recording_output_lease(*, device, dtype, K, rows, sizes, dbo):
+        buffer = torch.empty((rows, K), device=device, dtype=dtype)
+        lease = runtime.output_pool._Lease(
+            RecordingPool(), 0, buffer, runtime=False, dbo=dbo,
+            rows=rows, sizes=sizes, compute_stream=runtime.streams[0])
+        leases.append(lease)
+        yield lease
+        assert lease.released, "Pipeline returned without a final-reader fence"
+        assert runtime.reader_events[-1][0] == "release"
+
+    runtime.pipe_ns["output_lease"] = recording_output_lease
+    shared = runtime.arm(3)
+    _, result = runtime.call(shared)
+    torch.testing.assert_close(result, torch.full_like(shared, 11))
+    assert len(leases) == 1 and leases[0].released
+    expected_stream = runtime.streams[0] if dbo else runtime.streams[1]
+    assert runtime.reader_events[-1] == ("release", expected_stream.cuda_stream)
+    assert all(not event[1] for event in runtime.events)
 
 
 @pytest.mark.parametrize("dbo,sizes,rank,uniform", [

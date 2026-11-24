@@ -633,6 +633,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 return
             a1q, a1q_scale, expert_ids, inv_perm = fused_scatter
             align_used = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter_alignment", _HCU_HT_EP_TOKEN_ALIGNMENT)
+            if local_num_experts in (22, 23) and (align_used == 128) != bool(
+                getattr(self, "_hcu_step5_wasp128_enabled", False)
+            ):
+                raise ValueError("Step5 WASP128 GEMM and dispatch alignment disagree")
         else:
             M_sum, _ = compute_aligned_M_and_alignment(
                 M=topk_ids.size(0),
@@ -711,7 +715,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             else:
                 grouped_fp8 = m_grouped_fp8_gemm_nt_contiguous
                 if step5_channel_fp8 and fused_scatter is not None and align_used == 128:
-                    from ..ep8_wasp128 import grouped_fp8
+                    if local_num_experts == 44:
+                        from ..ep8_wasp128 import grouped_fp8
+                    else:
+                        from ..step5_wasp128 import grouped_fp8
                 grouped_fp8(
                     (a1q, a1q_scale),
                     (w1, self.w1_scale),

@@ -49,6 +49,7 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime
     DeepEPDeepGemmW4A8MaskedExperts,
 )
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
 
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
@@ -536,6 +537,8 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         max_num_tokens: int,
         num_dispatchers: int,
     ):
+        self._step5_ll = bool(
+            is_step5_tp4_deepep_ll() and henvs.optional_custom_op_enabled(True))
         mk.FusedMoEExpertsModular.__init__(
             self,
             moe_config=moe_config,
@@ -569,7 +572,11 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+        return activation == MoEActivation.SILU or (
+            activation == MoEActivation.SWIGLUSTEP
+            and is_step5_tp4_deepep_ll()
+            and henvs.optional_custom_op_enabled(True)
+        )
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -641,9 +648,12 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         del topk_weights, expert_map
         del a2_scale, apply_router_weight_on_input
         del workspace13
-        if activation != MoEActivation.SILU:
+        if not (activation == MoEActivation.SILU or (
+            activation == MoEActivation.SWIGLUSTEP
+            and self._step5_ll and henvs.optional_custom_op_enabled(True)
+        )):
             raise NotImplementedError(
-                "DeepEP DeepGEMM LL path currently supports silu only, "
+                "DeepEP DeepGEMM LL requires SiLU or the Step5 SWIGLUSTEP route, "
                 f"got {activation.value}."
             )
         if expert_tokens_meta is None:
@@ -653,6 +663,8 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         if self.w1_scale is None or self.w2_scale is None:
             raise RuntimeError("DeepEP DeepGEMM LL requires weight scales")
         use_int8 = bool(self.quant_config.use_int8_w8a8)
+        if use_int8 and activation == MoEActivation.SWIGLUSTEP:
+            raise NotImplementedError("Step5 SWIGLUSTEP requires channel-FP8 experts")
         if self._deepgemm_w13 is None or self._deepgemm_w2 is None:
             raise RuntimeError(
                 "DeepEP DeepGEMM LL weights were not packed. "
@@ -666,6 +678,10 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
         local_num_experts, max_tokens, _ = hidden_states.shape
         _, _, N, K, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
+        dispatch_tokens = topk_ids.size(0)
+        if (self._step5_ll and henvs.optional_custom_op_enabled(True)
+                and dispatch_tokens > 0 and dispatch_tokens % 4 == 0):
+            dispatch_tokens //= 4
         expected_m = max_tokens
         if not use_int8 and henvs.VLLM_HCU_USE_CUSTOM_OPS:
             # DeepGEMM uses expected_m as a tile-selection hint; masked_m
@@ -678,7 +694,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             expected_m = min(
                 max_tokens,
                 (
-                    topk_ids.size(0)
+                    dispatch_tokens
                     * self.num_dispatchers
                     * topk_ids.size(1)
                     + global_num_experts
@@ -719,12 +735,32 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
                     tokens_per_expert=expert_num_tokens,
                 )
         else:
-            q_activation, q_activation_scale = fuse_silu_mul_fp8_quant_ep(
-                gateup_output,
-                fp8type=0,
-                tokens_per_expert=expert_num_tokens,
-                limit=self.quant_config.gemm1_clamp_limit,
-            )
+            if activation == MoEActivation.SWIGLUSTEP:
+                from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
+                    ep_masked_swiglustep_quant_deepgemm,
+                )
+                # workspace13 aliases GEMM2 output. Put its quantized input in
+                # workspace2's tail, disjoint from the BF16 GEMM1 result.
+                raw = workspace2.view(torch.uint8).view(-1)
+                gateup_bytes = local_num_experts * max_tokens * N * workspace2.element_size()
+                raw = raw[gateup_bytes:]
+                width = self.adjust_N_for_activation(N, activation)
+                q_bytes = local_num_experts * max_tokens * width
+                scale_bytes = local_num_experts * max_tokens * 4
+                if raw.numel() < q_bytes + scale_bytes:
+                    raise RuntimeError("Step5 LL activation scratch is too small")
+                q_out = raw[:q_bytes].view(torch.float8_e4m3fn).view(
+                    local_num_experts, max_tokens, width)
+                scale_out = raw[q_bytes:q_bytes + scale_bytes].view(torch.float32).view(
+                    local_num_experts, max_tokens, 1)
+                q_activation, q_activation_scale = ep_masked_swiglustep_quant_deepgemm(
+                    gateup_output, expert_num_tokens,
+                    limit=float(self.quant_config.gemm1_clamp_limit or 7.0),
+                    q=q_out, scale=scale_out)
+            else:
+                q_activation, q_activation_scale = fuse_silu_mul_fp8_quant_ep(
+                    gateup_output, fp8type=0, tokens_per_expert=expert_num_tokens,
+                    limit=self.quant_config.gemm1_clamp_limit)
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         q_activation = q_activation.view(local_num_experts, max_tokens,
                                          activation_out_dim)

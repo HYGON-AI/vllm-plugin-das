@@ -31,6 +31,7 @@ from boltops.fused_moe.triton.moe_config_utils import try_get_optimal_moe_config
 from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
 from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
 from vllm_hcu.platforms import envs as henvs
+from .step5_wide_fp8_gemm import needs_wide_a, invoke_wide_fp8
 
 FP8 = torch.float8_e4m3fn
 _announced = False
@@ -124,6 +125,58 @@ def _ep_swiglustep_quant_deepgemm_kernel(
         # Router weights belong to DeepGEMM's unpermute/reduce after GEMM2.
         # Invalid rows store zero q and the harmless native zero-row scale.
         tl.store(scale_ptr + rows, scale, mask=row_mask)
+
+
+@triton.jit
+def _ep_masked_swiglustep_quant_deepgemm_kernel(
+    q_ptr, scale_ptr, in_ptr, counts_ptr,
+    T: tl.constexpr, D: tl.constexpr, LIMIT: tl.constexpr,
+    LANES: tl.constexpr, CH: tl.constexpr,
+):
+    expert = tl.program_id(0) // LANES
+    lane = tl.program_id(0) % LANES
+    count = tl.minimum(tl.load(counts_ptr + expert), T)
+    cols = tl.arange(0, CH)
+    # Counts remain GPU values so replay accepts new routing without reading
+    # uninitialized padding. Reuse Step5's post-SiLU clamp and BF16 rounding.
+    for row in range(lane, count, LANES):
+        flat = expert.to(tl.int64) * T + row
+        offs = flat * (2 * D) + cols
+        y0 = _ep_swiglu_chunk(in_ptr, offs, True, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, True, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, True, LIMIT, D)
+        amax = tl.maximum(tl.maximum(tl.max(tl.abs(y0), 0), tl.max(tl.abs(y1), 0)),
+                          tl.max(tl.abs(y2), 0))
+        scale = tl.maximum(amax.to(tl.float32), 1.0e-10) / 448.0
+        inv = 1.0 / scale
+        out = flat * D + cols
+        tl.store(q_ptr + out, (y0 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + CH, (y1 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(scale_ptr + flat, scale)
+
+
+def ep_masked_swiglustep_quant_deepgemm(cache1, counts, limit=7.0, *, q=None, scale=None):
+    """Step5 activation and full-token FP8 quantization in LL expert layout."""
+    if (cache1.dtype != torch.bfloat16 or cache1.ndim != 3
+            or cache1.shape[-1] != 3072 or not cache1.is_contiguous()):
+        raise ValueError("Step5 LL activation requires contiguous BF16 [E,T,3072]")
+    e, t, _ = cache1.shape
+    if (counts.dtype != torch.int32 or counts.shape != (e,)
+            or not counts.is_contiguous() or counts.device != cache1.device):
+        raise ValueError("Step5 LL requires contiguous device per-expert counts")
+    if q is None:
+        q = torch.empty((e, t, 1536), dtype=FP8, device=cache1.device)
+    if scale is None:
+        scale = torch.empty((e, t, 1), dtype=torch.float32, device=cache1.device)
+    if (q.shape != (e, t, 1536) or q.dtype != FP8 or not q.is_contiguous()
+            or scale.shape != (e, t, 1) or scale.dtype != torch.float32
+            or not scale.is_contiguous() or q.device != cache1.device or scale.device != cache1.device):
+        raise ValueError("Step5 LL activation output/scale geometry differs")
+    _ep_masked_swiglustep_quant_deepgemm_kernel[(e * 32,)](
+        q, scale, cache1, counts, T=t, D=1536, LIMIT=float(limit), LANES=32, CH=512,
+        num_warps=4, num_stages=1)
+    return q, scale
 
 
 @triton.jit
@@ -492,7 +545,7 @@ def _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted
         B_scale.stride(1) if B_scale.ndim >= 2 else 0,
         A.size(0), 0, 0,
         MUL_ROUTED_WEIGHT=False,
-        USE_ADDR_OFFSET_INT64_A=A.numel() * A.element_size() >= lim,
+        USE_ADDR_OFFSET_INT64_A=needs_wide_a(A),
         USE_ADDR_OFFSET_INT64_B=B.numel() * B.element_size() >= lim,
         USE_ADDR_OFFSET_INT64_C=C.numel() * C.element_size() >= lim,
         top_k=top_k, compute_type=compute_type, use_fp8_w8a8=True, use_int8_w8a8=False,
@@ -515,6 +568,10 @@ def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_
                            sorted_w, expert_ids, nvalid, top_k, compute_type, config=config,
                            **{k: v for k, v in kw.items() if k != "ck_sorting"})
         return
+    if needs_wide_a(A):
+        return invoke_wide_fp8(
+            A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
+            sorted_w, expert_ids, nvalid, top_k, compute_type, config, **kw)
     invoke_fused_moe_kernel(A, B, C, A_scale, B_scale, None, topk_weights, topk_ids,
                             sorted_ids, sorted_w, expert_ids, nvalid, False, top_k,
                             compute_type=compute_type, use_fp8_w8a8=True,

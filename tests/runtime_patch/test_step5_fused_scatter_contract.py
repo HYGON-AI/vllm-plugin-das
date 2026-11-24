@@ -164,13 +164,14 @@ class FusedScatterContractTest(unittest.TestCase):
                 Tensor((rows,), "int32"),
                 Tensor(kwargs["topk_ids"].shape, "int32"), 256)
 
-    def receive(self, experts=22, rows=256, counts=None, scatter=True):
+    def receive(self, experts=22, rows=256, counts=None, scatter=True, wasp128=False):
         counts = [rows] + [0] * (experts - 1) if counts is None else counts
         buffer = object()
         key = (id(buffer), 0)
         pf = SimpleNamespace(
             rank_expert_offset=0, buffer=buffer, num_dispatchers_=16,
             _hcu_step5_fused_scatter_enabled=scatter,
+            _hcu_step5_wasp128_enabled=wasp128,
             _hcu_step5_scatter_buffers={key: (
                 Tensor((sum(counts), 4096)),
                 Tensor((sum(counts), 1), "float32"),
@@ -196,10 +197,11 @@ class FusedScatterContractTest(unittest.TestCase):
                 Tensor((rows, 8), "float32"), None, quant, True,
             )
 
-    def apply(self, result, *, experts=22, compact=False, scatter=True, owner=True):
+    def apply(self, result, *, experts=22, compact=False, scatter=True, owner=True, wasp128=False):
         x, scale, meta, ids, weights = result
         expert = SimpleNamespace(
             _hcu_step5_owner=owner, _hcu_step5_compact_ht=compact,
+            _hcu_step5_wasp128_enabled=wasp128,
             _hcu_step5_fused_scatter_enabled=scatter,
             _hcu_logical_n=3072, _hcu_logical_k=4096, block_shape=None,
             w1_scale=object(), w2_scale=object(), mxfp8=False,
@@ -212,6 +214,26 @@ class FusedScatterContractTest(unittest.TestCase):
             Tensor((experts,) + (1,) * 6), weights, ids, "swiglustep",
             experts * 16, None, scale, None, Tensor((1,)), Tensor((1,)), meta, False,
         )
+
+    def test_wasp128_dispatch_and_consumer_share_e22_e23_layout(self):
+        for experts in (22, 23):
+            result = self.receive(experts, rows=128, wasp128=True)
+            self.assertEqual(result[2]._hcu_step5_fused_scatter_alignment, 128)
+            module = ModuleType("vllm_hcu.model_executor.layers.fused_moe.step5_wasp128")
+            module.grouped_fp8 = self.gemm
+            self.scope["__package__"] = "vllm_hcu.model_executor.layers.fused_moe.experts"
+            with patch.dict("sys.modules", {module.__name__: module}):
+                with self.assertRaises(GemmReached):
+                    self.apply(result, experts=experts, wasp128=True)
+            self.assertEqual(self.calls[-1][0][0].shape, (128, 4096))
+
+    def test_wasp128_cannot_consume_a_256_dispatch_contract(self):
+        with self.assertRaisesRegex(ValueError, "alignment disagree"):
+            self.apply(self.receive(), wasp128=True)
+
+    def test_wasp128_rejects_dispatch_counts_not_aligned_to_128(self):
+        with self.assertRaisesRegex(ValueError, "aligned"):
+            self.receive(rows=64, wasp128=True)
 
     def test_all_compact_and_scatter_combinations_for_e22_and_e23(self):
         for experts in (22, 23):

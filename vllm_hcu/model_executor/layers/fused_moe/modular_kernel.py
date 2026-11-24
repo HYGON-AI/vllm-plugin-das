@@ -15,6 +15,7 @@ import torch
 import vllm.envs as envs
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.model_executor.layers.fused_moe.workspace_growth import get_moe_workspaces
+from vllm_hcu.model_executor.layers.fused_moe.dp_pipe_output_pool import output_lease
 from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
     suspend_ep_shared_add,
 )
@@ -1693,164 +1694,177 @@ class FusedMoEKernelModularImpl:
         )
         if S:
             from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe as _ep_mod
-        moe_full = torch.empty((M + S, K), dtype=hidden_states.dtype, device=a1q.device)
-        moe_out = moe_full[:M]
-        result = torch.empty_like(hidden_states)
+        with output_lease(
+            device=a1q.device, dtype=hidden_states.dtype, K=K,
+            rows=M + S, sizes=sizes, dbo=dbo,
+        ) as _output_lease:
+            moe_full = (
+                _output_lease.buffer if _output_lease is not None else
+                torch.empty((M + S, K), dtype=hidden_states.dtype, device=a1q.device)
+            )
+            moe_out = moe_full[:M]
+            result = torch.empty_like(hidden_states)
 
-        nccl, ncomm = comm.nccl, comm.comm
-        sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
+            nccl, ncomm = comm.nccl, comm.comm
+            sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
 
-        # The synchronized DP metadata makes this decision identical on peers.
-        # Half-DP pipelines and nonuniform/empty shards retain the grouped path.
-        uniform = (
-            _DP_PIPE_UNIFORM and dbo and len(sizes) == W
-            and sizes[0] > 0 and all(n == sizes[0] for n in sizes)
-        )
-        if uniform and not getattr(self, "_step5_uniform_announced", False):
-            self._step5_uniform_announced = True
-            print(f"[dp_moe_pipe] uniform collectives: sizes={sizes}", flush=True)
+            # The synchronized DP metadata makes this decision identical on peers.
+            # Half-DP pipelines and nonuniform/empty shards retain the grouped path.
+            uniform = (
+                _DP_PIPE_UNIFORM and dbo and len(sizes) == W
+                and sizes[0] > 0 and all(n == sizes[0] for n in sizes)
+            )
+            if uniform and not getattr(self, "_step5_uniform_announced", False):
+                self._step5_uniform_announced = True
+                print(f"[dp_moe_pipe] uniform collectives: sizes={sizes}", flush=True)
 
-        def broadcast(grp, stream) -> None:
-            st = cudaStream_t(stream.cuda_stream)
-            if uniform:
-                assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+            def broadcast(grp, stream) -> None:
+                st = cudaStream_t(stream.cuda_stream)
+                if uniform:
+                    assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+                    nccl.ncclGroupStart()
+                    for src, dst in zip(local, gath):
+                        nccl.ncclAllGather(
+                            buffer_type(src.data_ptr()), buffer_type(dst.data_ptr()),
+                            src.numel(), _nccl_dtype(src), ncomm, st,
+                        )
+                    nccl.ncclGroupEnd()
+                    return
                 nccl.ncclGroupStart()
                 for src, dst in zip(local, gath):
-                    nccl.ncclAllGather(
-                        buffer_type(src.data_ptr()), buffer_type(dst.data_ptr()),
-                        src.numel(), _nccl_dtype(src), ncomm, st,
-                    )
+                    for root in grp:
+                        sl = dst[offs[root] : offs[root + 1]]
+                        nccl.ncclBroadcast(
+                            buffer_type(src.data_ptr()),
+                            buffer_type(sl.data_ptr()),
+                            sl.numel(),
+                            _nccl_dtype(src),
+                            root,
+                            ncomm,
+                            st,
+                        )
                 nccl.ncclGroupEnd()
-                return
-            nccl.ncclGroupStart()
-            for src, dst in zip(local, gath):
+
+            def experts(grp) -> None:
+                a, b = offs[grp[0]], offs[grp[-1] + 1]
+                if b <= a:
+                    return
+                _, _, N, Kw, top_k = fe.moe_problem_size(
+                    gath[0][a:b], w1, w2, gath[2][a:b]
+                )
+                if self.N > 0:
+                    N, Kw = self.N, self.K
+                workspace13, workspace2, _ = self._allocate_buffers(
+                    hidden_states.dtype,
+                    a1q.device,
+                    b - a,
+                    b - a,
+                    N,
+                    Kw,
+                    top_k,
+                    global_num_experts,
+                    local_num_experts,
+                    None,
+                    activation,
+                )
+                if S:
+                    _ep_mod.direct_scratch = moe_full[M:]
+                # This path owns its NCCL combine and never calls finalize_hook.
+                # Keep the shared result separate for the runner's final add. The
+                # scope is local to this microbatch's compute, not the global hook.
+                with suspend_ep_shared_add():
+                    fe.apply(
+                        output=moe_out[a:b],
+                        hidden_states=gath[0][a:b],
+                        w1=w1,
+                        w2=w2,
+                        topk_weights=gath[1][a:b],
+                        topk_ids=gath[2][a:b],
+                        activation=activation,
+                        global_num_experts=global_num_experts,
+                        expert_map=expert_map,
+                        a1q_scale=(
+                            a1q_scale[a:b]
+                            if a1q_scale is not None and a1q_scale.numel() > 1
+                            else a1q_scale
+                        ),
+                        a2_scale=fe.a2_scale,
+                        workspace13=workspace13,
+                        workspace2=workspace2,
+                        expert_tokens_meta=None,
+                        apply_router_weight_on_input=False,
+                    )
+                if S:
+                    _ep_mod.direct_scratch = None
+
+            def reduce(grp, stream) -> None:
+                st = cudaStream_t(stream.cuda_stream)
+                if uniform:
+                    assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+                    nccl.ncclReduceScatter(
+                        buffer_type(moe_out.data_ptr()), buffer_type(result.data_ptr()),
+                        result.numel(), _nccl_dtype(result), sum_op, ncomm, st,
+                    )
+                    return
+                nccl.ncclGroupStart()
                 for root in grp:
-                    sl = dst[offs[root] : offs[root + 1]]
-                    nccl.ncclBroadcast(
-                        buffer_type(src.data_ptr()),
-                        buffer_type(sl.data_ptr()),
-                        sl.numel(),
-                        _nccl_dtype(src),
+                    ch = moe_out[offs[root] : offs[root + 1]]
+                    nccl.ncclReduce(
+                        buffer_type(ch.data_ptr()),
+                        buffer_type(result.data_ptr()),
+                        ch.numel(),
+                        _nccl_dtype(ch),
+                        sum_op,
                         root,
                         ncomm,
                         st,
                     )
-            nccl.ncclGroupEnd()
+                nccl.ncclGroupEnd()
 
-        def experts(grp) -> None:
-            a, b = offs[grp[0]], offs[grp[-1] + 1]
-            if b <= a:
-                return
-            _, _, N, Kw, top_k = fe.moe_problem_size(
-                gath[0][a:b], w1, w2, gath[2][a:b]
-            )
-            if self.N > 0:
-                N, Kw = self.N, self.K
-            workspace13, workspace2, _ = self._allocate_buffers(
-                hidden_states.dtype,
-                a1q.device,
-                b - a,
-                b - a,
-                N,
-                Kw,
-                top_k,
-                global_num_experts,
-                local_num_experts,
-                None,
-                activation,
-            )
-            if S:
-                _ep_mod.direct_scratch = moe_full[M:]
-            # This path owns its NCCL combine and never calls finalize_hook.
-            # Keep the shared result separate for the runner's final add. The
-            # scope is local to this microbatch's compute, not the global hook.
-            with suspend_ep_shared_add():
-                fe.apply(
-                    output=moe_out[a:b],
-                    hidden_states=gath[0][a:b],
-                    w1=w1,
-                    w2=w2,
-                    topk_weights=gath[1][a:b],
-                    topk_ids=gath[2][a:b],
-                    activation=activation,
-                    global_num_experts=global_num_experts,
-                    expert_map=expert_map,
-                    a1q_scale=(
-                        a1q_scale[a:b]
-                        if a1q_scale is not None and a1q_scale.numel() > 1
-                        else a1q_scale
-                    ),
-                    a2_scale=fe.a2_scale,
-                    workspace13=workspace13,
-                    workspace2=workspace2,
-                    expert_tokens_meta=None,
-                    apply_router_weight_on_input=False,
-                )
-            if S:
-                _ep_mod.direct_scratch = None
+            if dbo:
+                # Every buffer here was allocated on the compute stream, which waits
+                # for the combine before this returns, so none is freed early.
+                dbo_yield_and_switch_from_compute_to_comm()
+                broadcast(groups[0], torch.cuda.current_stream())
+                dbo_yield_and_switch_from_comm_to_compute()
+                experts(groups[0])
+                dbo_yield_and_switch_from_compute_to_comm()
+                reduce(groups[0], torch.cuda.current_stream())
+                if _output_lease is not None:
+                    # Fence the last NCCL read before the DBO CPU handoff.
+                    _output_lease.release_after_last_reader(torch.cuda.current_stream())
+                dbo_yield_and_switch_from_comm_to_compute()
+                return result
 
-        def reduce(grp, stream) -> None:
-            st = cudaStream_t(stream.cuda_stream)
-            if uniform:
-                assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
-                nccl.ncclReduceScatter(
-                    buffer_type(moe_out.data_ptr()), buffer_type(result.data_ptr()),
-                    result.numel(), _nccl_dtype(result), sum_op, ncomm, st,
-                )
-                return
-            nccl.ncclGroupStart()
-            for root in grp:
-                ch = moe_out[offs[root] : offs[root + 1]]
-                nccl.ncclReduce(
-                    buffer_type(ch.data_ptr()),
-                    buffer_type(result.data_ptr()),
-                    ch.numel(),
-                    _nccl_dtype(ch),
-                    sum_op,
-                    root,
-                    ncomm,
-                    st,
-                )
-            nccl.ncclGroupEnd()
+            if _dp_pipe_stream is None:
+                _dp_pipe_stream = torch.cuda.Stream(device=a1q.device)
+            side = _dp_pipe_stream
+            cur = torch.cuda.current_stream()
+            side.wait_stream(cur)
 
-        if dbo:
-            # Every buffer here was allocated on the compute stream, which waits
-            # for the combine before this returns, so none is freed early.
-            dbo_yield_and_switch_from_compute_to_comm()
-            broadcast(groups[0], torch.cuda.current_stream())
-            dbo_yield_and_switch_from_comm_to_compute()
-            experts(groups[0])
-            dbo_yield_and_switch_from_compute_to_comm()
-            reduce(groups[0], torch.cuda.current_stream())
-            dbo_yield_and_switch_from_comm_to_compute()
+            ag_ev = []
+            for grp in groups:
+                broadcast(grp, side)
+                ev = torch.cuda.Event()
+                ev.record(side)
+                ag_ev.append(ev)
+
+            moe_ev = []
+            for grp, ev in zip(groups, ag_ev):
+                cur.wait_event(ev)
+                experts(grp)
+                ev = torch.cuda.Event()
+                ev.record(cur)
+                moe_ev.append(ev)
+
+            for grp, ev in zip(groups, moe_ev):
+                side.wait_event(ev)
+                reduce(grp, side)
+            if _output_lease is not None:
+                # All expert writes precede these final side-stream reductions.
+                _output_lease.release_after_last_reader(side)
+            _dp_pipe_pending = (side, local, gath, moe_out, result)
             return result
-
-        if _dp_pipe_stream is None:
-            _dp_pipe_stream = torch.cuda.Stream(device=a1q.device)
-        side = _dp_pipe_stream
-        cur = torch.cuda.current_stream()
-        side.wait_stream(cur)
-
-        ag_ev = []
-        for grp in groups:
-            broadcast(grp, side)
-            ev = torch.cuda.Event()
-            ev.record(side)
-            ag_ev.append(ev)
-
-        moe_ev = []
-        for grp, ev in zip(groups, ag_ev):
-            cur.wait_event(ev)
-            experts(grp)
-            ev = torch.cuda.Event()
-            ev.record(cur)
-            moe_ev.append(ev)
-
-        for grp, ev in zip(groups, moe_ev):
-            side.wait_event(ev)
-            reduce(grp, side)
-        _dp_pipe_pending = (side, local, gath, moe_out, result)
-        return result
 
     def apply(
         self,

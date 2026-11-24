@@ -73,3 +73,43 @@ def configure_step5_pd_producer_compilation(config):
     changed = any(options.get(key) is not value for key, value in required.items())
     options.update(required)
     return changed
+
+
+def is_step5_tp4_deepep_ll(config=None):
+    """Identify the non-SP Step5 TP4/DP4 low-latency transport route."""
+    if config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    if config is None or not is_step5_config(config):
+        return False
+    parallel = getattr(config, "parallel_config", None)
+    passes = getattr(getattr(config, "compilation_config", None), "pass_config", None)
+    return bool(
+        parallel is not None
+        and getattr(parallel, "tensor_parallel_size", None) == 4
+        and getattr(parallel, "data_parallel_size", None) == 4
+        and getattr(parallel, "enable_expert_parallel", False)
+        and not getattr(parallel, "enable_dbo", True)
+        and getattr(parallel, "pipeline_parallel_size", None) == 1
+        and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
+        and not getattr(passes, "enable_sp", False)
+    )
+
+
+def configure_step5_deepep_hca(config, local_rank):
+    """Bind rocSHMEM to the NIC selected by DeepEP for this logical device."""
+    if not is_step5_tp4_deepep_ll(config):
+        return
+    import os
+
+    mapping = os.environ.get("DEEP_EP_DEVICE_TO_HCA_MAPPING")
+    if not mapping:
+        return
+    devices = {}
+    for entry in mapping.split(","):
+        device, hca = entry.split(":", 1)
+        devices[int(device)] = hca.split(":", 1)[0]
+    if local_rank not in devices or not devices[local_rank]:
+        raise ValueError(f"DeepEP NIC mapping omits logical device {local_rank}")
+    os.environ["ROCSHMEM_USE_IB_HCA"] = devices[local_rank]

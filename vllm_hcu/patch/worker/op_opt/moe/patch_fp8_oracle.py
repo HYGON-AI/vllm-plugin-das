@@ -274,7 +274,7 @@ def apply_to_module(module: ModuleType) -> bool:
             # Channel-FP8 on HCU DeepGemmExperts: the deepgemm FP8 grouped
             # kernels consume the Marlin 6D layout [E, K/64, N/16, 4, 16, 16],
             # mirroring hcu_convert_to_int8_moe_kernel_format.
-            if w13.dim() == 6 and w2.dim() == 6:
+            if w13.dim() in (6, 7) and w2.dim() == w13.dim():
                 return w13, w2, w13_scale, w2_scale
             import torch
             from deepgemm import (
@@ -330,9 +330,14 @@ def apply_to_module(module: ModuleType) -> bool:
                     and os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER") == "1"
                     and is_step5_owner(layer)
                 ):
-                    from vllm_hcu.model_executor.layers.fused_moe.ep8_wasp128 import (
-                        nightly_weight_packer,
-                    )
+                    if os.environ.get("HCU_STEP5_WASP128") == "1":
+                        from vllm_hcu.model_executor.layers.fused_moe.step5_wasp128 import (
+                            nightly_weight_packer,
+                        )
+                    else:
+                        from vllm_hcu.model_executor.layers.fused_moe.ep8_wasp128 import (
+                            nightly_weight_packer,
+                        )
 
                     pack_weight = nightly_weight_packer(
                         getattr(layer, "moe_config", None)

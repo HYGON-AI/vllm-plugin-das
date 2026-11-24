@@ -143,6 +143,13 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                     and moe_quant_config.block_shape is None
                 ):
                     raise ValueError("Step5 fused DeepEP scatter requires TP1 channel-FP8 DeepGemmExperts")
+                wasp128 = False
+                if os.environ.get("HCU_STEP5_WASP128") == "1":
+                    from .step5_wasp128 import nightly_weight_packer
+
+                    wasp128 = nightly_weight_packer(moe_config) is not None
+                prepare._hcu_step5_wasp128_enabled = wasp128
+                experts._hcu_step5_wasp128_enabled = wasp128
             import deep_ep
             from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
@@ -479,7 +486,7 @@ def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
 
 
 def _step5_fused_scatter_alignment(prepare, num_experts):
-    if num_experts == 352 and getattr(prepare, "_hcu_step5_wasp128_enabled", False):
+    if num_experts in (352, 368) and getattr(prepare, "_hcu_step5_wasp128_enabled", False):
         return 128
     return 256
 
@@ -928,6 +935,101 @@ def ht_finalize_with_buffer_pair(
     return receiver
 
 
+class _Step5TPTokenBuffer:
+    """Send each replicated TP token once; restore full rows after combine."""
+
+    def __init__(self, buffer, max_tokens_per_rank, hidden_size):
+        import torch
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        self._buffer = buffer
+        self._tp = get_tp_group()
+        self._size, self._rank = self._tp.world_size, self._tp.rank_in_group
+        if self._size != 4 or buffer.group_size != 16:
+            raise ValueError("Step5 routed-token partition requires TP4/EP16")
+        self._capacity = max_tokens_per_rank
+        self._gather_comm = PyNcclCommunicator(
+            self._tp.cpu_group, device=torch.device("cuda", torch.cuda.current_device()))
+        if not self._gather_comm.available or self._gather_comm.disabled:
+            raise RuntimeError("Step5 routed-token partition requires a TP gather communicator")
+        self._local_output = torch.empty(
+            ((max_tokens_per_rank + 3) // 4, hidden_size),
+            dtype=torch.bfloat16, device=torch.cuda.current_device())
+
+    def __getattr__(self, name):
+        return getattr(self._buffer, name)
+
+    @staticmethod
+    def _complete_receive(event, hook):
+        if hook is not None:
+            hook()
+        if event is not None and event.event is not None:
+            event.current_stream_wait()
+
+    def low_latency_dispatch(
+        self, x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank,
+        num_experts, quant_type=1, quant_group_size=0, fp8_round_scale=False,
+        async_finish=False, return_recv_hook=False, x_scales=None, ll_route_hint=None,
+    ):
+        import torch
+
+        if async_finish:
+            raise ValueError("Step5 TP partition requires synchronous dispatch")
+        if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
+            raise ValueError("Step5 LL dispatch expects BF16 input before its FP8 quantization")
+        n = x.shape[0]
+        partition = n > 0 and n % self._size == 0
+        if partition:
+            width = n // self._size
+            start = self._rank * width
+            x, topk_idx, topk_weight = (
+                t[start:start + width] for t in (x, topk_idx, topk_weight))
+        received, counts, handle, event, hook = self._buffer.low_latency_dispatch(
+            x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank, num_experts,
+            quant_type=quant_type, quant_group_size=quant_group_size,
+            fp8_round_scale=fp8_round_scale, async_finish=False,
+            return_recv_hook=False, x_scales=x_scales, ll_route_hint=ll_route_hint)
+        self._complete_receive(event, hook)
+        return received, counts, (handle, n if partition else None), event, (
+            (lambda: None) if return_recv_hook else None)
+
+    def low_latency_combine(self, x, topk_idx, topk_weights, handle, **kwargs):
+        import torch
+
+        native_handle, n = handle
+        if kwargs.get("async_finish", False):
+            raise ValueError("Step5 TP partition requires the DBO-disabled synchronous combine")
+        requested_hook = kwargs.get("return_recv_hook", False)
+        # This route disables DBO. Complete send/receive in one native kernel
+        # and preserve the modular caller's callback contract with a no-op.
+        kwargs["return_recv_hook"] = False
+        if n is None:
+            output, event, hook = self._buffer.low_latency_combine(
+                x, topk_idx, topk_weights, native_handle, **kwargs)
+            self._complete_receive(event, hook)
+            return output, event, ((lambda: None) if requested_hook else None)
+        output = kwargs.pop("out", None)
+        if output is None or output.shape != (n, x.shape[-1]) or not output.is_contiguous():
+            raise ValueError("Step5 TP partition requires a contiguous caller-owned full output")
+        width, start = n // self._size, self._rank * (n // self._size)
+        if width > self._local_output.shape[0]:
+            raise ValueError("Step5 TP partition exceeds its reserved token capacity")
+        local = self._local_output[:width]
+        _, event, hook = self._buffer.low_latency_combine(
+            x, topk_idx[start:start + width], topk_weights[start:start + width],
+            native_handle, out=local, **kwargs)
+        self._complete_receive(event, hook)
+        # Enqueue at the combine call site, before shared-expert TP reduction.
+        # A deferred gather callback could invert collective order between ranks.
+        self._gather_comm.all_gather(output, local, stream=torch.cuda.current_stream())
+        return output, event, ((lambda: None) if requested_hook else None)
+
+    def get_next_low_latency_combine_buffer(self, handle):
+        native_handle, _ = handle
+        return self._buffer.get_next_low_latency_combine_buffer(native_handle)
+
+
 def ll_init(
     original,
     self,
@@ -956,6 +1058,23 @@ def ll_init(
     self._vllm_hcu_clean_low_latency_buffer = False
     self._hcu_low_latency_dispatch_abi = _has_hcu_low_latency_dispatch_abi(buffer)
     self._hcu_low_latency_cleanup_topk = _has_topk_low_latency_cleanup_abi(buffer)
+    from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
+    from vllm_hcu.platforms import envs as henvs
+
+    self._hcu_step5_ll_transport = bool(
+        is_step5_tp4_deepep_ll() and henvs.optional_custom_op_enabled(True))
+    if self._hcu_step5_ll_transport:
+        import weakref
+
+        self._vllm_hcu_clean_low_latency_buffer = True
+        reference = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
+        proxy = reference() if reference is not None else None
+        if proxy is None:
+            proxy = _Step5TPTokenBuffer(buffer, max_tokens_per_rank, 4096)
+            buffer._hcu_step5_tp_tokens_proxy = weakref.ref(proxy)
+        elif proxy._capacity < max_tokens_per_rank:
+            raise ValueError("Step5 LL shared transport capacity changed after construction")
+        self.buffer = proxy
 
 
 def configure_step5_ll_tp_tokens(prepare, moe):
@@ -1000,17 +1119,6 @@ def configure_step5_ll_tp_tokens(prepare, moe):
             buffer._hcu_step5_tp_tokens_proxy = proxy
         prepare.buffer = proxy
         prepare._hcu_step5_tp_tokens = True
-    if henvs.optional_custom_op_enabled(
-        os.environ.get("HCU_STEP5_DEEPEP_TP_TOKENS") == "1"
-    ):
-        if num_dispatchers != 8 or os.environ.get("HCU_STEP5_DEEPEP_SWIGLUSTEP") != "1":
-            raise ValueError("Step5 LL token partition requires EP8 and Step5 activation")
-        from .step5_ll_tp_tokens import Step5LLTPTokenBuffer
-        proxy = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
-        if proxy is None:
-            proxy = Step5LLTPTokenBuffer(buffer, max_tokens_per_rank, 4096)
-            buffer._hcu_step5_tp_tokens_proxy = proxy
-        self.buffer = proxy
 
 
 def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None):
@@ -1197,9 +1305,14 @@ def ll_prepare_async(
             if block_k is None and quant_config.per_act_token_quant
             else module.DEEPEP_QUANT_BLOCK_SIZE
         )
-    if getattr(
-        self, "_vllm_hcu_clean_low_latency_buffer", False
-    ) and _claim_ll_buffer_cleanup(self.buffer):
+    step5_ll = getattr(self, "_hcu_step5_ll_transport", False)
+    clean_required = getattr(self, "_vllm_hcu_clean_low_latency_buffer", False) and (
+        not getattr(self.buffer, "_hcu_step5_ll_initialized", False)
+        if step5_ll else _claim_ll_buffer_cleanup(self.buffer)
+    )
+    if clean_required:
+        if step5_ll and module.torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Step5 LL initialization must finish before graph capture")
         cleanup = getattr(self.buffer, "clean_low_latency_buffer", None)
         if not callable(cleanup):
             raise RuntimeError(
@@ -1219,6 +1332,15 @@ def ll_prepare_async(
             quant_group_size,
             **cleanup_kwargs,
         )
+        if step5_ll:
+            import torch.distributed as dist
+            from vllm.distributed import get_ep_group
+
+            module.torch.cuda.synchronize()
+            dist.barrier(group=get_ep_group().cpu_group)
+            # Pure LL never hands this buffer to HT. Its kernels reset the
+            # next slot themselves; graph warmups must not repeat CPU barriers.
+            self.buffer._hcu_step5_ll_initialized = True
     try:
         if use_hcu_api:
             result = self.buffer.low_latency_dispatch(
