@@ -94,7 +94,7 @@ def draft_config(cfg):
 
         if not native_decode_dspark(cfg):
             raise ValueError(
-                'DSpark AG-RS Graph requires the native V41 DP8/EP8 target; '
+                'DSpark AG-RS Graph requires the native V41 TP1 DP/EP target; '
                 'unsupported Graph topology'
             )
         validate_graph_capacity(cfg)

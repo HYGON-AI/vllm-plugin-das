@@ -63,7 +63,7 @@ def _validate(config):
     from .dspark_graph import native_decode_dspark
     owned = is_owned_draft(config)
     if _owned_quant_kind(config) != "ct_w4a8" or not (owned or native_decode_dspark(config)):
-        raise ValueError("Draft final Post requires the native W4A8 TP1/DP8/EP8 target")
+        raise ValueError("Draft final Post requires the native W4A8 TP1 DP/EP target")
     if owned:
         draft_config(config)  # Recheck the graph loader's fixed-capacity lease.
     mc = config.model_config

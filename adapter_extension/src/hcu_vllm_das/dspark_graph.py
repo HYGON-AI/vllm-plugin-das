@@ -44,7 +44,11 @@ class TokenCapacity:
 
 
 def native_decode_dspark(config) -> bool:
-    """Return true only for the reviewed native DP8/EP8 V41 target shape."""
+    """Select TP1 V41 DSpark with matching DP/EP construction policy.
+
+    Buffer and collective sizes are derived from the actual group width.
+    The transport owner separately validates single-node legacy IPC support.
+    """
     spec = getattr(config, "speculative_config", None)
     parallel = getattr(spec, "target_parallel_config", None) if spec else None
     if parallel is None:
@@ -59,9 +63,11 @@ def native_decode_dspark(config) -> bool:
             getattr(parallel, "tensor_parallel_size", None),
             getattr(parallel, "prefill_context_parallel_size", None),
             getattr(parallel, "pipeline_parallel_size", None),
-            getattr(parallel, "data_parallel_size", None),
+            getattr(parallel, "decode_context_parallel_size", None),
         )
-        == (1, 1, 1, 8)
+        == (1, 1, 1, 1)
+        and type(getattr(parallel, "data_parallel_size", None)) is int
+        and parallel.data_parallel_size > 1
         and bool(getattr(parallel, "enable_expert_parallel", False))
         and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
     )
