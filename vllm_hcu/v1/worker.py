@@ -41,6 +41,19 @@ def _num_workspace_lanes(
     )
 
 
+def _gemma4_bw1000_enabled() -> bool:
+    """Gemma4 BW1000 optimization bundle, behind VLLM_HCU_GEMMA_BW1000.
+
+    Reads the environment and nothing else, so it stays callable from
+    ``load_model`` without reaching for state the parent worker owns. See
+    vllm_hcu.utils.gemma4_switches for why this is one switch and why it
+    stays opt-in.
+    """
+    from vllm_hcu.utils.gemma4_switches import gemma4_bw1000_enabled
+
+    return gemma4_bw1000_enabled()
+
+
 def _create_model_runner(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -71,6 +84,17 @@ def _create_model_runner(
     from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
 
     runner = HcuGPUModelRunnerV2(vllm_config, device)
+    # Checked here, not in load_model: this is the one place on the worker's
+    # path that is handed vllm_config as an argument, and init_device (its
+    # caller) runs before load_model, so refusing here still happens before
+    # any Gemma4 patch is installed.
+    from vllm_hcu.utils.gemma4_switches import check_retired_switches
+
+    check_retired_switches(vllm_config)
+    if _gemma4_bw1000_enabled():
+        from vllm_hcu.model_executor.layers.attention import gemma4_bw1000_tuning
+
+        gemma4_bw1000_tuning.install()
     runner_logger.info("HCU model runner constructed: %s", type(runner).__name__)
     return runner
 
@@ -126,6 +150,16 @@ class HcuGPUWorker(Worker):
         """Load the model, then require every enabled patch chain to be live."""
 
         super().load_model(load_dummy_weights=load_dummy_weights)
+        if _gemma4_bw1000_enabled():
+            from vllm_hcu.model_executor.layers import gemma4_lm_head
+
+            gemma4_lm_head.load_head_table()
+            # The softcap lookup wraps logits_processor.forward and the row
+            # bucket wraps logits_processor._get_logits, so they compose:
+            # forward applies the table to what _get_logits returns.
+            gemma4_lm_head.install_softcap_lut(self.model_runner)
+            gemma4_lm_head.install_head_bucket(self.model_runner)
+            gemma4_lm_head.install_dense_draft(self.model_runner)
         from vllm_hcu.patch.worker import validate_worker_patches
         model_runner = getattr(self, "model_runner", None)
         from vllm_hcu.model_executor.layers.kimi_k3_mixed_precision import record_kimi_kda_offload_ownership
