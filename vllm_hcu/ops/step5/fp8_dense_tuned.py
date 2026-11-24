@@ -2,7 +2,7 @@
 """Measured gfx938 Step5 Dense choices through AITER.
 
 Call from the existing opaque vllm::step5_fp8_gemm custom op. Other shapes
-return None, preserving the original LightOp path and its compilation fake.
+return None to let the caller use AITER's default hipBLASLt selection.
 """
 import hashlib
 from pathlib import Path
@@ -64,7 +64,7 @@ def _aiter_gemm(device):
 
 
 def tuned_fp8_gemm(x, xs, w, ws):
-    """Return tuned BF16 output or None for the unchanged LightOp fallback."""
+    """Return tuned BF16 output or None for default algorithm selection."""
     if not henvs.custom_ops_enabled():
         return None
     m, k = x.shape

@@ -35,8 +35,10 @@ original wheel.
 
 Run [`serve_ep8_wasp128_prefill.sh`](serve_ep8_wasp128_prefill.sh) on the
 eight-device host. Set the model, tokenizer, qualified hipBLASLt directory,
-dense tuning JSON, and static EP8 expert placement using the environment
-variables listed by `--help`. Put `STEP5_RUN_DIR` on local storage with
+and static EP8 expert placement using the environment variables listed by
+`--help`. The default AITER GEMM path uses hipBLASLt's algorithm selection.
+Set `STEP5_DENSE_TUNING` to reproduce the historical tuned runs. Put
+`STEP5_RUN_DIR` on local storage with
 room for compilation caches. The script writes the 16-SMS communication
 configuration, sets the DBO threshold to 4,096, and starts the service
 with `--max-num-batched-tokens 8192`. Use `--dry-run` to inspect the

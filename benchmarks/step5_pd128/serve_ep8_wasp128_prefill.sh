@@ -10,11 +10,11 @@ Required environment:
   STEP5_MODEL_DIR        Step5 Channel-FP8 model
   STEP5_TOKENIZER_DIR    ByteLevel tokenizer used by the benchmark
   STEP5_EXPERT_MAP       EP8 physical-to-logical expert placement
-  STEP5_DENSE_TUNING     gfx938 dense tuning JSON
   STEP5_HIPBLASLT_DIR    Qualified hipBLASLt and library_gfx938 directory
   STEP5_RUN_DIR          Output and compilation-cache directory on local disk
 
-Optional: STEP5_PYTHON (python3), STEP5_PORT (28302).
+Optional: STEP5_PYTHON (python3), STEP5_PORT (28302),
+  STEP5_DENSE_TUNING (gfx938 dense tuning JSON for historical reproduction).
 Use --dry-run to print the arguments without starting the server.
 EOF
         exit
@@ -26,8 +26,14 @@ esac
 model=$(realpath -e "${STEP5_MODEL_DIR:?Set STEP5_MODEL_DIR}")
 tokenizer=$(realpath -e "${STEP5_TOKENIZER_DIR:?Set STEP5_TOKENIZER_DIR}")
 VLLM_STEP5_EXPERT_PLACEMENT=$(realpath -e "${STEP5_EXPERT_MAP:?Set STEP5_EXPERT_MAP}")
-HCU_STEP5_TUNING_CONFIG=$(realpath -e "${STEP5_DENSE_TUNING:?Set STEP5_DENSE_TUNING}")
-export VLLM_STEP5_EXPERT_PLACEMENT HCU_STEP5_TUNING_CONFIG
+export VLLM_STEP5_EXPERT_PLACEMENT
+if [[ -n "${STEP5_DENSE_TUNING:-}" ]]; then
+    HCU_STEP5_TUNING_CONFIG=$(realpath -e "$STEP5_DENSE_TUNING")
+    export HCU_STEP5_TUNING_CONFIG HCU_STEP5_DENSE_TUNING=1
+else
+    unset HCU_STEP5_TUNING_CONFIG
+    export HCU_STEP5_DENSE_TUNING=0
+fi
 hipblaslt=$(realpath -e "${STEP5_HIPBLASLT_DIR:?Set STEP5_HIPBLASLT_DIR}")
 run_dir=$(realpath -m "${STEP5_RUN_DIR:?Set STEP5_RUN_DIR}")
 python="${STEP5_PYTHON:-python3}"
@@ -59,7 +65,7 @@ export VLLM_DEEPEP_BUFFER_SIZE_MB=1536 HCU_DBO_MIN_TOKENS=4096
 export HCU_STEP5_MEGAMOE_PREFILL=0 HCU_STEP5_DSA_TOPK_EXACT_EMIT=1
 export HCU_STEP5_DEEPEP_FUSED_SCATTER=1 HCU_STEP5_DEEPEP_COMPACT_ROWS=1
 export HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT=1 HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR=1
-export HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_EP8_SPARSE_GROUP_MAJOR=1
+export HCU_STEP5_EP8_SPARSE_GROUP_MAJOR=1
 export HCU_MTP_PREFILL_TAIL=1536 HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096
 export VLLM_STEP4_DSA_GRAPH_REGIONS=17408 HCU_STEP5_CONTEXT_GRAPH_REGIONS=0
 

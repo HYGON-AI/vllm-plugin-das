@@ -7,8 +7,8 @@ they are quantized to fp8 e4m3 with one scale per output channel (symmetric
 absmax, the scheme of the checkpoint's fp8 MoE experts) and the bf16 copy is
 freed. Activations are quantized per token in plain torch ops for large batches,
 which Inductor fuses into the producer. Small decode batches may use the exact
-Step5 token quantizer under the existing token-quant switch. The GEMM
-is LightOp's hipBLASLt channel-wise W8A8 kernel, the HCU scaled_mm backend.
+Step5 token quantizer under the existing token-quant switch. The GEMM uses
+AITER's channel-wise hipBLASLt entry point when HCU custom ops are enabled.
 
 On gfx938 it beats the bf16 hipBLASLt GEMM at every decode and prefill size of
 these shapes (M=64: o_proj 29.5 -> 16.2 us, MLP down 39.5 -> 18.0 us; M>=2k:
@@ -152,12 +152,23 @@ def _step5_fp8_gemm(
     N = wq.shape[0]
     if M == 0:
         return torch.empty(0, N, device=xq.device, dtype=torch.bfloat16)
-    if henvs.optional_custom_op_enabled(_TUNED_DENSE):
-        from .fp8_dense_tuned import tuned_fp8_gemm
+    if henvs.custom_ops_enabled():
+        if _TUNED_DENSE:
+            from .fp8_dense_tuned import tuned_fp8_gemm
 
-        out = tuned_fp8_gemm(xq, xs, wq, ws)
-        if out is not None:
-            return out
+            out = tuned_fp8_gemm(xq, xs, wq, ws)
+            if out is not None:
+                return out
+        from aiter import hipb_mm
+        from vllm_hcu.model_executor.layers.fused_moe.aiter_ops import (
+            _ensure_hipb_mm_extension_initialized,
+        )
+
+        _ensure_hipb_mm_extension_initialized()
+        return hipb_mm(
+            xq, wq.t(), solution_index=-1, out_dtype=torch.bfloat16,
+            scaleA=xs, scaleB=ws.t(), scaleType=1,
+        )
     from lightop.gemm_ops import hipblaslt_w8a8_channelwise_gemm
 
     status, out = hipblaslt_w8a8_channelwise_gemm(
