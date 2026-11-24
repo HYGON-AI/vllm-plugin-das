@@ -16,6 +16,23 @@ Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
 and the explicit INT8 ASM candidate below. Core retains CT scheme selection,
 weight loading, generic quantization and kernel construction.
 
+## Mooncake stage tracing
+
+Core's default-off `VLLM_MOONCAKE_TTFT_TRACE=1` emits DEBUG stage timestamps
+correlated by transfer ID. Set `VLLM_LOGGING_LEVEL=DEBUG` before startup.
+The independent `das_hcu_mooncake_trace` Adapter extension translates the
+legacy `VLLM_HCU_MOONCAKE_TTFT_TRACE=1` (or `true`) to that Core switch.
+An explicitly set Core switch takes precedence, including `0` to disable.
+This extension changes only startup environment configuration; Core owns the
+OutputProcessor and all Mooncake connector transitions.
+
+The legacy alias needs a Core build exposing the new switch and must activate
+before Core caches its environment. Require extension
+`das_hcu_mooncake_trace` through `HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS` when a missing
+alias bridge must fail startup. A failed optional extension is reported by
+Adapter; discovery or ACTIVE status alone does not qualify P/D execution.
+Changing either switch after activation requires a fresh process.
+
 It also provides an explicit HCU FlashAttention backend selected by
 `--attention-backend FLASH_ATTN`. The backend keeps vLLM's official metadata,
 scheduler and allocation. Its public `AttentionImpl` owns the HCU provider call
