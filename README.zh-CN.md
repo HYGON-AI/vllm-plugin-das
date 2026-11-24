@@ -9,6 +9,11 @@ vLLM HCU Plugin
 `vllm-plugin-das` 为 [vLLM](https://github.com/vllm-project/vllm) 提供 HCU 平台、
 模型和算子集成。请选择与所部署 HCU/OpenDAS vLLM 环境匹配的仓库分支。
 
+## Kubernetes PR CI
+
+`v0.28.1-dev` 的 ARC/Kubernetes PR CI、显式 legacy 回退方式和隔离例外，见
+[CI 迁移说明](docs/hcu-ci-k8s-v0281.md)。
+
 ## 版本兼容
 
 包版本及集成基线记录在 [vllm_hcu/version.py](vllm_hcu/version.py) 中，

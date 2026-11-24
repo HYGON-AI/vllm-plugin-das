@@ -257,6 +257,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_indexer_rope_return.py",
+    est_time=10,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_sparse_indexer_loading.py",
     est_time=60,
 )
@@ -629,4 +634,27 @@ register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/kernels/test_bf16_indexer_gather.py",
     est_time=30,
+)
+
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=45,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=45,
+)
+
+# INT8 fallback: multidimensional MTP projections and native graph replay.
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_int8_fallback_leading_dims.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_int8_fallback_leading_dims.py",
+    est_time=60,
 )

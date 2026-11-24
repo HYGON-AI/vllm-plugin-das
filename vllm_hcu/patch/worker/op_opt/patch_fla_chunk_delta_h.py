@@ -149,8 +149,8 @@ def apply_to_module(module: ModuleType) -> bool:
             chunk_indices=chunk_indices,
             use_exp2=use_exp2,
             transpose_state_layout=True,
-            # vLLM reserves block/state index 0 as NULL_BLOCK_ID.
-            null_state_index=0,
+            # No cache-pool indices are passed here; dense state row 0 is valid.
+            null_state_index=-1,
             kernel_cfg=None,
         )
 

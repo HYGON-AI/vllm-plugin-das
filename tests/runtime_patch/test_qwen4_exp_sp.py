@@ -226,3 +226,98 @@ def test_sp_refuses_foreign_decoder_forward_wrapper():
     sp._require_unwrapped(original, "target")
     with pytest.raises(sp.PatchCompatibilityError):
         sp._require_unwrapped(foreign, "target")
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize(("compile_forward", "raise_in_layer"), [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("initial_padding", [False, True])
+@pytest.mark.parametrize("preexisting_domain", [False, True])
+def test_hc_sp_forward_restores_bitmap_domain_for_repeated_calls(
+    monkeypatch, mtp, compile_forward, raise_in_layer, initial_padding, preexisting_domain,
+):
+    """Real target/MTP forwards must not leak their local bitmap to the next call."""
+    from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_sp_mtp as drafter
+
+    context = SimpleNamespace(
+        is_padding=torch.tensor([False, False]) if initial_padding else None,
+        additional_kwargs={"unrelated": object()},
+    )
+    if preexisting_domain:
+        context.additional_kwargs["hcu_moe_padding_is_local"] = False
+    original = context.is_padding
+    kwargs = context.additional_kwargs
+    before = dict(kwargs)
+    monkeypatch.setattr(sp, "envs", SimpleNamespace(VLLM_MOE_SKIP_PADDING=True))
+    monkeypatch.setattr(sp, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(sp, "get_forward_context", lambda: context)
+    monkeypatch.setattr(sp, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(sp, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(sp, "sp_all_gather", lambda x: torch.cat([x, x]))
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    target = SimpleNamespace(get_pp_group=lambda: pp_group)
+    monkeypatch.setattr(sp, "_target", target)
+    monkeypatch.setattr(drafter, "_target", target)
+    seen = []
+
+    def layer(**kwargs):
+        # In the pre-fix source this producer had no marker. This assertion
+        # verifies the real production forward, not a hand-set test flag.
+        assert context.additional_kwargs["hcu_moe_padding_is_local"] is True
+        if not compile_forward:
+            assert context.is_padding.tolist() == [False]
+        seen.append(context.is_padding)
+        if raise_in_layer:
+            raise RuntimeError("layer failure")
+        return kwargs["hidden_states"] * (~context.is_padding)[:, None], None, None
+
+    identity = lambda x: x
+    model = SimpleNamespace(
+        config=SimpleNamespace(hc_count=1), layers=[layer], start_layer=0, end_layer=1,
+        _mtp_hidden_buffer=None,
+        hyper_connection_mixer=SimpleNamespace(combine_and_mix=lambda h, b, i: (h, h, None)),
+        hc_count=1, hidden_size=2, num_mtp_layers=1,
+        pre_fc_norm_embedding=identity, fc_embedding=identity,
+        pre_fc_norm_hidden=identity, fc_hidden=identity,
+    )
+    setattr(model, sp.HC_SP_ATTR, True)
+    positions = torch.arange(2)
+    def invoke():
+        if mtp:
+            return drafter.forward(model, None, positions,
+                hidden_states=torch.ones(2, 2), inputs_embeds=torch.zeros(2, 2))
+        return sp.model_forward(model, None, positions, inputs_embeds=torch.ones(2, 2))
+
+    if compile_forward:
+        # A CPU Dynamo/AOT contract, not a native HCU graph replay test.
+        torch._dynamo.reset()
+        invoke = torch.compile(invoke, backend="aot_eager", fullgraph=True)
+    for _ in range(2):
+        from contextlib import nullcontext
+        error = pytest.raises(RuntimeError, match="layer failure") if raise_in_layer else nullcontext()
+        with error:
+            result = invoke()
+            for tensor in result if mtp else (result,):
+                torch.testing.assert_close(tensor, torch.ones(2, 2))
+        assert context.is_padding is original
+        assert context.additional_kwargs is kwargs
+        assert kwargs == before
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("skip_padding", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_hc_sp_padding_scope_restores_existing_local_domain(monkeypatch, skip_padding, enabled):
+    context = SimpleNamespace(
+        is_padding=torch.tensor([False]),
+        additional_kwargs={"hcu_moe_padding_is_local": True},
+    )
+    original = context.is_padding
+    monkeypatch.setattr(sp, "envs", SimpleNamespace(VLLM_MOE_SKIP_PADDING=skip_padding))
+    monkeypatch.setattr(sp, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(sp, "get_forward_context", lambda: context)
+    with sp.hc_sp_padding_context(enabled):
+        if enabled and skip_padding:
+            context.is_padding = torch.tensor([True])
+            context.additional_kwargs["hcu_moe_padding_is_local"] = False
+    assert context.is_padding is original
+    assert context.additional_kwargs == {"hcu_moe_padding_is_local": True}

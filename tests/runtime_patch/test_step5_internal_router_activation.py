@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
 """The internal router must pass its explicit activation to the shared MLP."""
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -117,8 +120,16 @@ def test_internal_router_handoff_consumes_fresh_activation_only(
     runner._shared_experts = wrapper
     runner._fse_fuse_gate = False
     runner._ep_fused_combine = False
-    runner.moe_config = SimpleNamespace(pcp_size=1)
-    quant_method = SimpleNamespace(is_monolithic=False, topk_indices_dtype=torch.int32)
+    # Exercise the real no-collective dispatch path. The routing-input context
+    # reads these parallel settings even when this test runs on one CPU rank.
+    runner.moe_config = SimpleNamespace(
+        dp_size=1, pcp_size=1, is_sequence_parallel=False,
+    )
+    quant_method = SimpleNamespace(
+        is_monolithic=False,
+        supports_internal_mk=False,
+        topk_indices_dtype=torch.int32,
+    )
     runner.routed_experts = SimpleNamespace(
         _ensure_moe_quant_config_init=lambda: None,
         quant_method=quant_method,
@@ -129,8 +140,6 @@ def test_internal_router_handoff_consumes_fresh_activation_only(
         torch.zeros((kwargs['hidden_states'].shape[0], 1), dtype=torch.int32),
     ))
     runner._sequence_parallel_context = lambda: nullcontext()
-    runner._maybe_dispatch = lambda x, logits: (x, logits)
-    runner._pcp_routing_inputs = lambda *args: nullcontext(None)
     runner._maybe_combine = lambda shared_output, routed_output: shared_output + routed_output
 
     for value in [1., 2.]:
