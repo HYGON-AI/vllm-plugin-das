@@ -82,10 +82,18 @@ def test_real_hy4_config_delegates_without_claiming_other_models(monkeypatch):
     platform._is_hcu = lambda: True
     health = ModuleType('hcu_vllm_das.hy4_quant_activation')
     health.check_health = lambda: calls.append('health')
+    # Keep optional dense/provider imports isolated from the fake Core config.
+    dense = ModuleType('hcu_vllm_das.hy4_dense_fusion')
+    dense.enabled = lambda cfg: False
+    linear = ModuleType('hcu_vllm_das.quantization.dsv41_int8_linear')
+    linear.HcuDSV41Int8LinearMethod = type('UnusedDenseMethod', (), {})
     for name, value in {'vllm.config': fake_config,
         fake_base.__name__: fake_base, platform.__name__: platform,
-        health.__name__: health}.items():
+        health.__name__: health, dense.__name__: dense,
+        linear.__name__: linear}.items():
         monkeypatch.setitem(sys.modules, name, value)
+    monkeypatch.setattr(importlib.import_module('hcu_vllm_das'),
+                        'hy4_dense_fusion', dense, raising=False)
     name = 'hcu_vllm_das.quantization.hy4_ct_w4a8'
     monkeypatch.delitem(sys.modules, name, raising=False)
     module = importlib.import_module(name)
