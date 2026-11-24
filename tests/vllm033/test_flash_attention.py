@@ -230,6 +230,174 @@ def test_forward_profiles_without_provider_and_leaves_empty_batch_untouched(
     assert torch.all(output == 3)
 
 
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("prefill_gather", (False, True))
+@pytest.mark.parametrize("sliding_window,softcap", (
+    (None, 0.5), (1, 0.0), (1, 0.5), (3, 0.0), (3, 0.5),
+))
+def test_softcap_forward_uses_core_attention_and_preserves_output(
+    monkeypatch, layout, prefill_gather, sliding_window, softcap
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    impl = make_impl(flash, logits_soft_cap=softcap, sliding_window=sliding_window)
+    impl._prefill_gather_enabled = prefill_gather
+    query = torch.randn(5, 4, 64)
+    output = torch.full_like(query, -99.0)
+    cache = torch.empty_strided(
+        (2, 4, 64, 128),
+        (32768, 8192, 128, 1) if layout == "LBHNC" else (32768, 128, 512, 1),
+    )
+
+    def core(**arguments):
+        assert arguments["softcap"] == softcap
+        assert arguments["window_size"] == (
+            (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        )
+        assert arguments["layout"] == ("bhsd" if layout == "LBHNC" else "bshd")
+        arguments["out"].fill_(7)
+        return arguments["out"]
+
+    monkeypatch.setattr(flash, "_triton_softcap_attention", core)
+    monkeypatch.setattr(
+        flash, "_vendor_varlen_func", lambda: pytest.fail("softcap reached vendor")
+    )
+    result = impl.forward(None, query, query, query, cache, metadata(), output)
+    assert result is output
+    assert torch.all(output[:2] == 7)
+    assert torch.all(output[2:] == -99)
+
+
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("kv_dtype", ("fp8_e4m3", "fp8_e5m2"))
+def test_softcap_nonuniform_descales_retain_batch_and_head_semantics(
+    monkeypatch, layout, kv_dtype,
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    impl = make_impl(flash, kv_cache_dtype=kv_dtype, logits_soft_cap=0.5)
+    query = torch.randn(3, 4, 64, dtype=torch.bfloat16)
+    cache_shape = (2, 4, 64, 64) if layout == "LBHNC" else (2, 64, 4, 64)
+    key = torch.empty(cache_shape, dtype=torch.uint8)
+    output = torch.empty_like(query)
+    kscale = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+    vscale = kscale.flip(1).contiguous()
+    calls = []
+
+    def apply_descales(core, arguments):
+        calls.append("nonuniform")
+        assert core is flash._triton_softcap_attention
+        assert arguments["k_descale"] is kscale
+        assert arguments["v_descale"] is vscale
+        assert arguments["q"] is query
+        assert arguments["k"].dtype == (
+            torch.float8_e4m3fn if kv_dtype == "fp8_e4m3" else torch.float8_e5m2
+        )
+        output.fill_(7)
+        return output
+
+    scales = ModuleType("hcu_vllm_das.attention.e5m2_scales")
+    scales.run_e5m2_attention = apply_descales
+    monkeypatch.setitem(sys.modules, scales.__name__, scales)
+    monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: pytest.fail("reached vendor"))
+    result = impl._run_flash_attention(
+        q=query, k=key, v=key.clone(), out=output,
+        cu_seqlens_q=torch.tensor([0, 1, 3], dtype=torch.int32),
+        k_descale=kscale, v_descale=vscale, q_descale=None,
+        softcap=0.5, window_size=(-1, -1),
+    )
+    assert result is output and torch.all(output == 7)
+    assert calls == ["nonuniform"]
+
+
+@pytest.mark.parametrize("window", (0, -1, True, 1.5))
+def test_rejects_invalid_sliding_window(monkeypatch, window):
+    flash = load_flash_attention(monkeypatch)
+    with pytest.raises(ValueError, match="positive integer sliding window"):
+        make_impl(flash, sliding_window=window)
+
+
+@pytest.mark.parametrize("option", ("return_softmax_lse", "return_attn_probs"))
+def test_core_softcap_path_refuses_unavailable_statistics(monkeypatch, option):
+    flash = load_flash_attention(monkeypatch)
+    with pytest.raises(NotImplementedError, match="attention statistics"):
+        flash._triton_softcap_attention(**{option: True})
+
+
+@pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
+@pytest.mark.parametrize("kv_dtype,storage_dtype", (
+    ("fp8_e5m2", torch.float8_e5m2),
+    ("fp8_e4m3", torch.float8_e4m3fn),
+))
+@pytest.mark.parametrize("prefill_gather", (False, True))
+@pytest.mark.parametrize("sliding_window,softcap", ((None, 0.5), (3, 0.0), (3, 0.5)))
+def test_fp8_softcap_forward_preserves_format_and_layer_descales(
+    monkeypatch, layout, kv_dtype, storage_dtype, prefill_gather, sliding_window, softcap,
+):
+    flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
+    impl = make_impl(flash, kv_cache_dtype=kv_dtype, logits_soft_cap=softcap,
+                     sliding_window=sliding_window)
+    impl._prefill_gather_enabled = prefill_gather
+    query = torch.randn(5, 4, 64, dtype=torch.bfloat16)
+    output = torch.full_like(query, -99)
+    layer = SimpleNamespace(_k_scale=torch.tensor(0.5), _v_scale=torch.tensor(0.25))
+    cache = torch.empty_strided(
+        (2, 4, 64, 128),
+        (32768, 8192, 128, 1) if layout == "LBHNC" else (32768, 128, 512, 1),
+        dtype=torch.uint8,
+    )
+    views = impl._get_kv_cache_views(cache)
+    calls = []
+
+    def apply_descales(core, arguments):
+        pytest.fail("scalar layer scales reached the vendor Q/output workaround")
+
+    token_head_mode = object()
+
+    def unified_attention(**arguments):
+        calls.append("core")
+        for name, view in zip(("k", "v"), views):
+            assert arguments[name].dtype == storage_dtype
+            assert arguments[name].data_ptr() == view.data_ptr()
+        assert arguments["q"].data_ptr() == query.data_ptr()
+        assert arguments["kv_quant_mode"] is token_head_mode
+        assert arguments["q_descale"] is None
+        assert arguments["k_descale"] is arguments["v_descale"] is None
+        for name, value in (("k", 0.5), ("v", 0.25)):
+            scales = arguments[name + "_scale_cache"]
+            assert scales.shape == arguments[name].shape[:3]
+            assert scales.stride() == (0, 0, 0)
+            assert scales.data_ptr() == getattr(layer, "_" + name + "_scale").data_ptr()
+            torch.testing.assert_close(scales, torch.full(scales.shape, value))
+            # The official call observes the original device scalar storage,
+            # including later in-place updates, rather than a copied snapshot.
+            scalar = getattr(layer, "_" + name + "_scale")
+            scalar.fill_(value * 1.5)
+            torch.testing.assert_close(scales, torch.full(scales.shape, value * 1.5))
+            scalar.fill_(value)
+        assert arguments["softcap"] == softcap
+        assert arguments["window_size"] == (
+            (-1, -1) if sliding_window is None else (sliding_window - 1, 0)
+        )
+        arguments["out"].fill_(7)
+
+    scales = ModuleType("hcu_vllm_das.attention.e5m2_scales")
+    scales.run_e5m2_attention = apply_descales
+    core = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
+    core.unified_attention = unified_attention
+    kv_interface = ModuleType("vllm.v1.kv_cache_interface")
+    kv_interface.KVQuantMode = SimpleNamespace(
+        FP8_PER_TOKEN_HEAD=token_head_mode, FP8_PER_TENSOR=object(),
+    )
+    monkeypatch.setitem(sys.modules, scales.__name__, scales)
+    monkeypatch.setitem(sys.modules, core.__name__, core)
+    monkeypatch.setitem(sys.modules, kv_interface.__name__, kv_interface)
+    monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: pytest.fail("softcap reached vendor"))
+    result = impl.forward(layer, query, query, query, cache, metadata(), output)
+    assert result is output
+    assert calls == ["core"]
+    assert torch.all(output[:2] == 7)
+    assert torch.all(output[2:] == -99)
+
+
 @pytest.mark.parametrize(
     "field,value",
     (
@@ -264,7 +432,6 @@ def test_forward_rejects_fused_output_quantization(monkeypatch, argument):
     "kwargs",
     (
         {"attn_type": "encoder"},
-        {"sliding_window": 128},
         {"sinks": torch.empty(4)},
         {"kv_cache_dtype": "fp8_e4m3fnuz"},
         {"head_size": 96},
@@ -482,7 +649,7 @@ def test_backend_selects_fa2_dual_layout_and_64_token_pages(monkeypatch):
     assert flash.HcuFlashAttentionBackend.supports_rswa() is False
     assert flash.HcuFlashAttentionBackend.supports_attn_type("decoder") is True
     assert flash.HcuFlashAttentionBackend.supports_attn_type("encoder") is False
-    assert flash.HcuFlashAttentionBackend.supports_sliding_window() is False
+    assert flash.HcuFlashAttentionBackend.supports_sliding_window() is True
     assert flash.HcuFlashAttentionBackend.supports_non_causal() is False
     assert flash.HcuFlashAttentionBackend.supports_batch_invariance() is False
 
@@ -596,8 +763,9 @@ def test_e5m2_cache_update_uses_plugin_writer_and_resolved_write_views(
 
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 @pytest.mark.parametrize("kv_cache_dtype", ("auto", "bfloat16", "float16", "fp8_e4m3"))
+@pytest.mark.parametrize("input_dtype", (torch.float32, torch.bfloat16, torch.float16))
 def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
-    monkeypatch, layout, kv_cache_dtype
+    monkeypatch, layout, kv_cache_dtype, input_dtype
 ):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)
     calls = []
@@ -608,7 +776,7 @@ def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
     impl.head_size = 4
     strides = (120, 40, 8, 1) if layout == "LBHNC" else (120, 8, 24, 1)
     packed = torch.empty_strided((1, 3, 5, 8), strides)
-    key = torch.randn(2, 3, 4)
+    key = torch.randn(2, 3, 4, dtype=input_dtype)
     value = torch.randn_like(key)
     slots = torch.tensor([0, 1], dtype=torch.long)
     layer = SimpleNamespace(_k_scale=torch.tensor(1.0), _v_scale=torch.tensor(1.0))
@@ -617,7 +785,12 @@ def test_non_e5m2_cache_update_uses_native_writer_with_dense_views(
 
     assert len(calls) == 1
     k, v = impl._get_kv_cache_write_views(packed)
-    assert calls[0][:2] == (key, value)
+    if kv_cache_dtype == "fp8_e4m3" and input_dtype == torch.float16:
+        for actual, original in zip(calls[0][:2], (key, value)):
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, original.float(), atol=0, rtol=0)
+    else:
+        assert calls[0][0] is key and calls[0][1] is value
     assert calls[0][2].data_ptr() == k.data_ptr()
     assert calls[0][3].data_ptr() == v.data_ptr()
     assert calls[0][2].stride() == k.stride()

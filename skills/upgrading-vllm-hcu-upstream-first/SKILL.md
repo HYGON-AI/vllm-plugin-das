@@ -32,6 +32,21 @@ rewriting or retiring each patch. Keep a migration row with its owner, reason,
 affected call sites and tests. An identical file or matching parameter names
 does not establish equivalent behavior or performance.
 
+When Adapter directories move, verify published cross-repository contracts too.
+An entry-point group is a distribution metadata protocol name, independent of
+its implementation module's location. Check the current Plugin's real installed
+metadata with Adapter discovery and load the applicable actual entry points;
+Adapter-only fixtures can migrate together and miss a broken consumer. Retain
+public API imports and shared type identity for a compatible API revision, or
+coordinate an explicit breaking migration and paired release. Version acceptance
+alone cannot qualify that pair.
+
+Include dynamically constructed module paths and public package attributes in
+that audit. Restoring the discovery group and two factories can leave other
+installed factories broken after a directory move. Record each factory's load
+result against current consumer bytes; loading is separate from activation,
+native execution and checkpoint qualification.
+
 Inspect the old callback's body before calling it an optimization: a
 nonmutating audit callback need not become a replacement for an official
 verifier. Verify the registered target implementation and its observable
@@ -445,6 +460,13 @@ An unchanged serial request has different scheduling and cache history from
 the original cohort. Retain both full-cohort and serial results, including
 baseline failures. Reproduction on the baseline does not establish numerical
 equivalence or erase an earlier candidate failure.
+
+When an unmerged change differs from the no-Plugin control, also compare the
+current merged Plugin with the candidate on matched dependencies and requests.
+Inspect the production diff and actual executed branch before assigning the
+loss to the new change. An unchanged branch is a reason to run that control,
+not evidence of parity. Record live autotune choices when comparing compiled
+paths; seeded choices are a diagnostic and do not qualify default tuning.
 
 ## Prepare a reviewable change
 
