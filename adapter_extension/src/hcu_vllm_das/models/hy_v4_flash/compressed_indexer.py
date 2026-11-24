@@ -55,6 +55,7 @@ class FlashCompressedIndexer(nn.Module):
         self.eps = config.rms_norm_eps
         self.topk_indices_buffer = topk_indices_buffer
         self.max_model_len = vllm_config.model_config.max_model_len
+        self._hcu_fullgraph_capture_bound = None
         self.logits_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
         for name, input_size, output_size in (
             ("query_projection", config.q_lora_rank, self.num_heads * 128),
@@ -157,9 +158,13 @@ class FlashCompressedIndexer(nn.Module):
         # FULL graph replay must use the static capture bound, not the first
         # replay's sequence length. No GPU lengths are copied to the host.
         max_seq_len = (
-            self.max_model_len
-            if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
-            else km.max_seq_len
+            self._hcu_fullgraph_capture_bound
+            if self._hcu_fullgraph_capture_bound is not None
+            else (
+                self.max_model_len
+                if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+                else km.max_seq_len
+            )
         )
         if max_seq_len <= (self.group_budget + 1) * self.ratio:
             output[:tokens].copy_(

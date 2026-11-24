@@ -33,6 +33,7 @@ _VL_MODULE = "hcu_vllm_das.models.hy_v4_flash.vl_model"
 _VL_CLASS = _VL_ARCH
 _CONFIG_MODULE = "hcu_vllm_das.hyv4_flash_config_activation"
 _COMPAT_MODULE = "hcu_vllm_das.models.hy_v4_flash.dfly_compat"
+_RUNNER_MODULE = "hcu_vllm_das.models.hy_v4_flash.fullgraph_runner"
 _lock = RLock()
 _publication = None
 _publishing = False
@@ -57,6 +58,10 @@ class _Publication:
     compat_health: object
     vl_entry: object
     vl_model_cls: type
+    runner: object
+    runner_install: object
+    runner_health: object
+    runner_public_health: object
 
 
 def _fatal(message):
@@ -147,6 +152,7 @@ def _owned(publication):
     registry = import_module("vllm.model_executor.models").ModelRegistry
     config = import_module(_CONFIG_MODULE)
     compat = import_module(_COMPAT_MODULE)
+    runner = import_module(_RUNNER_MODULE)
     return (
         publication.pid == os.getpid()
         and registry is publication.registry
@@ -165,6 +171,10 @@ def _owned(publication):
         and compat is publication.compat
         and compat.install_compat is publication.compat_install
         and compat.check_health is publication.compat_health
+        and runner is publication.runner
+        and runner.install is publication.runner_install
+        and runner._check_registration is publication.runner_health
+        and runner.check_health is publication.runner_public_health
     )
 
 
@@ -189,6 +199,8 @@ def check_health():
             _invoke_sync(_publication.config_health)
             _raise_if_failed()
             _invoke_sync(_publication.compat_health)
+            _raise_if_failed()
+            _invoke_sync(_publication.runner_health)
             _raise_if_failed()
             # Providers may run callbacks: verify again and notice swallowed
             # recursive failures instead of reporting a healthy publication.
@@ -266,6 +278,13 @@ def _activate(context, expected_selection=None):
             install, health = compat.install_compat, compat.check_health
             _require_sync(install)
             _require_sync(health)
+            runner = import_module(_RUNNER_MODULE)
+            runner_install = runner.install
+            runner_health = runner._check_registration
+            runner_public_health = runner.check_health
+            _require_sync(runner_install)
+            _require_sync(runner_health)
+            _require_sync(runner_public_health)
             _invoke_sync(config_health)
             _raise_if_failed()
             if any(arch in registry.models for arch in (_ARCH, _VL_ARCH)):
@@ -275,6 +294,8 @@ def _activate(context, expected_selection=None):
                 # Calling install crosses a potentially irreversible boundary.
                 # The DFly owner supplies the real missing Core033 startup seams.
                 _invoke_sync(install)
+                _raise_if_failed()
+                _invoke_sync(runner_install)
                 _raise_if_failed()
                 current_registry = import_module(
                     "vllm.model_executor.models"
@@ -289,6 +310,8 @@ def _activate(context, expected_selection=None):
                     os.getpid(), selection, registry, registry.models[_ARCH], model_cls,
                     register, config, config_activate, config_health,
                     compat, install, health, registry.models[_VL_ARCH], vl_model_cls,
+                    runner, runner_install, runner_health,
+                    runner_public_health,
                 )
                 check_health()
             except BaseException:
