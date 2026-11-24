@@ -16,12 +16,14 @@ import weakref
 _MODEL_ENTRY_OWNERS = weakref.WeakKeyDictionary()
 
 
-def validate_legacy_ipc(buffer_cls):
+def validate_legacy_ipc(buffer_cls, world_size):
+    if type(world_size) is not int or world_size <= 1:
+        raise ValueError('W4A8 shared LL requires actual DP/EP membership')
     if os.environ.get('ROCSHMEM_BACKEND', 'ipc') != 'ipc':
         raise ValueError('W4A8 shared LL requires ROCSHMEM IPC')
     for name in ('is_ll_layered_opt_enabled', 'is_ll_layered_develop_enabled'):
         select = getattr(buffer_cls, name, None)
-        if not callable(select) or select(8):
+        if not callable(select) or select(world_size):
             raise ValueError('W4A8 shared LL requires native legacy IPC selection')
     for name in ('ROCSHMEM_IPC_MNVL', 'DEEP_EP_NORMAL_MNVL'):
         if os.environ.get(name, '0').strip().lower() not in ('0', 'false', 'off', ''):
@@ -63,8 +65,8 @@ def install_model_entry_reset(model, config, num_experts):
         raise ValueError("Duplicate live model entry IPC reset owner")
     buffer = None
     kwargs = dict(max_num_tokens_per_dp_rank=capacity, token_hidden_size=5120,
-                  num_ep_ranks=8, num_global_experts=num_experts,
-                  num_local_experts=num_experts // 8)
+                  num_ep_ranks=policy.world_size, num_global_experts=num_experts,
+                  num_local_experts=num_experts // policy.world_size)
 
     def clean_at_entry(_module, _args):
         nonlocal buffer
@@ -99,10 +101,14 @@ class SharedIPCManager:
         from vllm.distributed.device_communicators.all2all import DeepEPLLAll2AllManager
 
         if (not isinstance(manager, DeepEPLLAll2AllManager)
-                or manager.internode or manager.world_size != 8
-                or manager.dp_world_size != 8 or manager.support_fault_tolerance):
-            raise ValueError("W4A8 shared LL requires single-node native DP8/EP8")
-        validate_legacy_ipc(deep_ep.Buffer)
+                or manager.internode or type(manager.world_size) is not int
+                or manager.world_size <= 1
+                or manager.dp_world_size != manager.world_size
+                or manager.support_fault_tolerance):
+            raise ValueError("W4A8 shared LL requires matching single-node DP/EP groups")
+        if any(experts % manager.world_size for experts in (128, 384)):
+            raise ValueError("W4A8 shared LL requires evenly sharded target and draft experts")
+        validate_legacy_ipc(deep_ep.Buffer, manager.world_size)
         if type(capacity) is not int or capacity <= 0:
             raise ValueError('W4A8 shared LL capacity must be a positive integer')
         self.capacity = capacity
@@ -116,10 +122,11 @@ class SharedIPCManager:
 
     def get_handle(self, kwargs):
         expected = dict(max_num_tokens_per_dp_rank=self.capacity, token_hidden_size=5120,
-                        num_ep_ranks=8, num_global_experts=384, num_local_experts=48)
+                        num_ep_ranks=self.world_size, num_global_experts=384,
+                        num_local_experts=384 // self.world_size)
         experts = kwargs.get("num_global_experts")
         actual = dict(expected, num_global_experts=experts,
-                      num_local_experts=experts // 8 if type(experts) is int else None)
+                      num_local_experts=experts // self.world_size if type(experts) is int else None)
         if experts not in (128, 384) or kwargs != actual:
             raise ValueError("W4A8 shared LL geometry disagrees with configured capacity")
         # Request the same native cache key for both layouts. Adding a second

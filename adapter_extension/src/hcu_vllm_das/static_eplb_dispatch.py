@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Rank-local replica ordering for static EPLB routing maps.
 
-Static EPLB routes every token to one fixed replica per logical expert: the
-primary, which these builders place in column 0. ``nearest`` always prefers a
-same-GPU replica; ``locality_fair`` spreads source ranks evenly over the
-replicas of a logical expert while still preferring local ones, so a hot expert
-replicated twice does not send every rank to the same copy.
+These builders order all loaded replicas. HY4 lets Core hash token positions
+across every column; V41 routes to the primary in column 0. ``nearest`` puts
+same-GPU replicas first; ``locality_fair`` balances each source rank's first
+choice while retaining the same replica set.
 """
 from __future__ import annotations
 

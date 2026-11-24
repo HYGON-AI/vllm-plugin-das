@@ -77,6 +77,8 @@ class HcuCTW4A8MoEMethod(FusedMoEMethodBase):
             self._packed.pack(self._ops.pack,self._ops.view_n32 if self._backend=='deepep_low_latency' else None)
             self.moe_quant_config=self.get_fused_moe_quant_config(layer)
             experts=make_experts(self.moe,self.moe_quant_config,self._packed.weights,self._ops,prepare)
+            from hcu_vllm_das.hy4_expert_gather import configure
+            configure(experts, self._config, self.moe, prepare)
             self.moe_kernel=mk.FusedMoEKernel(prepare,experts)
         except BaseException:
             self._failed=True

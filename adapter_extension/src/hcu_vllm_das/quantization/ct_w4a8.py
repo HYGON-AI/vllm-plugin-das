@@ -10,21 +10,9 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig, CompressedTensorsLinearMethod
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import CompressedTensorsW8A8Fp8
 from .dsv41_channel_fp8 import _is_hcu, _is_v41
+from .ct_w4a8_schema import schema_matches as _schema
 
 NAME = 'hcu_dsv41_ct_w4a8'
-
-
-def _schema(weight, activation):
-    def value(obj, name, default=None):
-        return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
-    return (weight is not None and activation is not None
-        and value(weight,'num_bits') == 4 and value(weight,'type') == 'int'
-        and value(weight,'strategy') == 'channel' and value(weight,'symmetric',True) is True
-        and value(weight,'dynamic',False) is False and value(weight,'group_size') in (None,-1)
-        and value(weight,'block_structure') is None and value(activation,'block_structure') is None
-        and value(activation,'num_bits') == 8 and value(activation,'type') == 'int'
-        and value(activation,'strategy') == 'token' and value(activation,'symmetric',True) is True
-        and value(activation,'dynamic') is True)
 
 
 def validate_topology(config, moe):
@@ -48,7 +36,7 @@ def validate_topology(config, moe):
             from hcu_vllm_das.dspark_graph import native_decode_dspark, validate_graph_capacity
 
             if not native_decode_dspark(config):
-                errors.append('DSpark AG-RS Graph requires native V41 DP8/EP8')
+                errors.append('DSpark AG-RS Graph requires native V41 TP1 DP/EP')
             else:
                 validate_graph_capacity(config, moe)
     elif actual.all2all_backend not in ('deepep_high_throughput','deepep_low_latency'):
