@@ -84,7 +84,7 @@ def test_hyv4_forward_routes_only_eligible_calls(monkeypatch, enabled, eligible,
 
 @pytest.mark.parametrize(
     ("eager", "dcp", "enabled", "expected"),
-    [(True, 1, True, True), (False, 1, True, False),
+    [(True, 1, None, True), (True, 1, True, True), (False, 1, True, False),
      (True, 2, True, False), (True, 1, False, False)],
 )
 def test_builder_propagates_d576_decision(monkeypatch, eager, dcp, enabled, expected):
@@ -102,7 +102,10 @@ def test_builder_propagates_d576_decision(monkeypatch, eager, dcp, enabled, expe
         _num_computed_tokens_cpu=torch.tensor([79050]),
         is_prefilling=torch.tensor([True]),
     )
-    monkeypatch.setenv("VLLM_HCU_HYV4_D576_MLS", str(int(enabled)))
+    if enabled is None:
+        monkeypatch.delenv("VLLM_HCU_HYV4_D576_MLS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_HYV4_D576_MLS", str(int(enabled)))
     monkeypatch.setattr(hcu_sparse.HcuFlashMLASparseMetadataBuilder, "build",
                         lambda *args, **kwargs: metadata)
     built = builder.build(0, common)

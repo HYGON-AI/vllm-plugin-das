@@ -153,7 +153,7 @@ class HYV4FlashMLASparseMetadataBuilder(HcuFlashMLASparseMetadataBuilder):
             common_attn_metadata,
             fast_build,
         )
-        if os.getenv("VLLM_HCU_HYV4_D576_MLS", "0") == "1":
+        if os.getenv("VLLM_HCU_HYV4_D576_MLS", "1") == "1":
             metadata.hyv4_long_d576_prefill = (
                 self.vllm_config.model_config.enforce_eager
                 and self.vllm_config.parallel_config.decode_context_parallel_size == 1
@@ -219,7 +219,7 @@ class HYV4FlashMLASparseImpl(HcuFlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
-        self._resident_d576 = os.getenv("VLLM_HCU_HYV4_D576_MLS", "0") == "1"
+        self._resident_d576 = os.getenv("VLLM_HCU_HYV4_D576_MLS", "1") == "1"
         if self._resident_d576:
             from vllm_hcu.platforms.hcu import on_gfx938
 
