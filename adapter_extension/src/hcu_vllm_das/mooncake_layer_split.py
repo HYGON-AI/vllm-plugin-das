@@ -18,6 +18,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
+import torch
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -32,7 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.network_utils import make_zmq_path
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec
 
 from .layer_split_config import layer_split_enabled
 from .dsa_cache_layout import _owner, _specs
@@ -41,6 +42,18 @@ PROTOCOL = 'hcu-v41-pcp-owners-v3'
 CONNECTOR = 'HcuLayerSplitMooncakeConnector'
 MODULE = 'hcu_vllm_das.mooncake_layer_split'
 OWNER_QUERY_PATH = '/hcu/pcp-owners/v3/query'
+DRAFT_CONTEXT_KEY = 'hcu_dspark_context'
+
+
+def draft_context_enabled(config):
+    transfer = config.kv_transfer_config
+    if (transfer is None or transfer.kv_connector != CONNECTOR
+            or transfer.kv_connector_module_path != MODULE):
+        return False
+    enabled = transfer.get_from_extra_config(DRAFT_CONTEXT_KEY, False)
+    if type(enabled) is not bool:
+        raise ValueError(f'{DRAFT_CONTEXT_KEY} must be a boolean')
+    return enabled
 
 
 def validate_config(config):
@@ -55,20 +68,37 @@ def validate_config(config):
     ids = tuple(getattr(config.model_config.hf_config, 'kv_source_layer_ids', ()) or ())
     if not ids or ids != tuple(sorted(set(ids))):
         raise ValueError('PCP Mooncake requires ordered V41 KV source layers')
-    if config.speculative_config is not None:
-        raise ValueError('PCP Mooncake PD does not yet transfer DSpark draft context; disable speculation on both P and D')
+    spec = config.speculative_config
+    draft_context = draft_context_enabled(config)
+    if spec is not None and not draft_context:
+        raise ValueError('PCP Mooncake speculation requires explicit DSpark context transfer')
+    if draft_context:
+        draft = getattr(spec, 'draft_model_config', None)
+        if (getattr(spec, 'method', None) != 'dspark'
+                or spec.num_speculative_tokens < 1
+                or spec.enable_adaptive_verification
+                or spec.rejection_sample_method == 'synthetic'
+                or draft is None
+                or draft.hf_config.model_type not in ('deepseek_v41', 'deepseek_v41_text')
+                or not config.use_v2_model_runner
+                or config.scheduler_config.disable_hybrid_kv_cache_manager
+                or transfer.kv_load_failure_policy != 'fail'):
+            raise ValueError('PCP Mooncake draft context requires V41 DSpark, V2, '
+                             'hybrid KV and fail-on-load-error')
     if transfer.kv_role == 'kv_producer':
-        if p.data_parallel_size != 1 or config.speculative_config is not None:
-            raise ValueError('PCP Mooncake producer requires DP=1 and no drafter')
+        if p.data_parallel_size != 1:
+            raise ValueError('PCP Mooncake producer requires DP=1')
+        if draft_context and (not layer_split_enabled(config) or not draft.enforce_eager):
+            raise ValueError('PCP Mooncake draft producer requires eager Layer Split')
     elif p.prefill_context_parallel_size != 1 or layer_split_enabled(config):
         raise ValueError('PCP Mooncake consumer requires PCP=1 and layer split off')
     return ids
 
 
-def transfer_owner(name, ids, width, split):
-    owner = _owner(name, ids, width) if split else None
-    # SWA follows the same cyclic owner as the planner and attention. Only
-    # replicated compressor state (and split-off caches) defaults to rank 0.
+def transfer_owner(name, ids, width, split, *, is_draft=False):
+    owner = _owner(name, ids, width, is_draft=is_draft) if split else None
+    # Target SWA follows the planner's cyclic owner. Rank 0 represents
+    # replicated compressor state, DSpark draft pages, and split-off caches.
     return 0 if owner is None else owner
 
 
@@ -98,6 +128,9 @@ def describe_caches(kv_config, caches):
                 shape=list(cache.shape[1:]), dtype=str(cache.dtype), bytes=size,
                 sliding_window=getattr(spec, 'sliding_window', None),
                 bounded_replay=getattr(spec, 'bounded_replay', False))
+            if spec.is_draft:
+                manifest[name].update(is_draft=True,
+                                      extra_retained_tokens=spec.extra_retained_tokens)
     if not regions:
         raise ValueError('PCP Mooncake has no transferable cache pages')
     return regions, manifest
@@ -110,7 +143,7 @@ def validate_manifest(manifest):
         if type(group) is not int or group < 0:
             raise ValueError('Invalid KV manifest group index')
         semantics = tuple(entry.get(k) for k in
-            ('kind', 'block_size', 'sliding_window', 'bounded_replay'))
+            ('kind', 'block_size', 'sliding_window', 'bounded_replay', 'is_draft'))
         if group in groups and groups[group] != semantics:
             raise ValueError('Inconsistent semantics within KV manifest group')
         groups[group] = semantics
@@ -159,7 +192,8 @@ class OwnerBootstrap(MooncakeBootstrapServer):
                 or not 0 <= payload.pcp_rank < payload.pcp_size):
             raise HTTPException(400, 'Invalid PCP owner protocol/rank')
         expected = sorted(name for name in payload.manifest if transfer_owner(
-            name, tuple(payload.source_ids), payload.pcp_size, payload.split) == payload.pcp_rank)
+            name, tuple(payload.source_ids), payload.pcp_size, payload.split,
+            is_draft=payload.manifest[name].get('is_draft', False)) == payload.pcp_rank)
         if sorted(payload.sends) != expected or len(set(payload.sends)) != len(payload.sends):
             raise HTTPException(400, 'Invalid PCP owner coverage')
         if self.workers:
@@ -212,7 +246,8 @@ def validate_peers(data, manifest):
         if semantic_manifest(row['manifest']) != semantic_manifest(manifest):
             raise ValueError('P/D KV schemas differ (layers/groups/ring capacity/dtype); no bytes transferred')
         expected = sorted(name for name in manifest if transfer_owner(
-            name, tuple(row['source_ids']), width, row['split']) == row['pcp_rank'])
+            name, tuple(row['source_ids']), width, row['split'],
+            is_draft=manifest[name].get('is_draft', False)) == row['pcp_rank'])
         if sorted(row['sends']) != expected:
             raise ValueError('Missing or duplicate PCP layer owner')
         addresses.add(row['addr'])
@@ -225,6 +260,8 @@ def validate_peers(data, manifest):
 class OwnerWorker(core.MooncakeConnectorWorker):
     def __init__(self, vllm_config, engine_id, kv_cache_config):
         self.source_ids = validate_config(vllm_config)
+        self._draft_context = draft_context_enabled(vllm_config)
+        self._draft_groups = draft_transfer_groups(kv_cache_config, self._draft_context)
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.split = layer_split_enabled(vllm_config)
@@ -258,7 +295,8 @@ class OwnerWorker(core.MooncakeConnectorWorker):
     def register_kv_caches(self, kv_caches):
         all_regions, self._manifest = describe_caches(self.kv_cache_config, kv_caches)
         self._regions = [r for r in all_regions if not self.is_kv_producer or transfer_owner(
-            r.layer_name, self.source_ids, self.pcp_size, self.split) == self.pcp_rank]
+            r.layer_name, self.source_ids, self.pcp_size, self.split,
+            is_draft=self._manifest[r.layer_name].get('is_draft', False)) == self.pcp_rank]
         self.device_kv_caches = kv_caches
         storages = {kv_caches[r.layer_name].untyped_storage().data_ptr():
                     kv_caches[r.layer_name].untyped_storage().nbytes() for r in self._regions}
@@ -281,6 +319,11 @@ class OwnerWorker(core.MooncakeConnectorWorker):
         self.opaque_packed_storages = set()
         core.logger.info('PCP Mooncake rank %d/%d split=%s sends %s',
             self.pcp_rank, self.pcp_size, self.split, self.registered_layer_names)
+        if self._draft_context:
+            core.logger.info('DSpark Mooncake groups producer=%s rank=%d draft=%s main=%s',
+                self.is_kv_producer, self.pcp_rank, tuple(self._draft_groups),
+                tuple(i for i in range(len(self.kv_cache_config.transfer_groups))
+                      if i not in self._draft_groups))
         if self.is_kv_consumer:
             return
         ready = threading.Event()
@@ -327,13 +370,40 @@ class OwnerWorker(core.MooncakeConnectorWorker):
 
     def receive_kv(self, remote_engine_id, pull_metas):
         peers = self._owner_peers[remote_engine_id]
-        for meta in pull_metas.values():
-            self._validate_destination_ids(meta.local_block_ids)
+        valid = pull_metas.copy()
+        for req_id, meta in pull_metas.items():
+            try:
+                self._validate_destination_ids(meta.local_block_ids)
+            except ValueError as exc:
+                self._handle_failed_recv(valid, (req_id,), str(exc))
+                continue
             meta.pull_tasks_count = len(peers)
         # Shared PullReqMeta instances preserve Core's sticky failure flag and
         # counter. Each peer gets its own dict in the inherited receiver.
-        for peer in peers:
-            asyncio.create_task(self.receive_kv_from_single_worker(peer, pull_metas))
+        if valid:
+            for peer in peers:
+                asyncio.create_task(self.receive_kv_from_single_worker(peer, valid))
+
+    def _complete_pull_task(self, pull_meta):
+        super()._complete_pull_task(pull_meta)
+        if (self._draft_context and not pull_meta.failed and pull_meta.pull_tasks_count == 0
+                and pull_meta.local_block_ids):
+            sizes = {i: len(pull_meta.local_block_ids[i]) for i in self._draft_groups}
+            draft_bytes = sum(sizes[entry['group']] * entry['bytes']
+                             for entry in self._manifest.values() if entry.get('is_draft'))
+            core.logger.info('DSpark Mooncake received req=%s transfer=%s draft_pages=%s bytes=%d',
+                pull_meta.d_req_id, pull_meta.transfer_id, sizes, draft_bytes)
+
+    def start_load_kv(self, metadata):
+        if (self._draft_context and self.is_kv_producer and self.pcp_rank == 0
+                and any(ids for _, ids in metadata.reqs_to_send.values())):
+            # Finished tables arrive on a later runner step, after sample_tokens
+            # has enqueued the draft stores. Fence the producer stream before
+            # Core publishes ready to the RDMA thread.
+            written = torch.cuda.Event()
+            written.record()
+            written.synchronize()
+        return super().start_load_kv(metadata)
 
     def _validate_destination_ids(self, block_ids):
         # Core uses [] for a release notification with no destination pages.
@@ -346,6 +416,9 @@ class OwnerWorker(core.MooncakeConnectorWorker):
             count = self._cache_page_count(group.layer_names[0])
             if any(type(i) is not int or not 0 <= i < count for i in ids):
                 raise ValueError('Destination KV block ID exceeds its pool')
+        for index in self._draft_groups:
+            if not block_ids[index] or 0 in block_ids[index]:
+                raise ValueError('Destination DSpark window contains an empty/null page')
 
     def _prepare_transfer_regions(self, meta):
         if meta.remote_tp_size != 1 or meta.remote_pp_size != 1:
@@ -415,6 +488,17 @@ class OwnerWorker(core.MooncakeConnectorWorker):
                    for r in local_regions for i in local_ids[r.group_index]):
                 rejected.append(req_id)
                 continue
+            # A partial prefix-cache hit can leave D with a shorter draft
+            # suffix. Core aligns that suffix with the end of P's window.
+            if any(
+                not remote_ids[b.group_index]
+                or len(local_ids[a.group_index]) < len(remote_ids[b.group_index])
+                or 0 in local_ids[a.group_index] or 0 in remote_ids[b.group_index]
+                for a, b in zip(local_regions, remote_regions)
+                if a.group_index in self._draft_groups
+            ):
+                rejected.append(req_id)
+                continue
             private_send = copy.copy(send)
             private_send.local_block_ids = [local_ids[r.group_index] for r in local_regions]
             prepared.append((req_id, private_send))
@@ -430,6 +514,25 @@ class OwnerWorker(core.MooncakeConnectorWorker):
         return self.kv_cache_config.num_blocks_of(tensor)
 
 
+def draft_transfer_groups(cache_config, enabled):
+    draft_groups = {}
+    for group_index, group in enumerate(cache_config.transfer_groups):
+        specs = [spec for _, spec in _specs(group)]
+        if not any(spec.is_draft for spec in specs):
+            continue
+        first = specs[0]
+        if not enabled or not all(
+            spec.is_draft and isinstance(spec, SlidingWindowMLASpec) and spec == first
+            and spec.tokens_per_state == 1 and not spec.bounded_replay
+            for spec in specs
+        ):
+            raise ValueError('Mooncake DSpark needs a separate native draft SWA group')
+        draft_groups[group_index] = first
+    if enabled and not draft_groups:
+        raise ValueError('Mooncake DSpark draft SWA group missing from transfer layout')
+    return draft_groups
+
+
 class OwnerScheduler(core.MooncakeConnectorScheduler):
     """Transfer the state before the token D recomputes for its first logits.
 
@@ -442,6 +545,62 @@ class OwnerScheduler(core.MooncakeConnectorScheduler):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self._has_compressor_state = any(isinstance(spec, CircularBufferSpec)
             for group in kv_cache_config.transfer_groups for _, spec in _specs(group))
+        self._draft_context = draft_context_enabled(vllm_config)
+        self._draft_groups = draft_transfer_groups(kv_cache_config, self._draft_context)
+
+    def _select_draft_window(self, raw, selected, request, boundary, *, cached_pages=None):
+        """Pick the draft SWA pages covering the live tail of the handoff.
+
+        ``boundary`` is the number of context tokens whose draft KV exists, so
+        both sides derive the same logical page range from the same value: the
+        producer uses its truncated prompt length and the consumer uses the
+        prompt length, never ``num_external_tokens``, which shrinks by the
+        local prefix hit.
+
+        ``cached_pages`` is the leading count of pages the consumer already
+        owns through its prefix cache. Those pages keep the draft KV from the
+        request that filled them, so the transfer covers only the unhashed
+        tail; Core then tail-aligns the producer window to that length.
+        """
+        for i, spec in self._draft_groups.items():
+            # Match SlidingWindowManager's live tail using positions before
+            # discarding null blocks. P and D block IDs are never interchangeable.
+            start = max(0, boundary - spec.sliding_window + 1
+                        - spec.extra_retained_tokens) // spec.block_size
+            end = (boundary + spec.block_size - 1) // spec.block_size
+            if cached_pages is not None:
+                start = max(start, cached_pages[i])
+            if boundary <= 0 or end <= start:
+                raise ValueError('Mooncake DSpark transfer window is fully cached')
+            pages = raw[i][start:end]
+            if len(pages) != end - start or not pages or 0 in pages:
+                raise ValueError('Mooncake DSpark transfer window is missing live pages')
+            selected[i] = pages
+            core.logger.info('DSpark Mooncake window producer=%s transfer=%s group=%d '
+                'context_tokens=%d logical_pages=[%d,%d) block_size=%d',
+                self.is_kv_producer, request.kv_transfer_params['transfer_id'], i,
+                boundary, start, end, spec.block_size)
+
+    def _cached_draft_pages(self, blocks):
+        """Count the leading draft pages this consumer already holds.
+
+        Core hands the consumer only the unhashed tail, so everything before it
+        came from the prefix cache. Without prefix caching that count is zero.
+        """
+        raw = self.kv_cache_config.select_transfer_block_ids(blocks.get_block_ids())
+        unhashed = self.kv_cache_config.select_transfer_block_ids(
+            blocks.get_unhashed_block_ids_all_groups())
+        return {i: len(raw[i]) - len(unhashed[i]) for i in self._draft_groups}
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if self._draft_context and self.is_kv_consumer and num_external_tokens > 0:
+            pending = self._reqs_need_recv.get(request.request_id)
+            if pending is not None:
+                raw = self.kv_cache_config.select_transfer_block_ids(blocks.get_block_ids())
+                self._select_draft_window(
+                    raw, pending[1], request, request.num_prompt_tokens - 1,
+                    cached_pages=self._cached_draft_pages(blocks))
 
     def on_new_request(self, request):
         super().on_new_request(request)
@@ -464,10 +623,19 @@ class OwnerScheduler(core.MooncakeConnectorScheduler):
             if delay_free_blocks:
                 self._reqs_need_send[request.request_id] = (
                     request, self.get_sw_clipped_blocks(block_ids))
-            return delay_free_blocks, None
-        return super().request_finished(request, block_ids)
+            result = delay_free_blocks, None
+        else:
+            result = super().request_finished(request, block_ids)
+        if self._draft_context and self.is_kv_producer and params and params.get('_p_side_truncated'):
+            pending = self._reqs_need_send.get(request.request_id)
+            if result[0] and pending is not None:
+                raw = self.kv_cache_config.select_transfer_block_ids(block_ids)
+                self._select_draft_window(raw, pending[1], request, request.num_prompt_tokens)
+        return result
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens):
+        if self._draft_context:
+            return max(0, num_prompt_tokens - 1)
         if self._has_compressor_state and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return super()._get_remote_prefill_token_count(num_prompt_tokens)
