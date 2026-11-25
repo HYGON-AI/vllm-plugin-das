@@ -344,6 +344,9 @@ def test_opt_in_patch_preserves_default_and_is_idempotent(monkeypatch):
     fake = ModuleType("vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime")
     fake.select_method = lambda *args: "mega"
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    standard = ModuleType("vllm_hcu.model_executor.layers.fused_moe.deepgemm_megamoe")
+    standard.select_method = lambda *args: None
+    monkeypatch.setitem(sys.modules, standard.__name__, standard)
     monkeypatch.setenv("VLLM_HCU_USE_MEGAMOE", "1")
     # A stale legacy variable must not override explicit backend selection.
     for backend in ("auto", "triton", "aiter", "deep_gemm"):
@@ -355,8 +358,10 @@ def test_opt_in_patch_preserves_default_and_is_idempotent(monkeypatch):
     mega = NS(moe_backend="deep_gemm_mega_moe")
     assert instance._get_quant_method("model.layers.0.experts", None, mega) == "mega"
     fake.select_method = lambda *args: None
-    with pytest.raises(ValueError, match="DeepSeek-V4"):
+    with pytest.raises(ValueError, match="Channel-FP8"):
         instance._get_quant_method("model.layers.0.experts", None, mega)
+    standard.select_method = lambda *args: "standard-api"
+    assert instance._get_quant_method("model.layers.0.experts", None, mega) == "standard-api"
     assert instance._get_quant_method(
         "model.layers.0.experts", None, NS(moe_backend="auto")) == "existing"
     RoutedExperts._get_quant_method = lambda *args: None
