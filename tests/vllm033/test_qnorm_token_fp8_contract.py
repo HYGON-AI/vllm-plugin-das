@@ -83,3 +83,10 @@ def test_changed_consumer_cannot_receive_quantized_values(consumers):
     assert a._hcu_qnorm_token_fp8 is not None
     a.wq_b.scheme.fp8_linear=object()
     assert try_split(a,torch.ones(7,1792,dtype=torch.bfloat16)) is None
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "NO", " 0 ", " false "])
+def test_master_rollback_does_not_touch_qnorm_consumers(monkeypatch, value):
+    from hcu_vllm_das.qnorm_token_fp8 import configure
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", value)
+    assert configure(object(), object()) is None

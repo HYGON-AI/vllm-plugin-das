@@ -4,7 +4,6 @@
 Core retains attention control flow and both original projection consumers.
 Only the BF16 normalization/quantization producer is fused and shared.
 """
-import os
 
 import torch
 from vllm.model_executor.layers.fusion.quant_activation import (
@@ -14,6 +13,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Dynami
 from vllm.model_executor.kernels.linear.scaled_mm.triton import TritonFP8ScaledMMLinearKernel
 
 from .adapter_api import optional_adapter_module
+from .environment import fp8_fusions_enabled
 from .moe.shared_act_quant import (
     TokenFP8TritonLinearKernel,_quant_contract,enable_shared_prequant,
 )
@@ -25,7 +25,7 @@ def _kernel(layer):
 
 def configure(attention,config):
     """Bind only compatible native consumers; INT8/MXFP8/PCP stay native."""
-    if os.getenv('VLLM_HCU_USE_CUSTOM_OPS','1').lower() in ('0','false','off'):
+    if not fp8_fusions_enabled():
         return None
     parallel=config.parallel_config
     if (parallel.tensor_parallel_size!=1
