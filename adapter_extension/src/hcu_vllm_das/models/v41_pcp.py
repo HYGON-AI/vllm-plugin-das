@@ -363,6 +363,9 @@ class HcuV41Fp4DecoderLayer(native.DeepseekV4DecoderLayer):
         from ..shared_expert_int8 import bind_shared_expert
 
         bind_shared_expert(cfg, self.ffn)
+        from ..moe.router_stagger import bind_router
+
+        bind_router(cfg, self.ffn)
         if not self.use_sequence_parallel and self.attn._int8_wq_b_direct is not None:
             from ..int8_wq_b import bind_decoder_direct_gemm
 
