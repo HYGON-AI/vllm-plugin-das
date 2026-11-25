@@ -19,6 +19,40 @@ For v0.33, `adapter_extension` is the production project; repository-root
 - Plugin owns optional providers through Adapter extensions. Check defaults,
   explicit enablement, required-owner failures and the existing kill switch.
 
+## v0.33 hybrid Mamba prefix caching
+
+For the official v0.33.0 release line, do not use the historical
+`--enable-mamba-fine-grained-prefix-cache` option: it is absent from the
+official CLI. Use the public Core options and let Core own scheduling,
+allocation, hash registration and checkpoint materialization:
+
+```bash
+--enable-prefix-caching \\
+--prefix-match-unit 64 \\
+--enable-mamba-shared-prefix-checkpoint
+```
+
+The value `64` is a Qwen3.8-27B starting point, not a universal page size.
+Before retaining it, resolve the actual `MambaSpec.block_size` for every
+prefix-cacheable KV group and require that each group is divisible by the
+match unit. Do not force `--mamba-block-size`; leave it to the official model
+configuration unless a measured model-specific requirement justifies an
+override. The deprecated `--mamba-cache-mode` may still parse in v0.33 but
+does not enable fine-grained behavior and must not be used as a feature flag.
+
+KV cache precision is a separate hardware gate. On the current gfx936
+validation host, `fp8_e5m2` is the accepted FP8 KV route while the official
+runtime rejects `fp8_e4m3` with its gfx92a/gfx938 requirement. Keep the dtype
+requested by the target hardware/checkpoint and record the startup gate; do
+not infer E4M3 support from a successful E5M2 run.
+
+The shared-prefix option being accepted is not proof that a junction
+checkpoint was created. Validate an owner, junction and sibling request, and
+record the effective manager page, hit deltas, output equality and MTP/Graph
+configuration. A sibling hit must be a multiple of `prefix_match_unit` and
+not a multiple of the physical Mamba manager page to demonstrate fine-grained
+reuse. See [hybrid-prefix.md](references/hybrid-prefix.md).
+
 For a standalone draft config missing from the official registry, first test
 public Transformers `AutoConfig.register()` from an Adapter extension before
 adding Core registry entries or replacing parsers. Inherit the official config
