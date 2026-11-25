@@ -44,28 +44,37 @@ assert not any(name == 'torch' or name.startswith('vllm') or
 """)
 
 
-@pytest.mark.parametrize("request_first", [True, False])
-def test_model_selection_uses_the_same_core_qualification(request_first):
+@pytest.mark.parametrize("order", ["config-first", "adapter-first", "during-bind"])
+def test_model_selection_uses_the_same_core_qualification(order):
     run_child("""
 import importlib
-from types import SimpleNamespace as NS
+from importlib.metadata import EntryPoint
+from hcu_adapter.extensions import ExtensionCommitError, ExtensionContext, activate_extensions
 m = importlib.import_module('hcu_vllm_das.hyv4_flash_model_activation')
-context = NS(vllm_version='0.32.0', requested_extensions=set(),
-             requested_capabilities=set())
-request_first = """ + repr(request_first) + """
+context = ExtensionContext('0.5.22', '0.32.0')
+point = EntryPoint('das_hcu_hyv4_flash_model', m.__name__+':extension_spec',
+                   'hcu_adapter.extensions')
+order = """ + repr(order) + """
 try:
-    if request_first:
+    if order == 'config-first':
         m.request_model_runtime()
-        s = m.extension_spec()
-        assert s.capabilities == frozenset({'hyv4-flash-model'})
-        s.activate(context)
+        activate_extensions(context, [point])
+    elif order == 'during-bind':
+        activate = m._activate
+        def request_before_bind(*args, **kwargs):
+            activate(*args, **kwargs)
+            if not kwargs['model_selected']:
+                m.request_model_runtime()
+        m._activate = request_before_bind
+        activate_extensions(context, [point])
     else:
-        s = m.extension_spec()
-        assert not s.capabilities
-        s.activate(context)
+        report, = activate_extensions(context, [point])
+        assert not report.capabilities
         m.request_model_runtime()
 except RuntimeError as e:
     assert 'pinned vLLM 0.33.0' in str(e), e
+    if order != 'adapter-first':
+        assert isinstance(e, ExtensionCommitError), e
 else:
     raise AssertionError('model selection bypassed Core qualification')
 assert m._publication is None

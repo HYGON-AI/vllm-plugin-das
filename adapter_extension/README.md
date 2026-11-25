@@ -193,11 +193,11 @@ activate their inherited mapping, and spawned children discover the installed
 entry point. The capability can be required using the existing Adapter
 `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
 
-The optional `das_hcu_hyv4_flash_model` entry point delivers the active Flash
-model implementation. Select it with
-`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model` on pinned vLLM 0.33.0.
-Unselected discovery imports no model and claims no model capability. This
-model owns the `HYV4FlashForCausalLM`/`HYV4FlashVLForConditionalGeneration` names;
+On vLLM 0.33.0, the `das_hcu_hyv4_flash_model` entry point prepares the runtime
+when a Flash model configuration is parsed or restored in a worker. It uses
+`spawn` when the worker method is unset. To require the capability explicitly
+before model selection, set `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model`.
+The model owns the `HYV4FlashForCausalLM`/`HYV4FlashVLForConditionalGeneration` names;
 the separate optimized HY4 static-EPLB architecture and its entry points remain
 available. Flash quantized/latent parallel admission remains narrower than
 that static path and must not be treated as EPLB qualification.

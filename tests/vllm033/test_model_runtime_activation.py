@@ -74,3 +74,41 @@ class ModelRuntimeActivationTests(TestCase):
                 self.assertEqual(os.environ.get(key), explicit)
                 runtime.request()
                 self.assertEqual(os.environ[key], explicit or 'spawn')
+
+    def _check_after_fork(self, runtime, check):
+        if not hasattr(os, 'fork'):
+            runtime._after_fork()
+            check()
+            return
+        pid = os.fork()
+        if pid == 0:
+            status = 1
+            try:
+                check()
+                status = 0
+            finally:
+                os._exit(status)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(status, 0)
+
+    def test_fork_discards_the_parent_host_context(self):
+        calls = []
+        runtime = ModelRuntimeActivation(calls.append)
+        runtime.bind('parent')
+        def check():
+            runtime.request()
+            self.assertEqual(calls, [])
+            runtime.bind('child')
+            self.assertEqual(calls, ['child'])
+        self._check_after_fork(runtime, check)
+
+    def test_fork_rejects_an_inherited_publication(self):
+        runtime = ModelRuntimeActivation(lambda _: None)
+        runtime.bind('parent')
+        runtime.request()
+        def check():
+            with self.assertRaisesRegex(RuntimeError, 'use spawn'):
+                runtime.request()
+            with self.assertRaisesRegex(RuntimeError, 'use spawn'):
+                runtime.bind('child')
+        self._check_after_fork(runtime, check)

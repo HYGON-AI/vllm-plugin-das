@@ -15,12 +15,17 @@ class ModelRuntimeActivation:
         self._requested = False
         self._active = False
         self._activating = False
+        self._inherited_publication = False
         self._lock = RLock()
         if hasattr(os, 'register_at_fork'):
-            os.register_at_fork(after_in_child=self._reset_lock)
+            os.register_at_fork(after_in_child=self._after_fork)
 
-    def _reset_lock(self):
+    def _after_fork(self):
         self._lock = RLock()
+        self._context = None
+        self._inherited_publication |= self._active or self._activating
+        self._active = False
+        self._activating = False
 
     @property
     def requested(self):
@@ -40,6 +45,8 @@ class ModelRuntimeActivation:
             self._activate_if_ready()
 
     def _activate_if_ready(self):
+        if self._inherited_publication:
+            raise RuntimeError('Model runtime publication inherited across fork; use spawn')
         if not self._requested or self._context is None or self._active or self._activating:
             return
         self._activating = True

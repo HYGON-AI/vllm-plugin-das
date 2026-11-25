@@ -358,8 +358,17 @@ def extension_spec():
         selection = _environment_selection()
 
     def activate_discovered(context):
-        _activate(context, selection, model_selected=_model_activation.requested)
-        _model_activation.bind(context)
+        model_selected = _model_activation.requested
+        try:
+            _activate(context, selection, model_selected=model_selected)
+            _model_activation.bind(context)
+        except Exception as error:
+            if (_model_activation.requested and not any(selection)
+                    and not is_fatal_extension_error(error)):
+                # This process already received a Flash model configuration.
+                # The usual optional-extension recovery cannot serve that model.
+                _fatal(f"selected Flash runtime activation failed: {error}")
+            raise
 
     def health_discovered():
         with _lock:
@@ -374,7 +383,7 @@ def extension_spec():
 
     return ExtensionSpec(
         name=_SPEC_NAME, api_version=1, priority=72,
-        capabilities=frozenset({CAPABILITY}) if any(selection) or _model_activation.requested else frozenset(),
+        capabilities=frozenset({CAPABILITY}) if any(selection) else frozenset(),
         activate=activate_discovered,
         check_health=health_discovered,
     )
