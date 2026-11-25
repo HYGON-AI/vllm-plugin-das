@@ -484,19 +484,30 @@ def execute(layer, hidden, query, weights):
         d = meta.decode
         lengths = d.seq_lens.reshape(-1).contiguous()
         live_schedule = p.plan is not None and cache.is_cuda
-        decode_cache, decode_table = stage_decode_pages(
-            cache, d.block_table.contiguous(), lengths, layer.max_model_len, p.gather,
-            live_only=live_schedule,
-        )
+        rows_per_request = 1
+        if live_schedule:
+            from .fp4_rowgroup import uniform_decode_rows, stage_request_rows
+            from hcu_adapter.kernels.fp4_staging_triton import supports_staging_device
+
+            if supports_staging_device(cache.device):
+                rows_per_request = uniform_decode_rows(meta, topk_tokens=layer.topk_tokens)
+            decode_cache, decode_table = stage_request_rows(
+                cache, d.block_table, lengths, layer.max_model_len, p.gather,
+                rows_per_request=rows_per_request, page_records=page_records,
+                stage=stage_decode_pages)
+        else:
+            decode_cache, decode_table = stage_decode_pages(
+                cache, d.block_table.contiguous(), lengths, layer.max_model_len, p.gather,
+                live_only=False)
         schedule = None
         if live_schedule:
             sms = torch.cuda.get_device_properties(cache.device).multi_processor_count
-            schedule = p.plan(lengths, 64, sms)
+            schedule = p.plan(lengths, 64, sms, rows_per_request)
         logits = p.decode(query[0][:n].unsqueeze(1).contiguous(),
                           query[1][:n].unsqueeze(1).contiguous(),
                           decode_cache.unsqueeze(2), weights[:n].contiguous(),
                           lengths, decode_table.contiguous(),
-                          schedule, width, 64, None, 1)
+                          schedule, width, 64, None, rows_per_request)
         # Unsupported planners keep the fully staged and masked reader path.
         # The bounded selector masks unwritten tails when native TopK declines.
         if not live_schedule:

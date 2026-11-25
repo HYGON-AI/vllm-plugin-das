@@ -505,3 +505,23 @@ def test_seam_table_covers_the_ct_activation_binder():
     ct_entries = [(module.__name__, name) for module, name, purpose in
                   _seams._required_seams(modules) if 'CT W4A8' in purpose]
     assert (_seams.adapter_module_name('ct_w4a8_registration'), 'set_provider_binder') in ct_entries
+
+
+def test_deferred_rowgroup_source_drift_is_refused(monkeypatch, tmp_path):
+    # Relocate the plugin files so a real edit cannot touch the working tree.
+    import os
+    import shutil
+    source = Path(activation.__file__)
+    for path in source.parent.glob("*.py"):
+        shutil.copyfile(path, tmp_path / path.name)
+    monkeypatch.setattr(activation, "__file__", str(tmp_path / source.name))
+    state, registry = _healthy_state()
+    activation._state = state
+    _bind_health_host(monkeypatch, registry, state)
+    activation.check_health()
+    helper = tmp_path / "fp4_rowgroup.py"
+    stat = helper.stat()
+    helper.write_text(helper.read_text() + "\n# changed deferred grouping implementation\n")
+    os.utime(helper, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+    with pytest.raises(ExtensionCommitError, match="implementation changed"):
+        activation.check_health()
