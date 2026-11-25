@@ -14,6 +14,7 @@ _RELOCATED = {
     "hcu_config": "hcu_adapter.infra.hcu_config",
     "kill_switch": "hcu_adapter.infra.kill_switch",
     "dsv41_activation": "hcu_adapter.features.dsv41.dsv41_activation",
+    "dsv41_shared_act_quant": "hcu_adapter.features.dsv41.shared_act_quant",
     "ct_w4a8_registration": "hcu_adapter.features.ct_w4a8.ct_w4a8_registration",
     "v41_fp8_indexer": "hcu_adapter.features.dsv41.v41_fp8_indexer",
     "dsv41_channel_fp8": "hcu_adapter.features.dsv41.dsv41_channel_fp8",
