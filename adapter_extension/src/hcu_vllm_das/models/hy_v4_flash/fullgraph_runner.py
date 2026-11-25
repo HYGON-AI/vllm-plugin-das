@@ -8,6 +8,7 @@ _pid = None
 _failure = None
 _runner_cls = None
 _runner_methods = None
+_MIDDLE_SCORING_BOUND = 16384
 
 
 def is_qualified_config(cfg, *, breakable):
@@ -42,6 +43,32 @@ def is_qualified_config(cfg, *, breakable):
         )
     except AttributeError:
         return False
+
+
+def middle_scoring_enabled(cfg, device):
+    """Startup-only admission; the shared W4 Graph predicate stays unchanged."""
+    if not is_qualified_config(cfg, breakable=False):
+        return False
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    from hcu_vllm_das.environment import fp8_fusions_enabled
+    if is_breakable_cudagraph_enabled() or not fp8_fusions_enabled():
+        return False
+    from .quantization import validate_flash_quant_config, validate_flash_quant_parallelism
+    try:
+        if validate_flash_quant_config(cfg.quant_config.config) != "channel_w4a8":
+            return False
+        validate_flash_quant_parallelism(cfg)
+    except (AttributeError, TypeError, ValueError, NotImplementedError):
+        return False
+    from .runtime import is_hcu_platform
+    if not is_hcu_platform():
+        return False
+    import torch
+    if torch.version.hip is None:
+        return False
+    properties = torch.cuda.get_device_properties(device)
+    return (str(getattr(properties, "gcnArchName", "")).split(":")[0] == "gfx938"
+            and getattr(properties, "multi_processor_count", None) == 64)
 
 
 def _fatal(message):
@@ -126,9 +153,28 @@ def runner_class():
                     varlen_decode=wide.varlen_decode,
                     ubatch_runner=None,
                 )
+                if not hasattr(self, "_hcu_middle_scoring_enabled"):
+                    # Freeze the policy across throwaway profiling and real
+                    # initialization; capture/replay must not resolve config.
+                    self._hcu_middle_scoring_enabled = (
+                        bound < _MIDDLE_SCORING_BOUND < self.max_model_len
+                        and middle_scoring_enabled(self.vllm_config, self.device)
+                    )
+                scoring_banks = ()
+                if (self._hcu_middle_scoring_enabled
+                        and bound < _MIDDLE_SCORING_BOUND < self.max_model_len):
+                    middle = ModelCudaGraphManager(
+                        self.vllm_config, self.device, wide.cudagraph_mode,
+                        decode_query_len=self.decode_query_len,
+                        lora_capture_cases=wide.lora_capture_cases,
+                        varlen_decode=wide.varlen_decode,
+                        ubatch_runner=None,
+                    )
+                    scoring_banks = ((_MIDDLE_SCORING_BOUND, middle),)
                 self.cudagraph_manager = FlashFullGraphBanks(
                     wide, short, owners, bound, CUDAGraphMode.FULL,
                     short_pool_factory=current_platform.graph_pool_handle,
+                    scoring_banks=scoring_banks,
                 )
 
             def gather_batch_req_state(self, scheduler_output, dummy_run):
@@ -139,10 +185,14 @@ def runner_class():
                 if isinstance(manager, FlashFullGraphBanks):
                     manager.use_wide_bank()
                     if not dummy_run and state is not None:
-                        manager.set_request_limits(
-                            self.req_states.max_seq_len[state.idx_mapping_np],
-                            self.decode_query_len,
-                        )
+                        try:
+                            mapping = state.idx_mapping_np
+                            if mapping is None:
+                                return state, uniform
+                            limits = self.req_states.max_seq_len[mapping]
+                        except (AttributeError, TypeError, IndexError, KeyError):
+                            return state, uniform
+                        manager.set_request_limits(limits, self.decode_query_len)
                 return state, uniform
 
         _runner_cls = FlashBankModelRunner

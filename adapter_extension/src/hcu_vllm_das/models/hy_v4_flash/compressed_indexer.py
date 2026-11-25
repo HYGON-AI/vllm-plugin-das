@@ -37,6 +37,7 @@ from .indexpool_ops import (
     write_pool,
 )
 from .indexpool_prepare import prepare_groups, write_tails
+from .fullgraph_banks import scoring_max_seq_len
 
 
 class FlashCompressedIndexer(nn.Module):
@@ -56,6 +57,7 @@ class FlashCompressedIndexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         self.max_model_len = vllm_config.model_config.max_model_len
         self._hcu_fullgraph_capture_bound = None
+        self._hcu_fullgraph_scoring_bound = None
         self.logits_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
         for name, input_size, output_size in (
             ("query_projection", config.q_lora_rank, self.num_heads * 128),
@@ -166,7 +168,8 @@ class FlashCompressedIndexer(nn.Module):
                 else km.max_seq_len
             )
         )
-        if max_seq_len <= (self.group_budget + 1) * self.ratio:
+        if (self._hcu_fullgraph_scoring_bound is None
+                and max_seq_len <= (self.group_budget + 1) * self.ratio):
             output[:tokens].copy_(
                 unpruned_indices(logical, output.shape[1], active=live)
             )
@@ -193,9 +196,10 @@ class FlashCompressedIndexer(nn.Module):
         mx_scales = None
         if self.use_mx_scales:
             mx_scales, weights = mqa_logits_mx_inputs(quant_q, None, weights)
+        score_max_seq_len = scoring_max_seq_len(self, max_seq_len)
         width = max(
             POOL_PAGE_SIZE,
-            cdiv(max_seq_len, self.ratio * POOL_PAGE_SIZE) * POOL_PAGE_SIZE,
+            cdiv(score_max_seq_len, self.ratio * POOL_PAGE_SIZE) * POOL_PAGE_SIZE,
         )
         if self.logits_budget < width:
             raise ValueError("IndexPool logits budget cannot hold a single scoring row")
