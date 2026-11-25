@@ -103,11 +103,12 @@ def _scalar(scale,device,name):
 
 
 class TeacherMSAPrefill:
-    def __init__(self,native):
+    def __init__(self,native,stage2_plan=None):
         required=('msa128_stage1_page_max','msa128_stage2_topk_select','msa128_expand_block_indexes','sparse_prefill_fwd')
         if not all(callable(getattr(native,k,None)) for k in required):
             raise ValueError('same-ABI MSA128 native extension with all four entrypoints is required')
         self.native=native
+        self.stage2_plan=stage2_plan
 
     def write_gathered_main(self,k,v,slots,cache,*,k_scale,v_scale,writer):
         """Use the existing post-PCP-gather writer on the new physical view.
@@ -140,6 +141,13 @@ class TeacherMSAPrefill:
             raise ValueError('forced prefix/local pages must be nonnegative and fit Top16')
         score=self.native.msa128_stage1_page_max(index_q,index_cache.unsqueeze(1),meta.k_end,True,-1,
             meta.q_lens_cpu,meta.kv_lens_cpu,None,meta.packed_kv_pages,meta.max_kv_len,index_q_scale,index_k_scale,True,False,False)
+        if self.stage2_plan is not None and _prefill_enabled():
+            from .minimax31_prefill_ops.prefill_stage2_runtime import select_scored_pages
+            from .minimax31_prefill_triton import force_local_pages
+            return select_scored_pages(
+                self.native, score, meta, init_blocks, local_blocks, force_local_pages,
+                selection=self.stage2_plan,
+            )
         if local_blocks and _prefill_enabled():
             from .minimax31_prefill_triton import force_local_pages
             force_local_pages(score, meta.k_end, local_blocks)
@@ -179,6 +187,7 @@ _META = {}
 _META_SOURCES = {}
 _ADAPTER = None
 _ADAPTER_ROOT = None
+_ADAPTER_STAGE2_RECEIPT = None
 _UNIT = {}
 _UNIT_VERSION = {}
 
@@ -208,29 +217,51 @@ def ensure_native_cache(layer):
     return binding
 
 
-def _get_adapter(extension_dir):
-    global _ADAPTER, _ADAPTER_ROOT
+def prepare_native_prefill(deployment):
+    """Validate configured native libraries on the worker before serving."""
+    if deployment.msa_extension_dir is None:
+        if deployment.msa_stage2_receipt is not None:
+            raise ValueError("MSA Stage2 requires msa_extension_dir")
+        return
+    _get_adapter(deployment.msa_extension_dir, deployment.msa_stage2_receipt)
+
+
+def _get_adapter(extension_dir,stage2_receipt=None):
+    global _ADAPTER, _ADAPTER_ROOT, _ADAPTER_STAGE2_RECEIPT
     import hashlib,importlib,importlib.metadata,json,sys
     from pathlib import Path
     root=Path(extension_dir).resolve()
     if _ADAPTER is not None:
-        if root != _ADAPTER_ROOT:
+        if root != _ADAPTER_ROOT or stage2_receipt != _ADAPTER_STAGE2_RECEIPT:
             raise RuntimeError('native MSA artifact changed; restart the engine')
         return _ADAPTER
-    proof=json.loads((root.parent/'native_import_result.json').read_text())
-    plan=json.loads((root.parent/'build_plan.json').read_text())
+    try:
+        proof = json.loads((root.parent / "native_import_result.json").read_text())
+        plan = json.loads((root.parent / "build_plan.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not read native MSA build receipts for {root}") from exc
     so=root/'hcu_minimax_msa'/Path(proof['path']).name
     if (sys.version_info[:2]!=(3,12)
             or importlib.metadata.version('torch')!=plan['target_identity']['torch_distribution']
             or hashlib.sha256(so.read_bytes()).hexdigest()!=proof['sha256']
             or bool(torch._C._GLIBCXX_USE_CXX11_ABI)!=proof['cxx11_abi']):
         raise RuntimeError('native MSA target ABI/build identity mismatch')
-    sys.path.insert(0,str(root))
-    native=importlib.import_module('hcu_minimax_msa._native')
+    # Old qualified builds ship a namespace package under build_lib.
+    # Keep the artifact path scoped to loading so it cannot shadow later imports.
+    sys.path.insert(0, str(root))
+    try:
+        native = importlib.import_module('hcu_minimax_msa._native')
+    finally:
+        sys.path.remove(str(root))
     if Path(native.__file__).resolve()!=so:
         raise RuntimeError('native MSA loaded from a foreign path')
-    _ADAPTER=TeacherMSAPrefill(native)
+    stage2_plan=None
+    if stage2_receipt is not None:
+        from .minimax31_prefill_ops.prefill_stage2_runtime import load_prefill_plan
+        stage2_plan=load_prefill_plan(stage2_receipt)
+    _ADAPTER=TeacherMSAPrefill(native,stage2_plan)
     _ADAPTER_ROOT=root
+    _ADAPTER_STAGE2_RECEIPT=stage2_receipt
     return _ADAPTER
 
 
@@ -280,7 +311,8 @@ def run_native_attention(layer,query,index_query):
         if getattr(main,field)!=getattr(side,field):raise RuntimeError('native MSA main/index query split mismatch')
     if layer.skip_index_topk or index_query is None:
         raise RuntimeError('native MSA index sharing is outside current opt-in contract')
-    adapter=_get_adapter(layer._hcu_msa_extension_dir);cache=ensure_native_cache(layer)
+    adapter=_get_adapter(layer._hcu_msa_extension_dir, layer._hcu_msa_stage2_receipt)
+    cache=ensure_native_cache(layer)
     n=query.shape[0];q=query.view(n,64,128);iq=index_query.view(n,4,128)
     unit=_UNIT.get(query.device)
     if unit is None:
