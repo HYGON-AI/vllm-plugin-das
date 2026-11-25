@@ -97,7 +97,7 @@ def test_all_finite_bf16_gate_values_preserve_rounding(lightop, n):
     torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("m", [1, 48])
+@pytest.mark.parametrize("m", [1, 7, 35, 42, 48, 257])
 def test_fused_activation_is_consumed_by_real_linear(m, native_linear_config):
     if not torch.cuda.is_available():
         pytest.skip("HCU required")
@@ -200,6 +200,88 @@ def test_native_shared_mlp_advertises_quantized_consumer(monkeypatch,
     installed = shared.act_fn
     install_shared_activation(shared)
     assert shared.act_fn is installed
+
+
+@pytest.mark.parametrize("layers", [1, 3, 5])
+@pytest.mark.parametrize("dp", [1, 8])
+def test_dspark_constructor_binds_native_shared_consumers(
+        monkeypatch, native_linear_config, layers, dp):
+    """The owned draft constructor must reach every real native MLP consumer.
+
+    Replace the large model allocation, not the MLP, quantization scheme or
+    binding. The separate consumer test checks loaded weights and graph output.
+    """
+    import copy
+    from types import SimpleNamespace
+    from vllm.config import get_current_vllm_config
+    from vllm.distributed import parallel_state
+    from vllm.models.deepseek_v4.amd.model import DeepseekV4MLP
+    from hcu_vllm_das import dspark_agrs, dspark_backend, dspark_post, qkv_split
+    from hcu_vllm_das.adapter_api import adapter_module
+    from hcu_vllm_das.models.dsv41_dspark import (
+        HcuDSV41DraftWeightAliasModel, HcuDSparkDeepseekV41ForCausalLM,
+    )
+    from hcu_vllm_das.moe.shared_act_quant import (
+        QuantizedSharedActivation, bind_dspark_shared_experts_fp8,
+    )
+
+    monkeypatch.setattr(parallel_state, "_TP",
+                        SimpleNamespace(rank_in_group=0, world_size=1))
+    cfg = get_current_vllm_config()
+    monkeypatch.setattr(cfg, "model_config", SimpleNamespace(dtype=torch.bfloat16))
+    quant = adapter_module("dsv41_channel_fp8").HcuDSV41ChannelFP8Config.from_config(
+        dict(quant_method="fp8", is_per_channel=True, activation_scheme="dynamic"))
+    quant.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    monkeypatch.setattr(cfg, "quant_config", quant)
+    monkeypatch.setattr(cfg, "speculative_config",
+                        SimpleNamespace(target_parallel_config=None))
+    monkeypatch.setattr(cfg.parallel_config, "data_parallel_size", dp)
+    local = copy.copy(cfg)
+    local.parallel_config = copy.copy(cfg.parallel_config)
+    local.parallel_config.all2all_backend = "allgather_reducescatter"
+    monkeypatch.setattr(dspark_agrs, "draft_config", lambda _: local)
+    monkeypatch.setattr(dspark_backend, "native_draft_ll_requested", lambda _: False)
+    monkeypatch.setattr(dspark_post, "requested", lambda _: False)
+    monkeypatch.setattr(qkv_split, "bind_dspark_qkv", lambda _: 0)
+    observed = []
+
+    def allocate(self, *, vllm_config, prefix=""):
+        torch.nn.Module.__init__(self)
+        observed.append(vllm_config)
+        assert get_current_vllm_config() is vllm_config
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList()
+        for index in range(layers):
+            decoder = torch.nn.Module()
+            decoder.ffn = torch.nn.Module()
+            with torch.device("meta"):
+                decoder.ffn.shared_experts = DeepseekV4MLP(
+                    5120, 2304, "silu", 10., quant, reduce_results=False,
+                    is_sequence_parallel=True,
+                    prefix=f"model.layers.{40 + index}.ffn.shared_experts")
+            decoder.ffn.use_mega_moe = False
+            decoder.ffn.fuse_heterogeneous_shared_expert = False
+            self.model.layers.append(decoder)
+
+    monkeypatch.setattr(HcuDSV41DraftWeightAliasModel, "__init__", allocate)
+    draft = HcuDSparkDeepseekV41ForCausalLM(vllm_config=cfg)
+    assert observed == [local if dp > 1 else cfg]
+    assert get_current_vllm_config() is cfg
+    originals = [layer.ffn.shared_experts.act_fn for layer in draft.model.layers]
+    assert all(isinstance(act, QuantizedSharedActivation) for act in originals)
+    assert bind_dspark_shared_experts_fp8(observed[0], draft.model) == layers
+    assert [layer.ffn.shared_experts.act_fn for layer in draft.model.layers] == originals
+
+    # A new unsupported draft remains native rather than silently changing its
+    # shared/mega-expert or parallel semantics.
+    unsupported = object.__new__(HcuDSparkDeepseekV41ForCausalLM)
+    allocate(unsupported, vllm_config=cfg)
+    for layer in unsupported.model.layers:
+        layer.ffn.use_mega_moe = True
+    assert bind_dspark_shared_experts_fp8(cfg, unsupported.model) == 0
+    assert all(not isinstance(layer.ffn.shared_experts.act_fn,
+                              QuantizedSharedActivation)
+               for layer in unsupported.model.layers)
 
 
 def stock_activation_quant(x, lightop):
