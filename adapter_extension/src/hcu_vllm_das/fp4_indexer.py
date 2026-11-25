@@ -215,6 +215,9 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
             from .int8_wq_b import configured_device
 
             self._int8_wq_b_device = configured_device(self.indexer.vllm_config)
+        from .qnorm_token_fp8 import configure
+
+        self._hcu_qnorm_token_fp8 = configure(self, cfg)
 
     def _o_proj(self, attn_out, positions):
         if self._hcu_wo_a_layout and wo_a_layout.supported(self, attn_out):
@@ -225,6 +228,11 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
         return Fp4Indexer
 
     def _split_qkv_and_norm(self, qr_kv):
+        from .qnorm_token_fp8 import try_split
+
+        fused = try_split(self, qr_kv)
+        if fused is not None:
+            return fused
         qr, qr_scale, kv = super()._split_qkv_and_norm(qr_kv)
         if (self._int8_wq_b_device is not None and type(self) is Fp4Attention
                 and type(self.indexer) is Fp4Indexer

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Write native BF16 WO_A directly in the following INT8 consumer's layout."""
+"""Write native BF16 WO_A directly in the following linear's layout."""
 from __future__ import annotations
 
 import inspect
@@ -63,7 +63,11 @@ def configured(config, device):
         return False
 
     from .quantization.ct_w4a8 import HcuDSV41CTW4A8Config
-    if _BLAS_OVERRIDDEN or not isinstance(config.quant_config, HcuDSV41CTW4A8Config):
+    from .adapter_api import adapter_module
+
+    channel_fp8 = adapter_module('dsv41_channel_fp8').HcuDSV41ChannelFP8Config
+    if _BLAS_OVERRIDDEN or not isinstance(
+            config.quant_config, (HcuDSV41CTW4A8Config, channel_fp8)):
         return False
     parallel = config.parallel_config
     mc = config.model_config
@@ -181,7 +185,7 @@ def supported(owner, attn_out):
 
 def project(owner, attn_out):
     if not supported(owner, attn_out):
-        raise ValueError('WO_A token-major output is outside the verified W4A8 contract')
+        raise ValueError('WO_A token-major output is outside the verified BF16 contract')
     output = _project(native._get_cached_wo_a_bf16, owner.wo_a, attn_out)
     if (_CAPTURE_LOG and attn_out.device not in _logged_capture_devices
             and torch.cuda.is_current_stream_capturing()):
@@ -197,6 +201,6 @@ def _project(cache, wo_a, attn_out):
     result = torch.empty((rows, 8, 1024), dtype=attn_out.dtype, device=attn_out.device)
     torch.bmm(inputs.transpose(0, 1), weight.transpose(1, 2), out=result.transpose(0, 1))
     # This is a view. Native einsum produces group-major storage and flatten
-    # must copy it; the following native INT8 consumer now receives the same
+    # must copy it; the following native linear now receives the same
     # byte-verified BF16 values in contiguous token-major storage.
     return result.flatten(1)
