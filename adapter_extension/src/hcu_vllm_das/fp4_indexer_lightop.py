@@ -15,7 +15,7 @@ from importlib import import_module
 import torch
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
-from .fp4_workspace import workspace_bytes
+from .fp4_workspace import prefill_chunk_rows, workspace_bytes
 
 
 class Fp4Query(tuple):
@@ -438,6 +438,7 @@ def execute(layer, hidden, query, weights):
     _validate(layer, meta, hidden, cache, query, weights)
     p = providers()
     width = (layer.max_model_len + 3) // 4 * 4
+    candidates = layer.candidate_blocks
     out = layer.topk_indices_buffer[:, :layer.topk_tokens]
     out[:hidden.shape[0]].fill_(-1)
     page_records = physical_page_records(cache)
@@ -450,6 +451,15 @@ def execute(layer, hidden, query, weights):
             total = chunk.total_seq_lens
             if not total or start == end:
                 continue
+            prefill_width = width
+            rows = layer.fp4_query_chunk_rows
+            if candidates is None:
+                # Every query's local K window is within this chunk's
+                # gathered records. The host count bounds all ke - ks
+                # without reading the per-query bounds back to the CPU.
+                prefill_width = min(width, (total + 3) // 4 * 4)
+                rows = prefill_chunk_rows(
+                    layer.max_model_len, prefill_width, layer.fp4_max_logits_bytes)
             positions = torch.arange(total, dtype=torch.int64, device=cache.device)
             requests = chunk.token_to_seq[:total].long()
             local = positions - chunk.cu_seq_lens[requests]
@@ -460,20 +470,19 @@ def execute(layer, hidden, query, weights):
             del positions, requests, local
             k, sf = p.gather(flat, slots, page_records)
             del slots
-            for row_start in range(start, end, layer.fp4_query_chunk_rows):
-                row_end = min(end, row_start + layer.fp4_query_chunk_rows)
+            for row_start in range(start, end, rows):
+                row_end = min(end, row_start + rows)
                 lo, hi = row_start - start, row_end - start
                 ks, ke = chunk.cu_seqlen_ks[lo:hi], chunk.cu_seqlen_ke[lo:hi]
                 logits = p.prefill(
                     (query.bf16[row_start:row_end].contiguous(), None), (k, sf),
                     weights[row_start:row_end].contiguous(), ks, ke,
-                    False, width, None, None)
+                    False, prefill_width, None, None)
                 # LightOp columns are relative to each query's K window.
                 lengths = ke - ks
                 starts = torch.zeros_like(lengths)
                 _select(logits, starts, lengths, out[row_start:row_end],
-                        None if layer.candidate_blocks is None
-                        else layer.candidate_blocks[row_start:row_end],
+                        None if candidates is None else candidates[row_start:row_end],
                         layer.candidate_block_size, layer.candidate_write)
                 del logits, lengths, starts
             # Also release the previous chunk's gather before the next gather

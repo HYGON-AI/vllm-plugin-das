@@ -1,7 +1,11 @@
 """CPU bounds for the FP4 reader, independent of model or device imports."""
 import pytest
 
-from hcu_vllm_das.fp4_workspace import query_chunk_rows, workspace_bytes
+from hcu_vllm_das.fp4_workspace import (
+    prefill_chunk_rows,
+    query_chunk_rows,
+    workspace_bytes,
+)
 
 
 def test_query_rows_respect_fixed_aligned_score_width():
@@ -24,8 +28,25 @@ def budget(**overrides):
 
 
 def test_prefill_budget_saturates_after_query_chunk_cap():
-    assert budget(query_rows=1024) == budget(query_rows=32768)
-    assert budget() < 1024**3
+    assert budget(query_rows=2048) == budget(query_rows=32768)
+    assert budget() < 1100 * 1024**2
+
+
+def test_long_model_keeps_32k_prefill_row_capacity():
+    logits_budget = 512 * 1024**2
+    assert query_chunk_rows(524288, logits_budget) == 256
+    assert prefill_chunk_rows(524288, 16384, logits_budget) == 4096
+    assert prefill_chunk_rows(524288, 524288, logits_budget) == 256
+
+
+@pytest.mark.parametrize('width', [4, 16384, 32768, 65536, 524288])
+def test_profile_covers_live_width_and_rows(width):
+    max_logits_bytes = 512 * 1024**2
+    rows = min(8192, prefill_chunk_rows(524288, width, max_logits_bytes))
+    live = width * 76 + rows * (10 * width + 512 * 96 + 32 * 128 * 2) + width * 8
+    assert budget(query_rows=8192, decode_rows=0, max_model_len=524288,
+                  total_seq_lens=524288, topk_tokens=512,
+                  max_logits_bytes=max_logits_bytes) >= live
 
 
 def test_only_noncanonical_decode_pages_need_staging():
