@@ -11,6 +11,7 @@ _MASTER_SWITCH = "VLLM_HCU_USE_CUSTOM_OPS"
 WO_A_TOKEN_MAJOR_SWITCH = "HCU_VLLM_WO_A_TOKEN_MAJOR"
 _RMS_NORM_SWITCH = "VLLM_HCU_USE_CUSTOM_RMS_NORM"
 _RMS_NORM_COMPILE_FACTOR = "VLLM_HCU_DAS_RMS_NORM_ENABLED"
+_FP8_FUSIONS_COMPILE_FACTOR = "VLLM_HCU_DAS_FP8_FUSIONS_ENABLED"
 _PREFILL_GATHER_SWITCH = "VLLM_HCU_FLASH_PREFILL_GATHER"
 _DSV41_PROFILE_WORKER_SWITCH = "VLLM_HCU_DSV41_PCP_PROFILE_WORKER"
 _PREFILL_GATHER_FACTOR = "VLLM_HCU_FLASH_PREFILL_GATHER_ENABLED"
@@ -42,6 +43,15 @@ def rms_norm_enabled() -> bool:
     master_enabled = custom_ops_enabled()
     child_enabled = _flag(_RMS_NORM_SWITCH, default=False)
     return master_enabled and child_enabled
+
+
+def fp8_fusions_enabled() -> bool:
+    """Allow qualified FP8 fusions by default; honor every master OFF value.
+
+    Unlike the opt-in migrated RMSNorm path, these fusions already default to
+    enabled. The same effective policy must control binding and cache identity.
+    """
+    return _flag(_MASTER_SWITCH, default=True)
 
 
 def dsv41_profile_worker_enabled() -> bool:
@@ -83,11 +93,11 @@ def owns_prefill_compile_factor(vllm_envs: object) -> bool:
 
 
 def register_compile_factors(vllm_envs: object) -> None:
-    """Include effective RMS policy in vLLM's normal and AOT cache keys.
+    """Include effective RMS and FP8 policy in normal and AOT cache keys.
 
     vLLM 0.33 hashes the getters in its environment registry for both caches.
-    A derived getter keeps equivalent disabled switch combinations identical;
-    the two raw switches alone would unnecessarily split those cache entries.
+    Derived getters keep equivalent switch spellings/combinations identical;
+    raw environment strings would unnecessarily split those cache entries.
     This registration must happen before model construction or AOT loading.
     """
     registry = getattr(vllm_envs, "environment_variables", None)
@@ -95,11 +105,17 @@ def register_compile_factors(vllm_envs: object) -> None:
         getattr(vllm_envs, "compile_factors", None)
     ):
         raise RuntimeError("vLLM environment compile-factor registry is unavailable")
-    existing = registry.get(_RMS_NORM_COMPILE_FACTOR)
-    if existing is not None and existing is not rms_norm_enabled:
-        raise RuntimeError("HCU RMSNorm compile factor already has another owner")
-    registry[_RMS_NORM_COMPILE_FACTOR] = rms_norm_enabled
+    factors = {
+        _RMS_NORM_COMPILE_FACTOR: rms_norm_enabled,
+        _FP8_FUSIONS_COMPILE_FACTOR: fp8_fusions_enabled,
+    }
+    # Validate every owner before publishing anything, including on re-entry.
+    for name, getter in factors.items():
+        existing = registry.get(name)
+        if existing is not None and existing is not getter:
+            raise RuntimeError(f"HCU compile factor {name} already has another owner")
+    registry.update(factors)
 
 
 __all__ = ["custom_ops_enabled", "dsv41_profile_worker_enabled",
-           "rms_norm_enabled", "register_compile_factors"]
+           "rms_norm_enabled", "fp8_fusions_enabled", "register_compile_factors"]

@@ -179,9 +179,9 @@ def install_shared_activation(shared):
 
 def bind_shared_expert_fp8(config, moe):
     """Use the existing model-construction seam; unsupported cases stay native."""
-    import os
+    from ..environment import fp8_fusions_enabled
 
-    if os.getenv("VLLM_HCU_USE_CUSTOM_OPS", "1").lower() in ("0", "false", "off"):
+    if not fp8_fusions_enabled():
         return False
     parallel = config.parallel_config
     if (parallel.tensor_parallel_size != 1
