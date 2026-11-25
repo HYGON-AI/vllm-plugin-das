@@ -17,6 +17,10 @@ _ENV = 'HCU_DSV41_SHARED_EXPERT_INT8_FUSION'
 
 
 def bind_shared_expert(config, moe):
+    from .moe.shared_act_quant import bind_shared_expert_fp8
+
+    if bind_shared_expert_fp8(config, moe):
+        return
     if os.getenv(_ENV, '1') != '1':
         return
     _LOG.warning_once('HCU DSV4.1 shared expert INT8 fusion requested')
