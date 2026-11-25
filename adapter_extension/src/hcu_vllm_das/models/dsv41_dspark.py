@@ -26,6 +26,7 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
         from hcu_vllm_das.dspark_post import requested, initialize_owned
 
         native_ll = native_draft_ll_requested(vllm_config)
+        constructor_config = vllm_config
         constructor = super().__init__
         if requested(vllm_config):
             constructor = lambda **kwargs: initialize_owned(self, **kwargs)
@@ -41,6 +42,7 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
             and not native_ll
         ):
             local = draft_config(vllm_config)
+            constructor_config = local
             # Native draft decoder construction reads current_config as well as
             # its explicit argument. Keep both references on the same private
             # copy and retain native compiler live tables for layer discovery.
@@ -54,6 +56,7 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
             from ..pcp_dspark_draft import draft_config as pcp_draft_config, moe_pcp_size
 
             local = pcp_draft_config(vllm_config)
+            constructor_config = local
             with set_current_vllm_config(local):
                 constructor(vllm_config=local, prefix=prefix)
             init_logger('vllm.hcu_dspark_pcp').info(
@@ -63,6 +66,15 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
             )
         else:
             constructor(vllm_config=vllm_config, prefix=prefix)
+
+        # Draft decoder layers use the native constructor, so the target's
+        # HcuV41Fp4DecoderLayer activation binding never visits them. Reuse the
+        # same guarded consumer contract with the actual construction config;
+        # keep CT INT8, heterogeneous/mega MoE and unsupported topology native.
+        if _owned_quant_kind(constructor_config) == "channel_fp8":
+            from ..moe.shared_act_quant import bind_dspark_shared_experts_fp8
+
+            bind_dspark_shared_experts_fp8(constructor_config, self.model)
         if native_ll:
             from hcu_vllm_das.dspark_ll import install_model_entry_reset
             install_model_entry_reset(self, vllm_config, 128)
