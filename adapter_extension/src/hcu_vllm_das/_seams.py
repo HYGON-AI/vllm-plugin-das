@@ -199,4 +199,10 @@ def bind_ct_w4a8() -> None:
     additional = getattr(modules["ct_w4a8_registration"], 'set_additional_config_provider', None)
     if callable(additional):
         additional('hcu_hy4_ct_w4a8', _hy4_ct_w4a8_config_provider)
+    from .environment import dsv41_megamoe_forward_pool_enabled
+    if dsv41_megamoe_forward_pool_enabled():
+        from hcu_adapter.bridges.vllm_model_load import register_post_model_load
+        from .moe.dsv41_forward_pool import configure_forward_pool
+
+        register_post_model_load("dsv41-w4a8-megamoe.forward-pool", configure_forward_pool)
     _bound.add("ct_w4a8")
