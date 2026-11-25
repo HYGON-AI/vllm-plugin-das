@@ -274,7 +274,12 @@ class HYV4FlashModel(HYV4Model):
                     raise ValueError(f"Unknown Flash expert weight: {name}")
                 parameter = parameters[target]
                 if expert_id is None:
-                    if value.ndim != 3 or value.shape[0] != self.config.num_experts:
+                    expected_ndim = 2 if suffix == "_shape" else 3
+                    if (
+                        value.ndim != expected_ndim
+                        or value.shape[0] != self.config.num_experts
+                        or (suffix == "_shape" and value.shape[-1] != 2)
+                    ):
                         raise ValueError(
                             f"Invalid packed expert shape for {name}: {value.shape}"
                         )

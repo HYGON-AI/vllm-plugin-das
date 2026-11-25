@@ -319,3 +319,113 @@ def test_dfly_required_dtypes_preserve_quant_weights_not_other_params(dtype):
     assert required["layers.0.self_attn.learnable_sink_param"] == torch.bfloat16
     assert required["layers.0.unexpected_metadata"] == torch.bfloat16
     assert "layers.0.self_attn.mla_attn.k_scale" not in required
+
+
+# Regression executes the legacy production methods, without importing the full
+# legacy runtime or reproducing its rank/suffix/duplicate implementation.
+def _legacy_flash_expert_loader(projection, *, accept=True):
+    import re
+    from types import SimpleNamespace
+
+    tree = ast.parse((FLASH / "nvidia/model.py").read_text(encoding="utf-8"))
+    regex = next(n for n in tree.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "_EXPERT_WEIGHT"
+                         for t in n.targets))
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                 and any(isinstance(m, ast.FunctionDef) and m.name == "load_weights"
+                         for m in n.body))
+    owner = deepcopy(owner)
+    owner.bases, owner.keywords, owner.decorator_list = [], [], []
+    owner.body = [n for n in owner.body if isinstance(n, ast.FunctionDef)
+                  and n.name in {"load_weights", "_record_part"}]
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.fix_missing_locations(ast.Module(body=[future, regex, owner], type_ignores=[]))
+    scope = {"torch": torch, "re": re}
+    exec(compile(module, str(FLASH / "nvidia/model.py"), "exec"), scope)
+    model = scope[owner.name]()
+    model.config = SimpleNamespace(num_experts=2, engram_layer_ids=[])
+    model.loaded_parts = {}
+    target = "layers.1.mlp.experts.routed_experts." + (
+        "w2_weight_shape" if projection == "down_proj" else "w13_weight_shape")
+    parameter = torch.nn.Parameter(torch.full((2, 2), -1, dtype=torch.int64), requires_grad=False)
+    calls = []
+
+    def load(param, value, name, *, shard_id, expert_id, return_success):
+        calls.append((value.clone(), name, shard_id, expert_id, return_success))
+        if accept:
+            param[expert_id].copy_(value)
+        return accept
+
+    parameter.weight_loader = load
+    model.named_parameters = lambda: [(target, parameter)]
+    return model, parameter, target, calls
+
+
+@pytest.mark.parametrize("projection,shard", [("gate_proj", "w1"), ("up_proj", "w3"), ("down_proj", "w2")])
+def test_flash_legacy_aggregate_expert_shape_loads_size_pairs(projection, shard):
+    model, parameter, target, calls = _legacy_flash_expert_loader(projection)
+    metadata = torch.tensor([[384, 1536], [192, 768]], dtype=torch.int64)
+    loaded = model.load_weights([(f"layers.1.mlp.experts.{projection}.weight_shape", metadata)])
+    assert loaded == {target}
+    torch.testing.assert_close(parameter, metadata, rtol=0, atol=0)
+    assert [(c[1], c[2], c[3], c[4]) for c in calls] == [
+        (target, shard, 0, True), (target, shard, 1, True)]
+    assert all(c[0].shape == (2,) for c in calls)
+    assert model.loaded_parts == {target: {(0, shard), (1, shard)}}
+
+
+@pytest.mark.parametrize("shape", [(), (2,), (2, 1, 2), (2, 1, 1, 2), (1, 2), (3, 2), (2, 3), (2, 0)])
+def test_flash_legacy_rejects_malformed_aggregate_shape_before_loading(shape):
+    model, parameter, _, calls = _legacy_flash_expert_loader("gate_proj")
+    with pytest.raises(ValueError, match="Invalid packed expert shape"):
+        model.load_weights([("layers.1.mlp.experts.gate_proj.weight_shape", torch.zeros(shape))])
+    assert calls == [] and model.loaded_parts == {}
+    assert torch.equal(parameter, torch.full_like(parameter, -1))
+
+
+def test_flash_legacy_aggregate_payload_still_requires_rank_three():
+    model, _, target, calls = _legacy_flash_expert_loader("gate_proj")
+    # Make the payload target exist so this tests rank validation, not name lookup.
+    parameter = dict(model.named_parameters())[target]
+    model.named_parameters = lambda: [(target.removesuffix("_shape"), parameter)]
+    with pytest.raises(ValueError, match="Invalid packed expert shape"):
+        model.load_weights([("layers.1.mlp.experts.gate_proj.weight", torch.ones(2, 2))])
+    assert calls == [] and model.loaded_parts == {}
+
+
+def test_flash_legacy_fused_aggregate_shape_remains_unsupported():
+    model, _, _, calls = _legacy_flash_expert_loader("gate_up_proj")
+    with pytest.raises(ValueError, match="Fused gate/up weight_shape is not supported"):
+        model.load_weights([("layers.1.mlp.experts.gate_up_proj.weight_shape", torch.ones(2, 2))])
+    assert calls == [] and model.loaded_parts == {}
+
+
+def test_flash_legacy_per_expert_shape_and_duplicate_accounting():
+    model, parameter, target, calls = _legacy_flash_expert_loader("up_proj")
+    metadata = torch.tensor([384, 1536], dtype=torch.int64)
+    weight = ("layers.1.mlp.experts.1.up_proj.weight_shape", metadata)
+    assert model.load_weights([weight]) == {target}
+    torch.testing.assert_close(parameter[1], metadata, rtol=0, atol=0)
+    assert calls[0][0].shape == (2,) and model.loaded_parts == {target: {(1, "w3")}}
+    with pytest.raises(ValueError, match="Duplicate Flash checkpoint"):
+        model.load_weights([weight])
+
+
+def test_flash_legacy_aggregate_shape_rejects_duplicate_expert_metadata():
+    model, _, _, _ = _legacy_flash_expert_loader("gate_proj")
+    model.load_weights([("layers.1.mlp.experts.0.gate_proj.weight_shape", torch.tensor([384, 1536]))])
+    with pytest.raises(ValueError, match="Duplicate Flash checkpoint"):
+        model.load_weights([("layers.1.mlp.experts.gate_proj.weight_shape", torch.ones(2, 2))])
+
+
+def test_flash_legacy_rejected_expert_load_does_not_record_metadata():
+    model, _, _, calls = _legacy_flash_expert_loader("gate_proj", accept=False)
+    assert model.load_weights([("layers.1.mlp.experts.gate_proj.weight_shape", torch.ones(2, 2))]) == set()
+    assert len(calls) == 2 and model.loaded_parts == {}
+
+
+def test_flash_legacy_per_expert_index_out_of_range_still_rejected():
+    model, _, _, calls = _legacy_flash_expert_loader("gate_proj")
+    with pytest.raises(ValueError, match="Expert index out of range"):
+        model.load_weights([("layers.1.mlp.experts.2.gate_proj.weight_shape", torch.ones(2))])
+    assert calls == [] and model.loaded_parts == {}
