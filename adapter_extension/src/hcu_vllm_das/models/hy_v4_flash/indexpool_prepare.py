@@ -21,7 +21,7 @@ def _group_prefix(
     tl.store(Ends + request, tl.cumsum(count), request < BATCH)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS", "SLOTS"])
 def _gather_groups(
     Keys,
     Positions,
@@ -36,8 +36,8 @@ def _gather_groups(
     Groups,
     Live,
     BATCH: tl.constexpr,
-    TOKENS: tl.constexpr,
-    SLOTS: tl.constexpr,
+    TOKENS,
+    SLOTS,
     R: tl.constexpr,
     RING: tl.constexpr,
     KEY_ROW: tl.constexpr,
@@ -114,7 +114,7 @@ def _gather_groups(
     tl.store(Live + slot, live)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _query_metadata(
     Starts,
     Lengths,
@@ -123,7 +123,7 @@ def _query_metadata(
     Upper,
     Live,
     BATCH: tl.constexpr,
-    TOKENS: tl.constexpr,
+    TOKENS,
     R: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
