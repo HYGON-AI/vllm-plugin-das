@@ -230,22 +230,30 @@ def validate_w4a8_execution(vllm_config):
 
 
 def _validate_aiter_w4a8_weight_residency(vllm_config):
-    """Reject unqualified migration before native packed aliases are created."""
+    """Return the public raw migration mode; reject unqualified transports."""
     offload = getattr(vllm_config, "offload_config", None)
     if offload is None:
-        return
+        return False
     backend = offload.offload_backend
     uva_active = backend in ("auto", "uva") and offload.uva.cpu_offload_gb > 0
     prefetch_active = (
         backend in ("auto", "prefetch")
         and offload.prefetch.offload_group_size > 0
     )
-    if uva_active or prefetch_active:
+    if prefetch_active:
         raise NotImplementedError(
-            "AITER W4A8 currently requires resident GPU expert weights; "
-            "CPU weight offload (UVA or prefetch) is not supported yet. "
-            "Disable --cpu-offload-gb and prefetch weight offload."
+            "AITER W4A8 CPU weight offload does not support prefetch yet"
         )
+    if uva_active:
+        from vllm import envs
+
+        if not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA:
+            raise NotImplementedError(
+                "AITER W4A8 CPU weight offload requires "
+                "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1; UVA is not supported yet"
+            )
+        return True
+    return False
 
 
 def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):

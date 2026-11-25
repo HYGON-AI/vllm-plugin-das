@@ -53,6 +53,12 @@ def _identity(layer):
                            layer.w13_weight_scale, layer.w2_weight_scale))
 
 
+def _parameter_schema(layer):
+    return tuple((tuple(p.shape), tuple(p.stride()), p.dtype)
+                 for p in (layer.w13_weight_packed, layer.w2_weight_packed,
+                           layer.w13_weight_scale, layer.w2_weight_scale))
+
+
 def _unique_padded_route_ids(ids):
     """Fill padding with distinct unused IDs, retaining Core's valid routes.
 
@@ -89,10 +95,17 @@ class HYV4FlashAiterW4A8Method(HYV4FlashChannelW4A8Method):
     def create_weights(self, layer, *args, **kwargs):
         if self.moe.moe_backend != 'aiter':
             raise ValueError('Flash AITER W4A8 requires explicit moe_backend=aiter')
+        from vllm.config import get_current_vllm_config
+        from .quantization import _validate_aiter_w4a8_weight_residency
+
+        # Core only guarantees its current config while constructing weights.
+        self._raw_offload = _validate_aiter_w4a8_weight_residency(
+            get_current_vllm_config()
+        )
         return super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer):
-        if getattr(self, '_prepared', None) is not None:
+        if getattr(self, '_weights_processed', False) or getattr(self, '_prepared', None) is not None:
             raise RuntimeError('AITER W4A8 weights already processed; cannot repack')
         if self.moe.moe_backend != 'aiter':
             raise ValueError('Flash AITER W4A8 requires explicit moe_backend=aiter')
@@ -125,6 +138,9 @@ class HYV4FlashAiterW4A8Method(HYV4FlashChannelW4A8Method):
             activation='silu', quant_dtype_a=torch.int8, backend='auto',
             max_num_tokens=self.moe.max_num_tokens,
         )
+        raw_offload = getattr(self, '_raw_offload', False)
+        if raw_offload and prepared.layout != 'raw':
+            raise NotImplementedError('AITER W4A8 CPU weight offload requires raw prepared layout')
         if any(w.dtype not in (torch.uint8, torch.int32, torch.uint32) for w in (w1, w2)):
             raise RuntimeError('AITER W4A8 preparation must retain packed integer weights')
         # Keep Parameter objects/loader attributes, replacing their CT storage
@@ -138,18 +154,31 @@ class HYV4FlashAiterW4A8Method(HYV4FlashChannelW4A8Method):
         layer.w2_weight_packed.data = owned2
         layer.w13_weight_scale.data = prepared.w1_scale
         layer.w2_weight_scale.data = prepared.w2_scale
-        self._native_weights = (w1, w2)
-        self._prepared = prepared
+        # Core restores CPU owners after this postload scope and functional_call
+        # swaps in fresh device tensors during forward. Raw mode must not retain
+        # the temporary GPU weights or PreparedMoe's strong scale references.
+        self._native_weights = None if raw_offload else (w1, w2)
+        self._prepared = None if raw_offload else prepared
         self._api = api
         self._limit = limit
-        self._lifecycle = _identity(layer)
+        self._lifecycle = None if raw_offload else _identity(layer)
+        self._schema = _parameter_schema(layer)
         self._weights_processed = True
 
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
-        if not self._weights_processed or getattr(self, '_prepared', None) is None:
+        raw_offload = getattr(self, '_raw_offload', False)
+        if not self._weights_processed or (not raw_offload and getattr(self, '_prepared', None) is None):
             raise RuntimeError('AITER W4A8 weights must be processed after CT loading')
-        if _identity(layer) != self._lifecycle or layer.swiglu_limit != self._limit:
+        if (not raw_offload and _identity(layer) != self._lifecycle) or layer.swiglu_limit != self._limit:
             raise RuntimeError('AITER W4A8 storage/lifecycle changed; rebuild the method')
+        if raw_offload and (
+            _parameter_schema(layer) != self._schema
+            or any(p.device != x.device for p in (
+                layer.w13_weight_packed, layer.w2_weight_packed,
+                layer.w13_weight_scale, layer.w2_weight_scale,
+            ))
+        ):
+            raise RuntimeError('AITER W4A8 raw offload parameter schema/device changed')
         if x.dtype != torch.bfloat16 or not _device_supported(x):
             raise ValueError('AITER W4A8 requires gfx938 BF16 activations')
         if (x.ndim != 2 or x.shape[1] != self.hidden or x.shape[0] > self.moe.max_num_tokens
@@ -173,9 +202,16 @@ class HYV4FlashAiterW4A8Method(HYV4FlashChannelW4A8Method):
         values = torch.where(active, x, 0)
         weights = torch.where(valid, topk_weights, 0)
         ids = _unique_padded_route_ids(topk_ids)
+        if raw_offload:
+            native_weights = (packed_byte_view(layer.w13_weight_packed),
+                              packed_byte_view(layer.w2_weight_packed))
+            scales = dict(w1_scale=layer.w13_weight_scale,
+                          w2_scale=layer.w2_weight_scale)
+        else:
+            native_weights, scales = self._native_weights, {}
         result = self._api.execute(
-            values, *self._native_weights, weights, ids,
+            values, *native_weights, weights, ids,
             quant_type=self._api.quant_type, quant_dtype_a=torch.int8,
-            gemm1_limit=self._limit, prepared=self._prepared,
+            gemm1_limit=self._limit, prepared=self._prepared, **scales,
         )
         return torch.where(active, result, 0)
