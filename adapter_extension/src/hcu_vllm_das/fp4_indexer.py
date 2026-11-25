@@ -21,7 +21,7 @@ from vllm.v1.attention.backends.mla import indexer as metadata
 from . import fp4_packer, wo_a_layout
 from .fp4_indexer_lightop import Fp4Query, cache_view, load_providers, providers, rotate_bf16
 from .v41_pcp import HcuV41PcpAttention
-from .qkv_split import qualify_qkv_split, split_qkv, supported as qkv_split_supported
+from .qkv_split import qualify_qkv_split, try_attention_split
 from .v41_pcp_layer_split import LayerSplitAttentionMixin, LayerSplitIndexerMixin
 
 
@@ -252,19 +252,9 @@ class Fp4Attention(rocm.DeepseekV41ROCMAiterMLAAttention, _Fp4CommonAttention):
         return super()._wq_b_proj(qr, qr_scale)
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
-        if (isinstance(attn_metadata, dict) and not self.use_pcp
-                and not self.kv_mxfp8 and not self.accepts_unnormed_unroped_query
-                and self.n_local_heads == self.padded_heads == 64):
-            swa = attn_metadata.get(self.swa_cache_layer.prefix)
-            cache = self.swa_cache_layer.kv_cache
-            if (swa is not None and swa.block_size in (32, 64)
-                    and cache.dtype == torch.uint8
-                    and cache.ndim > 0 and cache.shape[0] > 0
-                    and cache.numel() == cache.shape[0] * swa.block_size * 584):
-                cache = cache.view(cache.shape[0], swa.block_size, 584)
-                cos_sin = self.rotary_emb.cos_sin_cache
-                if qkv_split_supported(q, kv, cache, swa.slot_mapping, positions, cos_sin):
-                    return split_qkv(q, kv, cache, swa.slot_mapping, positions, cos_sin)
+        result = try_attention_split(self, q, kv, positions, attn_metadata)
+        if result is not None:
+            return result
         return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
 
