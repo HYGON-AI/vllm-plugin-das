@@ -35,12 +35,19 @@ def config(**changes):
     return result
 
 
-def test_int8_is_an_independent_explicit_capability():
+def test_int8_uses_hcu_admission_without_private_requirements(monkeypatch):
+    from hcu_adapter.bridges import vllm as host
+    calls = []
+    def detect():
+        calls.append('detect')
+        return host.HcuDetection(False, None, 'CPU contract')
+    monkeypatch.setattr(host, 'detect_hcu', detect)
     spec = int8_activation.extension_spec()
     assert spec.capabilities == frozenset({"hcu-aiter-int8-moe"})
     assert spec.check_health is int8_activation.check_health
-    with pytest.raises(RuntimeError, match="explicit"):
+    with pytest.raises(RuntimeError, match="real gfx936 or gfx938"):
         spec.activate(ExtensionContext(adapter_version="0.5.22", vllm_version="0.33.0"))
+    assert calls == ['detect']
     with pytest.raises(RuntimeError, match="not active"):
         spec.check_health()
 

@@ -13,7 +13,7 @@ Version `0.33.0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
 Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
-and the explicit INT8 ASM candidate below. Core retains CT scheme selection,
+and the AITER INT8 backend below. Core retains CT scheme selection,
 weight loading, generic quantization and kernel construction.
 
 It also provides an explicit HCU FlashAttention backend selected by
@@ -358,14 +358,23 @@ Schema4 additionally verifies that the seven official INT8 oracle symbols
 remain identical across activation, the module is owned by the Core wheel,
 and explicit Triton selection resolves to an official expert.
 
-## Explicit INT8 ASM candidate
+## AITER INT8 backend
 
-Request `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hcu-aiter-int8-moe` and
-`--moe-backend aiter`. This requires the associated Core public
+Select `--moe-backend aiter`. On compatible gfx936 and gfx938 hosts the
+independent extension registers automatically; neither
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES` nor
+`HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS` is required to enable it.
+The existing `hcu-aiter-int8-moe` capability can still be required as an optional
+deployment assertion that registration succeeds before model construction.
+Registration requires the associated Core public
 `register_int8_moe_backend` API; stock v0.33 without that API refuses activation.
 The retired `int8_oracle.install()` remains unavailable and no oracle functions,
 already-imported aliases, CT classes or builtin enum members are replaced.
 Builtin auto/triton behavior stays unchanged.
+An unavailable optional provider is reported before registration without
+blocking unrelated backends; failed preparation cannot be retried in that
+process. An explicit deployment requirement remains strict. Any failure once
+public registration is attempted is still process-fatal, without rollback.
 
 The architecture candidate admits exact gfx936 and gfx938 identities, with
 raw symmetric per-channel INT8 expert weights,

@@ -6,7 +6,7 @@
       "scope": "CPU source and packaging contracts"
     },
     "v033-device-gfx938": {
-      "scope": "installed-wheel Channel-FP8 DeepGEMM numerical contract"
+      "scope": "installed-wheel Channel-FP8 DeepGEMM and AITER INT8/Graph contracts"
     },
     "v033-device-gfx936": {
       "scope": "installed-wheel HCU operator and Graph contracts"
