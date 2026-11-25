@@ -32,6 +32,7 @@ def configure(attention,config):
             or parallel.prefill_context_parallel_size!=1
             or parallel.decode_context_parallel_size!=1
             or attention.use_pcp or attention.kv_mxfp8
+            or attention.accepts_unnormed_unroped_query
             or attention._wq_b_uses_aiter_block_scaled):
         return None
     from .fp4_indexer import Fp4Attention,Fp4Indexer

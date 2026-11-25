@@ -62,6 +62,21 @@ def test_other_native_attention_contracts_are_not_rebound(consumers,attribute):
     assert a.wq_b.scheme.fp8_linear is before
 
 
+@pytest.mark.parametrize('has_indexer', [False, True])
+def test_backend_owned_normalization_keeps_both_native_consumers(consumers, monkeypatch, has_indexer):
+    from hcu_vllm_das.qnorm_token_fp8 import configure
+    a, cfg = consumers
+    if not has_indexer:
+        a.indexer = None
+    monkeypatch.setattr(type(a), 'accepts_unnormed_unroped_query',
+                        property(lambda self: True))
+    layers = [a.wq_b] + ([a.indexer.wq_b] if has_indexer else [])
+    before = [layer.scheme.fp8_linear for layer in layers]
+    assert configure(a, cfg) is None
+    assert all(layer.scheme.fp8_linear is previous
+               for layer, previous in zip(layers, before))
+
+
 @pytest.mark.parametrize('attribute',['tensor_parallel_size','prefill_context_parallel_size','decode_context_parallel_size'])
 def test_other_parallel_layouts_keep_native(consumers,attribute):
     from hcu_vllm_das.qnorm_token_fp8 import configure

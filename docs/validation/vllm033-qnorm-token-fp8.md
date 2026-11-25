@@ -9,8 +9,10 @@ are unchanged.
 
 Admission requires TP/PCP/DCP=1, the exact owned attention/indexer classes,
 matching native dynamic-token E4M3 quantizers and their public input capability.
-MXFP8, AITER block scales, INT8, unknown providers and consumer drift retain the
-native producer. Main and indexer capabilities are inspected before either is
+Backends that own query normalization/RoPE, MXFP8, AITER block scales, INT8,
+unknown providers and consumer drift retain the native producer. The backend
+normalization contract is checked before either linear is rebound. Main and
+indexer capabilities are inspected before either is
 updated. BF16 Q is rounded before FP8 conversion; graph/compile quantizer
 selection preserves the existing LightOp/upstream choice. No new launch flags
 or environment variables are introduced.
