@@ -167,6 +167,30 @@ def materialize(config, groups, num_blocks, rank):
         layer_pool=layer_pool)
 
 
+def separate_draft_groups(groups, draft_names, *, mark_eagle=False):
+    """Keep draft block tables independent even when native specs compare equal."""
+    separated = []
+    for group in groups:
+        for is_draft in (False, True):
+            specs = {name: replace(spec, is_draft=is_draft)
+                     for name, spec in _specs(group) if (name in draft_names) == is_draft}
+            if not specs:
+                continue
+            spec = (UniformTypeKVCacheSpecs.from_specs(specs)
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else next(iter(specs.values())))
+            separated.append(replace(group, layer_names=list(specs), kv_cache_spec=spec,
+                                     is_eagle_group=is_draft and mark_eagle))
+    return separated
+
+
+class DSparkConsumerCacheBuilder(DefaultKVCacheConfigBuilder):
+    def get_kv_cache_groups(self, vllm_config, kv_cache_spec):
+        draft_names = {name for name, spec in kv_cache_spec.items() if spec.is_draft}
+        groups = super().get_kv_cache_groups(vllm_config, kv_cache_spec)
+        return separate_draft_groups(groups, draft_names)
+
+
 class IndependentDSACacheBuilder(DefaultKVCacheConfigBuilder):
     def get_kv_cache_groups(self, vllm_config, kv_cache_spec):
         draft_names = {name for name, spec in kv_cache_spec.items() if spec.is_draft}
@@ -174,21 +198,7 @@ class IndependentDSACacheBuilder(DefaultKVCacheConfigBuilder):
         if split_config(vllm_config) is None:
             return groups
         if draft_names:
-            # Native equality ignores is_draft. Separate producers before
-            # merging SWA pools so replicated drafts cannot alias target scratch.
-            separated = []
-            for group in groups:
-                for is_draft in (False, True):
-                    specs = {name: replace(spec, is_draft=is_draft)
-                        for name, spec in _specs(group) if (name in draft_names) == is_draft}
-                    if not specs:
-                        continue
-                    spec = (UniformTypeKVCacheSpecs.from_specs(specs)
-                        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                        else next(iter(specs.values())))
-                    separated.append(replace(group, layer_names=list(specs),
-                        kv_cache_spec=spec, is_eagle_group=is_draft))
-            groups = separated
+            groups = separate_draft_groups(groups, draft_names, mark_eagle=True)
         return merge_swa_groups(groups)
 
     def _get_pool_bytes_per_block(self, vllm_config, kv_cache_groups):
