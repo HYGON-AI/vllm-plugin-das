@@ -73,6 +73,7 @@ def test_context_kv_uses_native_profile_or_missing_op_fallback(monkeypatch, prof
     assert calls == [(states, positions, mappings)]
 
 
+@pytest.mark.hcu
 @pytest.mark.parametrize(
     "dtype,width,mxfp8",
     [(torch.uint8, 584, False), (torch.uint8, 528, True),
