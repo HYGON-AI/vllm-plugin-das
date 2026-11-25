@@ -57,8 +57,10 @@ def validate(api, cfg):
     return function(cfg)
 
 
-def test_qualified_fullpiecewise_preserves_config(api):
+@pytest.mark.parametrize("disable_custom_all_reduce", [True, False])
+def test_qualified_fullpiecewise_preserves_config(api, disable_custom_all_reduce):
     cfg = current()
+    cfg.parallel_config.disable_custom_all_reduce = disable_custom_all_reduce
     before = deepcopy(cfg)
     assert validate(api, cfg) is True
     assert cfg == before
@@ -85,7 +87,10 @@ def test_eager_retains_reference_execution(api):
     ("parallel_config", "enable_eplb", True),
     ("parallel_config", "enable_dbo", True),
     ("parallel_config", "use_sequence_parallel_moe", True),
-    ("parallel_config", "disable_custom_all_reduce", False),
+    ("parallel_config", "disable_custom_all_reduce", None),
+    ("parallel_config", "disable_custom_all_reduce", 0),
+    ("parallel_config", "disable_custom_all_reduce", 1),
+    ("parallel_config", "disable_custom_all_reduce", "false"),
     ("speculative_config", "method", "mtp"),
     ("speculative_config", "num_speculative_tokens", 3),
     ("cache_config", "cache_dtype", "auto"),

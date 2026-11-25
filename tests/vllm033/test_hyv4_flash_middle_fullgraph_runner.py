@@ -344,5 +344,17 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(self.runner_api.is_qualified_config(self.cfg, breakable=True))
 
 
+class CustomAllReduceRunnerTests(RunnerTests):
+    """Keep the same bank construction/replay contracts with Core AR enabled.
+
+    Core/device managers remain explicit CPU doubles in these tests. Native
+    collective numerical correctness and model capture are separate checks.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.parallel_config.disable_custom_all_reduce = False
+
+
 if __name__ == "__main__":
     unittest.main()

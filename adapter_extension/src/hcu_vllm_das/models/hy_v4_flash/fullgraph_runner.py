@@ -15,6 +15,8 @@ def is_qualified_config(cfg, *, breakable):
     """Configuration predicate only; platform/version ownership is separate."""
     if breakable:
         return False
+    # Core owns communicator selection and fallback. Either boolean policy
+    # uses the same ordered capture/replay and independent scoring-bank pools.
     try:
         model, parallel = cfg.model_config, cfg.parallel_config
         compilation, spec, cache = (
@@ -30,7 +32,7 @@ def is_qualified_config(cfg, *, breakable):
                     "data_parallel_size", "pipeline_parallel_size",
                     "prefill_context_parallel_size", "decode_context_parallel_size"))
                 or parallel.enable_dbo or parallel.enable_eplb
-                or parallel.disable_custom_all_reduce is not True
+                or type(parallel.disable_custom_all_reduce) is not bool
                 or cfg.lora_config is not None or cfg.kv_transfer_config is not None
                 or spec is None or spec.method != "dfly"
                 or spec.num_speculative_tokens != 5
