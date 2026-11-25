@@ -12,6 +12,7 @@ from vllm.models.hy_v4.nvidia.flashmla_sparse import (
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 
+from ...environment import fp8_fusions_enabled
 from .hisparse_runtime import (
     HiSparseBindingError,
     HiSparseRuntimeBinding,
@@ -37,11 +38,14 @@ class FlashSparseImpl(CoreSinkImpl):
         # Qualify the current worker device once, outside compilation/capture.
         # The native 512-column layout is qualified only on gfx938.
         self._hcu_window_device = None
+        self._hcu_small_head_device = None
         if self._hcu_ops is not None and torch.cuda.is_available():
             device = torch.cuda.current_device()
             arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
             if arch == "gfx938":
                 self._hcu_window_device = torch.device("cuda", device)
+                if fp8_fusions_enabled():
+                    self._hcu_small_head_device = self._hcu_window_device
         self._install_hisparse_hook()
 
     def _install_hisparse_hook(self):
@@ -52,6 +56,8 @@ class FlashSparseImpl(CoreSinkImpl):
         from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 
         if isinstance(self.index_group, HiSparseMLAIndexGroup):
+            # Keep the separately qualified HiSparse reader ABI unchanged.
+            self._hcu_small_head_device = None
             install_hisparse_prewrite_hook(
                 self, self.index_group.cache(self.index_group_index)
             )
@@ -278,6 +284,27 @@ class FlashSparseImpl(CoreSinkImpl):
             and indices.stride(-1) == 1
         )
 
+    def _use_fp8_small_heads(self, q, cache, indices):
+        # The public sparse API takes the real query head count. Qualification
+        # covers gfx938 BF16 Q576 with the contiguous 64-row FP8 cache656 ABI;
+        # other layouts retain Core's padding. No device/env probe during replay.
+        return (
+            self._hcu_small_head_device is not None
+            and q.device == self._hcu_small_head_device
+            and q.ndim == 4 and q.shape[0] == 1 and q.shape[1] > 0
+            and q.shape[2] in (8, 16) and q.shape[3] == 576
+            and q.dtype == torch.bfloat16
+            and self.fp8_decode_padded_heads == 64
+            and cache.device == q.device and cache.dtype == torch.uint8
+            and cache.ndim == 3 and cache.shape[1:] == (64, 656)
+            and cache.is_contiguous()
+            and indices.ndim == 3
+            and indices.shape[:2] == q.shape[:2]
+            and indices.shape[-1] in (512, 2048)
+            and indices.dtype == torch.int32 and indices.device == q.device
+            and indices.stride(-1) == 1
+        )
+
     def _fp8_flash_mla_kernel(
         self,
         q: torch.Tensor,
@@ -292,14 +319,24 @@ class FlashSparseImpl(CoreSinkImpl):
         use_window_prefix = self._use_window_fp8_prefix(
             q, kv_c_and_k_pe_cache, topk_indices
         )
+        use_small_heads = self._use_fp8_small_heads(
+            q, kv_c_and_k_pe_cache, topk_indices
+        )
         heads = q.shape[2]
-        padded = self.fp8_decode_padded_heads
+        padded = heads if use_small_heads else self.fp8_decode_padded_heads
         sinks = self._sinks_for_query(q, 2, padded)
-        if heads < padded:
+        if use_small_heads:
+            # Core's query workspace can retain a padded 64-head row stride.
+            q = q.contiguous()
+            if sinks is not None:
+                sinks = sinks.contiguous()
+        elif heads < padded:
             q = F.pad(q, (0, 0, 0, padded - heads))
         # IndexGroup paths may deliberately omit kernel metadata. A fresh
         # vendor scheduler is valid for sparse decode (no dummy tables needed).
-        if kernel_metadata is None:
+        if kernel_metadata is None or use_small_heads:
+            # Core may already have initialized its shared scheduler for H64
+            # or a different top-k width. Never mutate/reuse it for real heads.
             scheduler, _ = self._hcu_ops.get_metadata()
             table = lengths = None
         else:
@@ -311,7 +348,7 @@ class FlashSparseImpl(CoreSinkImpl):
             # populate only the first 512 columns; preserve the shared 2048
             # source and its scheduler for compressed attention.
             topk_indices = topk_indices[..., :512]
-            if kernel_metadata is not None:
+            if kernel_metadata is not None and not use_small_heads:
                 scheduler, _ = self._hcu_ops.get_metadata()
         result, lse = self._hcu_ops.with_kvcache(
             q=q,

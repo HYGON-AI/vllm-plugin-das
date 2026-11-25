@@ -142,7 +142,8 @@ def setup(monkeypatch):
     def pad(t, values):
         assert values[:3] == (0,0,0)
         return Tensor((*t.shape[:-2], t.shape[-2]+values[3], t.shape[-1]), t.dtype, t.device, t)
-    namespace = {'__package__':package, 'CoreSinkImpl':Core, 'torch':NS(cuda=cuda,device=Device,bfloat16='bfloat16',uint8='uint8',int32='int32'), 'F':NS(pad=pad), 'get_current_vllm_config':lambda:NS(parallel_config=NS(prefill_context_parallel_size=1,decode_context_parallel_size=1)), 'get_flashmla_ops':lambda:provider, 'is_hcu_platform':lambda:True}
+    # Keep these original H64/window-width contracts on the rollback path.
+    namespace = {'fp8_fusions_enabled':lambda:False, '__package__':package, 'CoreSinkImpl':Core, 'torch':NS(cuda=cuda,device=Device,bfloat16='bfloat16',uint8='uint8',int32='int32'), 'F':NS(pad=pad), 'get_current_vllm_config':lambda:NS(parallel_config=NS(prefill_context_parallel_size=1,decode_context_parallel_size=1)), 'get_flashmla_ops':lambda:provider, 'is_hcu_platform':lambda:True}
     module = ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),node],type_ignores=[])
     exec(compile(ast.fix_missing_locations(module),str(source)+'::<actual-class-control-test>','exec'),namespace)
     cls = namespace['FlashSparseImpl']
