@@ -99,6 +99,15 @@ class SelectionTests(unittest.TestCase):
             self.assertIn('--diff-filter=ACMRTUXB', run.call_args.args[0])
             self.assertNotIn('--no-renames', run.call_args.args[0])
 
+    def test_both_device_tiers_run_public_int8_loading_and_graph_contracts(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import test_files
+        expected = {'tests/vllm033/test_aiter_int8_public_hcu.py',
+                    'tests/vllm033/test_aiter_int8_ct_graph_hcu.py'}
+        for tier in ('device', 'device-gfx938'):
+            with self.subTest(tier=tier):
+                self.assertTrue(expected.issubset(test_files(tier)))
+
     def test_result_gate_rejects_skip_xfail_empty_failure_and_error(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         from run_v033_ci import validate_result, test_files

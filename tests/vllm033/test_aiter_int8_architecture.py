@@ -55,8 +55,9 @@ def _scenario_supported(architecture, drift="value"):
              patch.object(torch.cuda, 'current_device', return_value=1), \
              patch.object(torch.cuda, 'get_device_properties', return_value=SimpleNamespace(gcnArchName=architecture)) as properties, \
              patch.object(owner, '_prepare_identity', return_value=(identity, ((chip, 'get_gfx', chip.get_gfx),), chip, os.fsencode(asm_dir))):
-            context = ExtensionContext(adapter_version='0.5.22', vllm_version='0.33.0',
-                requested_capabilities={'hcu-aiter-int8-moe'})
+            # The official explicit backend is sufficient on both HCU targets;
+            # no private capability/entry-point requirement enables this owner.
+            context = ExtensionContext(adapter_version='0.5.22', vllm_version='0.33.0')
             owner.activate(context)
             registered = get_int8_moe_backend('aiter')
             assert registered is not None
@@ -73,6 +74,10 @@ def _scenario_supported(architecture, drift="value"):
             detect.return_value = host.HcuDetection(True, 'gfx942', '')
             assert owner.compile_factor() == factor
             assert oracle.map_int8_backend('triton') is oracle.Int8MoeBackend.TRITON
+            assert oracle._get_priority_backends(config) == [
+                oracle.Int8MoeBackend.TRITON, oracle.Int8MoeBackend.HUMMING,
+                oracle.Int8MoeBackend.CPU,
+            ]
             owner.check_health()
             detect.return_value = host.HcuDetection(True, architecture, '')
             if drift == 'mixed-worker':
