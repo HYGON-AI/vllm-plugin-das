@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 import copy
 import inspect
+import logging
 from types import SimpleNamespace
 import torch
 from ..adapter_api import adapter_module
@@ -18,7 +19,21 @@ from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import kInt4W4A8StaticChannelSym, kInt8DynamicTokenSym
 from vllm.platforms import current_platform
 from .ct_w4a8_hints import expected_m, masked_gemm
-from .ct_w4a8_prepare import HcuCTHTPrepareAndFinalize,HcuCTLLPrepareAndFinalize,DeepEPHTPrepareAndFinalize,DeepEPLLPrepareAndFinalize
+from .ct_w4a8_prepare import (
+    DeepEPHTPrepareAndFinalize,
+    DeepEPLLPrepareAndFinalize,
+    FixedHTExpertTokens,
+    HcuCTHTPrepareAndFinalize,
+    HcuCTLLPrepareAndFinalize,
+)
+
+
+def _accepts_device_count(clamp_quant):
+    try:
+        parameter = inspect.signature(clamp_quant).parameters.get("num_local_tokens_tensor")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
 
 
 @lru_cache(maxsize=1)
@@ -48,6 +63,67 @@ def _require_abi(function,names):
     parameters=inspect.signature(function).parameters
     if any(p.kind==inspect.Parameter.VAR_KEYWORD for p in parameters.values()): return
     if not set(names)<=parameters.keys(): raise RuntimeError('HCU DeepEP provider ABI lacks '+','.join(names))
+
+
+def _fixed_receive_capacity(config, moe, buffer):
+    from ..dsv41.profile_worker import HT_FIXED_CAPACITY_KEY, w4a8_profile_selected
+
+    extra = getattr(config, "additional_config", None) or {}
+    enabled = extra.get(HT_FIXED_CAPACITY_KEY, False)
+    if enabled is False:
+        return None
+    if enabled is not True:
+        raise ValueError(f"{HT_FIXED_CAPACITY_KEY} must be a boolean")
+
+    from ..dsv41.w4a8_profile import routed_token_bound
+
+    parallel = config.parallel_config
+    if (not w4a8_profile_selected(config) or parallel.use_ubatching
+            or parallel.prefill_context_parallel_size not in (4, 8)
+            or moe.moe_parallel_config.ep_size != parallel.prefill_context_parallel_size):
+        raise ValueError("Fixed-capacity W4A8 DeepEP HT requires eager PCP4/EP4 or PCP8/EP8 with rank-local profiling")
+    rdma_ranks = getattr(getattr(buffer, "runtime", None), "get_num_rdma_ranks", None)
+    if not callable(rdma_ranks) or rdma_ranks() != 1:
+        raise ValueError("Fixed-capacity W4A8 DeepEP HT requires a verified intranode buffer")
+    _require_abi(buffer.dispatch, ("num_worst_tokens",))
+    spec = config.speculative_config
+    speculative_tokens = (spec.num_speculative_tokens or 0) if spec else 0
+    scheduler = config.scheduler_config
+    return routed_token_bound(
+        moe.max_num_tokens, scheduler.max_num_seqs, 1 + speculative_tokens,
+        parallel.prefill_context_parallel_size, parallel.pcp_shard_decode_requests,
+    )
+
+
+def _isolated_draft_ht_buffer(manager, hidden):
+    import deep_ep
+
+    options = manager._make_all2all_kwargs()
+    if options["num_rdma_bytes"]:
+        raise ValueError("A separate dSpark HT buffer requires single-node DeepEP")
+
+    # The target's fixed receive path can leave host count metadata that the
+    # draft's dynamic receive would otherwise read on the next dispatch.
+    size_hints = (
+        deep_ep.Buffer.get_dispatch_config(manager.world_size),
+        deep_ep.Buffer.get_combine_config(manager.world_size),
+    )
+    options["num_nvl_bytes"] = max(
+        config.get_nvl_buffer_size_hint(hidden * 2, manager.world_size)
+        for config in size_hints
+    )
+    options["_buffer_owner"] = "dsv41_pcp_draft"
+
+    def create_buffer(*, _buffer_owner, **kwargs):
+        buffer = deep_ep.Buffer(**kwargs)
+        logging.getLogger("vllm." + __name__).info(
+            "HCU dSpark uses a separate DeepEP HT receive buffer: %d bytes",
+            kwargs["num_nvl_bytes"],
+        )
+        return buffer
+
+    # The EP manager owns both buffers and tears them down with the group.
+    return manager.handle_cache.get_or_create(options, create_buffer)
 
 
 def make_prepare(moe,descriptor,routing_tables,config=None):
@@ -91,7 +167,16 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
     if isinstance(native,DeepEPHTPrepareAndFinalize):
         if native.num_dispatchers()!=moe.moe_parallel_config.ep_size:
             raise RuntimeError('DeepEP HT group disagrees with loaded MoE')
-        prepare = HcuCTHTPrepareAndFinalize(native.buffer,native.num_dispatchers(),native.dp_size,native.rank_expert_offset)
+        capacity = _fixed_receive_capacity(config, moe, native.buffer)
+        buffer = native.buffer
+        from ..pcp_dspark_draft import needs_isolated_ht_buffer
+        if needs_isolated_ht_buffer(config):
+            from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+            buffer = _isolated_draft_ht_buffer(get_ep_all2all_manager(), moe.hidden_dim)
+        prepare = HcuCTHTPrepareAndFinalize(
+            buffer, native.num_dispatchers(), native.dp_size,
+            native.rank_expert_offset, fixed_receive_tokens=capacity,
+        )
         from hcu_vllm_das.hy4_ht_int8 import select_prepare
         return select_prepare(prepare, config, moe)
     raise RuntimeError('HCU W4A8 requires a fixed native HT/LL prepare object')
@@ -145,26 +230,63 @@ class _Experts(mk.FusedMoEExpertsModular):
             raise ValueError('HIPC experts require INT8, FP32 token scales and gated SiLU')
 
 
+def contiguous_aligned_rows(tokens, topk, local_experts):
+    alignment = HcuCTContiguousExperts.ALIGNMENT
+    assignments = tokens * topk
+    padding = min(assignments, local_experts) * (alignment - 1)
+    return (assignments + padding + alignment - 1) // alignment * alignment
+
+
+def contiguous_workspace_shapes(tokens, aligned_rows, gate_width, hidden_width):
+    # workspace13 is allocated in the output dtype and viewed as INT8 for
+    # both permutation and activation. Count pairs of INT8 values per slot.
+    int8_width = max(hidden_width, gate_width // 2)
+    packed_width = (int8_width + 1) // 2
+    return (
+        (aligned_rows, packed_width),
+        (aligned_rows, max(gate_width, hidden_width)),
+        (tokens, hidden_width),
+    )
+
+
+def _aligned_expert_row_count(counts, alignment):
+    # ep_scatter writes a prefix of independently aligned expert segments.
+    padded = torch.bitwise_and(counts + alignment - 1, -alignment)
+    return padded.sum(dtype=torch.int32).view(1)
+
+
 class HcuCTContiguousExperts(_Experts):
     ALIGNMENT=256
     def __init__(self,moe,quant,weights,ops):
         super().__init__(moe,quant);self.weights=weights;self.ops=ops
         self._gather = deepgemm_unpermute_and_reduce
+        self._clamp_accepts_device_count = _accepts_device_count(ops.clamp_quant)
         from .clamped_int8_admission import admitted
         self._live_row_activation = admitted(ops, weights, self.w1_scale,
             self.w2_scale, quant.gemm1_clamp_limit, masked=False)
     @staticmethod
     def activation_format(): return mk.FusedMoEActivationFormat.Standard
     def finalize_weight_and_reduce_impl(self): return TopKWeightAndReduceNoOP()
+    def _aligned_rows(self, tokens, topk, local_experts, metadata):
+        if isinstance(metadata, FixedHTExpertTokens):
+            return contiguous_aligned_rows(tokens, topk, local_experts)
+        return compute_aligned_M(
+            M=tokens, num_topk=topk, local_num_experts=local_experts,
+            alignment=self.ALIGNMENT, expert_tokens_meta=metadata,
+        )
+
     def workspace_shapes(self,M,N,K,topk,global_num_experts,local_num_experts,expert_tokens_meta,activation):
-        aligned=compute_aligned_M(M=M,num_topk=topk,local_num_experts=local_num_experts,alignment=256,expert_tokens_meta=expert_tokens_meta)
-        return (aligned,max(N//2,K)),(aligned,max(N,K)),(M,K)
+        aligned = self._aligned_rows(M, topk, local_num_experts, expert_tokens_meta)
+        return contiguous_workspace_shapes(M, aligned, N, K)
     def apply(self,output,hidden_states,w1,w2,topk_weights,topk_ids,activation,global_num_experts,expert_map,
               a1q_scale,a2_scale,workspace13,workspace2,expert_tokens_meta,apply_router_weight_on_input):
         if hidden_states.shape[0]==0: return
         self._check(hidden_states,a1q_scale,activation)
         e,m,n,k,topk=self.moe_problem_size(hidden_states,w1,w2,topk_ids)
-        aligned=compute_aligned_M(M=m,num_topk=topk,local_num_experts=e,alignment=256,expert_tokens_meta=expert_tokens_meta)
+        aligned = self._aligned_rows(m, topk, e, expert_tokens_meta)
+        if isinstance(expert_tokens_meta, FixedHTExpertTokens):
+            # DeepEP returns local physical IDs after any EPLB remapping.
+            expert_map = None
         workspace=_resize_cache(workspace13.view(dtype=torch.int8),(aligned,k))
         data,scale,indices,inverse,_=deepgemm_moe_permute(aq=hidden_states,aq_scale=a1q_scale,
             topk_ids=topk_ids,local_num_experts=e,expert_map=expert_map,expert_tokens_meta=expert_tokens_meta,
@@ -174,7 +296,13 @@ class HcuCTContiguousExperts(_Experts):
         self.ops.gemm_contiguous((data,scale),(self.weights[0],self.w1_scale),gateup,indices)
         qout=_resize_cache(workspace13.view(dtype=torch.int8),(aligned,n//2))
         limit=self.quant_config.gemm1_clamp_limit
-        if self._live_row_activation:
+        if (isinstance(expert_tokens_meta, FixedHTExpertTokens)
+                and limit is not None and limit > 0 and self._clamp_accepts_device_count):
+            active_rows = _aligned_expert_row_count(expert_tokens_meta.expert_num_tokens, self.ALIGNMENT)
+            mid, ms = self.ops.clamp_quant(
+                gateup, limit=limit, output=qout, num_local_tokens_tensor=active_rows,
+            )
+        elif self._live_row_activation:
             from .clamped_int8_triton import clamped_int8_2304
             mid,ms=clamped_int8_2304(gateup,indices,masked=False,output=qout)
         elif limit is not None and limit>0:

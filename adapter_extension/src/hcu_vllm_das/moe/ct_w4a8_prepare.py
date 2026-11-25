@@ -1,12 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 """Owned public DeepEP prepare adapters; official classes remain unchanged."""
 from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
 import torch
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
 from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import DeepEPLLPrepareAndFinalize
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input, normalize_batched_scales_shape
-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.model_executor.layers.fused_moe.utils import (
+    count_expert_num_tokens,
+    moe_kernel_quantize_input,
+    normalize_batched_scales_shape,
+)
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
+
+
+_fixed_ht_batch_capacity: ContextVar[int | None] = ContextVar(
+    "w4a8_fixed_ht_batch_capacity", default=None,
+)
+
+
+@contextmanager
+def fixed_ht_batch_capacity(capacity):
+    token = _fixed_ht_batch_capacity.set(capacity)
+    try:
+        yield
+    finally:
+        _fixed_ht_batch_capacity.reset(token)
+
+
+class FixedHTExpertTokens(mk.ExpertTokensMetadata):
+    """Receive routes and counts are indexed by the local physical expert."""
 
 
 def _check_quant(config):
@@ -15,14 +39,29 @@ def _check_quant(config):
 
 
 class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
-    """Inherit native transport/finalize; quantize tokens after dispatch."""
+    """DeepEP HT with receiver-side INT8 quantization and native combine."""
+
+    def __init__(self, *args, fixed_receive_tokens=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fixed_receive_tokens = fixed_receive_tokens
+
     def prepare_async(self, a1, topk_weights, topk_ids, num_experts, expert_map,
                       apply_router_weight_on_input, quant_config, defer_input_quant=False):
         _check_quant(quant_config)
         if defer_input_quant:
             raise ValueError('HCU CT experts consume quantized inputs')
-        receiver = super().prepare_async(a1, topk_weights, topk_ids, num_experts,
-            expert_map, apply_router_weight_on_input, quant_config, defer_input_quant=True)
+        batch_capacity = _fixed_ht_batch_capacity.get()
+        if self.fixed_receive_tokens is None or batch_capacity is None:
+            receiver = super().prepare_async(a1, topk_weights, topk_ids, num_experts,
+                expert_map, apply_router_weight_on_input, quant_config, defer_input_quant=True)
+        else:
+            if not 0 < batch_capacity <= self.fixed_receive_tokens:
+                raise ValueError("W4A8 DeepEP HT batch exceeds the profiled receive capacity")
+            receiver = self._dispatch_fixed(
+                a1, topk_weights, topk_ids, num_experts, apply_router_weight_on_input,
+                batch_capacity,
+            )
+
         def receive():
             x, _, meta, ids, weights = receiver()
             if x.shape[0] == 0:
@@ -35,6 +74,59 @@ class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
             if q.dtype != torch.int8 or scale.dtype != torch.float32 or scale.device != q.device or tuple(scale.shape) != (q.shape[0], 1):
                 raise RuntimeError('HCU HT did not produce INT8 and per-token scales')
             return q, scale, meta, ids, weights
+        return receive
+
+    def _dispatch_fixed(self, a1, topk_weights, topk_ids, num_experts,
+                        apply_router_weight_on_input, capacity):
+        if dbo_enabled():
+            raise RuntimeError("Fixed-capacity W4A8 DeepEP HT requires a single ubatch")
+        if apply_router_weight_on_input:
+            if topk_ids.size(1) != 1:
+                raise ValueError("router weighting on input requires topk=1")
+            a1 = a1 * topk_weights.to(a1.dtype)
+
+        # Fixed receive capacity skips the host count read. Let DeepEP place
+        # the communication dependency on the caller's stream for buffer reuse.
+        per_rank, per_rdma, per_expert, to_rank, layout_event = (
+            self.buffer.get_dispatch_layout(
+                topk_idx=topk_ids, num_experts=num_experts, async_finish=False,
+            )
+        )
+        x, local_ids, weights, _, handle, event = self.buffer.dispatch(
+            x=a1,
+            num_tokens_per_rank=per_rank,
+            num_tokens_per_rdma_rank=per_rdma,
+            is_token_in_rank=to_rank,
+            num_tokens_per_expert=per_expert,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            expert_alignment=1,
+            num_worst_tokens=capacity,
+            config=self._get_dispatch_config(),
+            previous_event=layout_event,
+            async_finish=False,
+        )
+        if handle is None:
+            raise RuntimeError("Fixed-capacity DeepEP HT requires a combine handle")
+        self.handles[dbo_current_ubatch_id()] = handle
+
+        def receive():
+            if event.event is not None:
+                event.current_stream_wait()
+            shape = (capacity, topk_ids.size(1))
+            if (tuple(x.shape) != (capacity, a1.size(1))
+                    or local_ids is None or tuple(local_ids.shape) != shape
+                    or weights is None or tuple(weights.shape) != shape):
+                raise RuntimeError("DeepEP HT returned an incompatible fixed receive layout")
+            # The fixed path may return no host counts. DeepEP fills the
+            # unused route slots with -1. Count only live local routes.
+            local_experts = num_experts // self.num_dispatchers()
+            counts = count_expert_num_tokens(local_ids, local_experts, None)
+            # DeepEP does not initialize the payload in unused receive
+            # rows. Give the per-token quantizer defined input there.
+            x.masked_fill_((local_ids == -1).all(dim=1, keepdim=True), 0)
+            return x, None, FixedHTExpertTokens(counts, None), local_ids, weights
+
         return receive
 
 

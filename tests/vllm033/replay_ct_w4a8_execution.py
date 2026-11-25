@@ -40,11 +40,17 @@ class Buffer:
     def dispatch(self, x, topk_idx, topk_weights, **kwargs):
         assert isinstance(x,torch.Tensor) and x.dtype==torch.bfloat16
         self.calls.append('ht_dispatch')
+        if capacity := kwargs.get('num_worst_tokens'):
+            padding = capacity - x.size(0)
+            return (F.pad(x, (0, 0, 0, padding), value=float('nan')),
+                    F.pad(topk_idx, (0, 0, 0, padding), value=-1),
+                    F.pad(topk_weights, (0, 0, 0, padding)),
+                    [], ('ht', x.size(0)), Event())
         return x, topk_idx, topk_weights, [x.shape[0]]*2, ('ht',), Event()
     def combine(self, x, handle, **kwargs):
-        assert handle == ('ht',)
+        assert handle[0] == 'ht'
         self.calls.append('ht_combine')
-        return x, None, Event()
+        return (x[:handle[1]] if len(handle) == 2 else x), None, Event()
     def low_latency_dispatch(self, x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank,
                              num_experts, quant_type=1, quant_group_size=0, fp8_round_scale=False,
                              async_finish=False, return_recv_hook=False):
@@ -206,7 +212,7 @@ def native_factory(moe,quant_config,routing_tables=None,allow_new_interface=Fals
     return DeepEPHTPrepareAndFinalize(buffer,moe.moe_parallel_config.ep_size,moe.dp_size,0)
 
 
-def pipeline(mode):
+def pipeline(mode, fixed=False):
     required(); config,moe=context(mode)
     ops=Ops()
     with ExitStack() as stack:
@@ -216,6 +222,12 @@ def pipeline(mode):
         stack.enter_context(patch.object(prepare_module.HcuCTLLPrepareAndFinalize,'SUPPORTED_HIDDEN_SIZES',[H]))
         stack.enter_context(patch.object(runtime,'deepgemm_moe_permute',side_effect=permutation))
         stack.enter_context(patch.object(runtime,'deepgemm_unpermute_and_reduce',side_effect=unpermute))
+        if fixed:
+            stack.enter_context(patch.object(runtime, '_fixed_receive_capacity', return_value=8))
+            def count_on_cpu(ids, experts, expert_map):
+                assert expert_map is None
+                return torch.stack([(ids == expert).sum(dtype=torch.int32) for expert in range(experts)])
+            stack.enter_context(patch.object(prepare_module, 'count_expert_num_tokens', side_effect=count_on_cpu))
         def token_quant(x,scale,quant_dtype,per_act_token_quant,block_shape,**kwargs):
             assert quant_dtype==torch.int8 and per_act_token_quant and block_shape is None
             return quantize(x)
@@ -240,7 +252,8 @@ def pipeline(mode):
         assert isinstance(method.moe_kernel,mk.FusedMoEKernel) and method.supports_internal_mk
         x=(torch.arange(3*H).reshape(3,H).remainder(13).float()/32).to(torch.bfloat16)
         ids=torch.tensor([[0,1]]*3,dtype=torch.int64);weights=torch.tensor([[0.25,0.75]]*3)
-        actual=method.apply(layer,x,weights,ids,None,None)
+        with prepare_module.fixed_ht_batch_capacity(8 if fixed else None):
+            actual=method.apply(layer,x,weights,ids,None,None)
         qx,sx=quantize(x); reference=torch.zeros((3,H),dtype=torch.float32)
         for e in range(E):
             q1=torch.cat((logical[e,'w1'][0],logical[e,'w3'][0]),0)
@@ -284,6 +297,7 @@ def main():
     case('actual_selector_and_model_scope',selector)
     case('native_modular_LL_pipeline_and_exact_reference',lambda:pipeline('deepep_low_latency'))
     case('native_modular_HT_pipeline_and_exact_reference',lambda:pipeline('deepep_high_throughput'))
+    case('fixed_modular_HT_pipeline_and_exact_reference',lambda:pipeline('deepep_high_throughput', fixed=True))
     def topology():
         required()
         for dp in (1,4,8,16):
