@@ -208,9 +208,9 @@ def validate_flash_quant_parallelism(vllm_config, *, enable_eplb=False):
 def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
     """Compose real Core CT and model-local W4A8; never register a quant method.
 
-    Dense/DFly linears retain Core CT. CT FP8 retains Core's own weight loader,
-    backend selection and apply; unsupported platform kernels fail at that real
-    boundary. W4A8 is explicit opt-in eager HCU only, not a native Core claim.
+    Dense/DFly linears retain Core CT. Explicit AITER channel-FP8 experts use
+    a model-local CT copy and the official loader/modular runner. Auto/Triton
+    retain Core selection. W4A8 remains explicit eager HCU only.
     """
     backend = getattr(config, "flash_w4a8_backend", "disabled")
     if backend not in ("disabled", "adapter_reference"):
@@ -264,11 +264,27 @@ def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
                 "Channel W4A8 requires HCU and flash_w4a8_backend=adapter_reference"
             )
         if not get_current_vllm_config().model_config.enforce_eager:
-            raise NotImplementedError("Channel W4A8 reference requires eager TP-only execution")
+            raise NotImplementedError(
+                "Channel W4A8 reference requires eager TP-only execution"
+            )
         if for_moe:
             from .w4a8 import HYV4FlashW4A8Config
 
             return HYV4FlashW4A8Config.for_moe(quant_config)
     elif backend != "disabled":
         raise ValueError("adapter_reference requires serialized channel W4A8 CT")
+    current = get_current_vllm_config()
+    if (
+        for_moe
+        and family == "fp8"
+        and isinstance(quant_config, CompressedTensorsConfig)
+        and getattr(getattr(current, "kernel_config", None), "moe_backend", "auto")
+        == "aiter"
+    ):
+        from .aiter_fp8_moe import HYV4FlashAiterFP8Config
+
+        return HYV4FlashAiterFP8Config.for_moe(
+            quant_config,
+            use_shuffle=getattr(config, "flash_aiter_moe_use_shuffle", True),
+        )
     return quant_config
