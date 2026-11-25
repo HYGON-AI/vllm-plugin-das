@@ -201,3 +201,13 @@ def bind_shared_expert_fp8(config, moe):
             or getattr(shared.forward, "__func__", None) is not DeepseekV4MLP.forward):
         return False
     return install_shared_activation(shared)
+
+
+def bind_dspark_shared_experts_fp8(config, model):
+    """Bind each native draft MLP without changing draft routing or transport."""
+    count = sum(bind_shared_expert_fp8(config, layer.ffn)
+                for layer in model.layers)
+    if count:
+        logger.info("Channel-FP8 DSpark shared activation: %d/%d layers",
+                    count, len(model.layers))
+    return count

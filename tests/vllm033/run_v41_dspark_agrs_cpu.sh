@@ -11,5 +11,7 @@ export CUDA_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES=
 export HCU_ADAPTER_HOST=none VLLM_PLUGINS=__disabled__ VLLM_TARGET_DEVICE=cpu
 export VLLM_NO_USAGE_STATS=1 PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_TARGET_ROOT="${draft_core}"
-export PYTHONPATH="${draft_core}:${draft_adapter}:${draft_repo}/adapter_extension/src"
+# A wheel's site-packages directory can also contain older Adapter/Plugin
+# installations. Prefer the worktrees under test before the native Core root.
+export PYTHONPATH="${draft_repo}/adapter_extension/src:${draft_adapter}:${draft_core}"
 "${VLLM_TEST_PYTHON}" -B "${draft_repo}/tests/vllm033/replay_v41_dspark_agrs.py" "${draft_output}/report.json" 2>&1 | tee "${draft_output}/replay.log"
