@@ -205,12 +205,65 @@ def validate_flash_quant_parallelism(vllm_config, *, enable_eplb=False):
         )
 
 
+def validate_w4a8_execution(vllm_config):
+    """Return Graph admission; preserve ordinary-TP eager execution.
+
+    Reuse the same scoped configuration predicate as the model Graph banks.
+    This is an admission check, not evidence of model numerical acceptance.
+    """
+    validate_flash_quant_parallelism(vllm_config)
+    if vllm_config.model_config.enforce_eager:
+        return False
+    from vllm.compilation.breakable_cudagraph import (
+        is_breakable_cudagraph_enabled,
+    )
+    from .fullgraph_runner import is_qualified_config
+
+    if not is_qualified_config(
+        vllm_config, breakable=is_breakable_cudagraph_enabled()
+    ):
+        raise NotImplementedError(
+            "Channel W4A8 Graph execution requires the qualified Flash "
+            "V2 TP4 DFly5 FULL_AND_PIECEWISE configuration"
+        )
+    return True
+
+
+def _validate_aiter_w4a8_weight_residency(vllm_config):
+    """Return the public raw migration mode; reject unqualified transports."""
+    offload = getattr(vllm_config, "offload_config", None)
+    if offload is None:
+        return False
+    backend = offload.offload_backend
+    uva_active = backend in ("auto", "uva") and offload.uva.cpu_offload_gb > 0
+    prefetch_active = (
+        backend in ("auto", "prefetch")
+        and offload.prefetch.offload_group_size > 0
+    )
+    if prefetch_active:
+        raise NotImplementedError(
+            "AITER W4A8 CPU weight offload does not support prefetch yet"
+        )
+    if uva_active:
+        from vllm import envs
+
+        if not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA:
+            raise NotImplementedError(
+                "AITER W4A8 CPU weight offload requires "
+                "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1; UVA is not supported yet"
+            )
+        return True
+    return False
+
+
 def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
     """Compose real Core CT and model-local W4A8; never register a quant method.
 
     Dense/DFly linears retain Core CT. Explicit AITER channel-FP8 experts use
     a model-local CT copy and the official loader/modular runner. Auto/Triton
-    retain Core selection. W4A8 remains explicit eager HCU only.
+    retain Core selection. Explicit AITER W4A8 admits the original checkpoint
+    metadata; the exact CT reference retains its experimental opt-in. Both
+    preserve ordinary TP eager or qualified HCU Graph admission.
     """
     backend = getattr(config, "flash_w4a8_backend", "disabled")
     if backend not in ("disabled", "adapter_reference"):
@@ -225,7 +278,8 @@ def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
     )
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    validate_flash_quant_parallelism(get_current_vllm_config())
+    current = get_current_vllm_config()
+    validate_flash_quant_parallelism(current)
     if isinstance(quant_config, Fp8Config):
         if not quant_config.is_checkpoint_fp8_serialized:
             raise ValueError("Flash FP8 requires a serialized checkpoint")
@@ -259,21 +313,30 @@ def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
     if family == "channel_w4a8":
         from .runtime import is_hcu_platform
 
-        if backend != "adapter_reference" or not is_hcu_platform():
+        aiter_requested = (
+            getattr(getattr(current, "kernel_config", None), "moe_backend", "auto")
+            == "aiter"
+        )
+        if not is_hcu_platform() or (
+            backend != "adapter_reference" and not aiter_requested
+        ):
             raise ValueError(
-                "Channel W4A8 requires HCU and flash_w4a8_backend=adapter_reference"
+                "Channel W4A8 requires HCU and explicit --moe-backend aiter "
+                "or flash_w4a8_backend=adapter_reference"
             )
-        if not get_current_vllm_config().model_config.enforce_eager:
-            raise NotImplementedError(
-                "Channel W4A8 reference requires eager TP-only execution"
-            )
+        if aiter_requested:
+            _validate_aiter_w4a8_weight_residency(current)
+        validate_w4a8_execution(current)
         if for_moe:
+            if aiter_requested:
+                from .aiter_w4a8_moe import HYV4FlashAiterW4A8Config
+
+                return HYV4FlashAiterW4A8Config.for_moe(quant_config)
             from .w4a8 import HYV4FlashW4A8Config
 
             return HYV4FlashW4A8Config.for_moe(quant_config)
     elif backend != "disabled":
         raise ValueError("adapter_reference requires serialized channel W4A8 CT")
-    current = get_current_vllm_config()
     if (
         for_moe
         and family == "fp8"

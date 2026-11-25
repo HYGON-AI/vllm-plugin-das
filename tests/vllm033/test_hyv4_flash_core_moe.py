@@ -693,7 +693,7 @@ def test_quant_config_is_prepared_for_dense_and_moe(monkeypatch):
 
 
 @pytest.mark.parametrize("eager", [False,True])
-def test_channel_w4a8_requires_eager_at_quantization_boundary(monkeypatch,eager):
+def test_channel_w4a8_checks_execution_at_quantization_boundary(monkeypatch,eager):
     h = _Harness(monkeypatch)
     current = SimpleNamespace(parallel_config=h.parallel,lora_config=None,
                               model_config=SimpleNamespace(enforce_eager=eager))
@@ -711,11 +711,21 @@ def test_channel_w4a8_requires_eager_at_quantization_boundary(monkeypatch,eager)
     runtime=ModuleType("hcu_vllm_das.models.hy_v4_flash.runtime")
     runtime.is_hcu_platform=lambda:True
     monkeypatch.setitem(sys.modules,runtime.__name__,runtime)
+    # The real shared configuration predicate is CPU-only; only the external
+    # breakable switch is isolated in this source-loaded composition harness.
+    name="hcu_vllm_das.models.hy_v4_flash.fullgraph_runner"
+    spec=importlib.util.spec_from_file_location(name,ACTIVE.parent/"fullgraph_runner.py")
+    graph=importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules,name,graph)
+    spec.loader.exec_module(graph)
+    breakable=ModuleType("vllm.compilation.breakable_cudagraph")
+    breakable.is_breakable_cudagraph_enabled=lambda:False
+    monkeypatch.setitem(sys.modules,breakable.__name__,breakable)
     config=_config(flash_w4a8_backend="adapter_reference")
     if eager:
         assert h.quantization.prepare_flash_quant_config(config,quant) is quant
     else:
-        with pytest.raises(NotImplementedError,match="eager"):
+        with pytest.raises(NotImplementedError,match="FULL_AND_PIECEWISE"):
             h.quantization.prepare_flash_quant_config(config,quant)
 
 

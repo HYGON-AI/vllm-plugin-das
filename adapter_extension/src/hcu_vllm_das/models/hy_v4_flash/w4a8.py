@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Eager TP-only CT channel INT4 / token INT8 method for actual Core033.
+"""Ordinary-TP CT channel INT4 / token INT8 method for actual Core033.
 
 Core's RoutedExperts and MoERunner retain loader, router, shared-expert and TP
 reduction ownership. Only packed expert arithmetic is Adapter-owned. No marker,
@@ -23,6 +23,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from .quantization import (
     validate_channel_w4a8_config,
     validate_flash_quant_parallelism,
+    validate_w4a8_execution,
 )
 
 
@@ -240,6 +241,9 @@ class HYV4FlashChannelW4A8Method(FusedMoEMethodBase):
             raise ValueError(
                 "Channel W4A8 supports little-endian BF16 SiLU ordinary-TP experts only"
             )
+        # Core only guarantees the current config during construction, not
+        # when this opaque MoE method executes during Graph capture/replay.
+        self._graph_admitted = validate_w4a8_execution(get_current_vllm_config())
         self.hidden, self.intermediate = hidden_size, intermediate_size_per_partition
         attrs = dict(extra_weight_attrs, is_transposed=False, quant_method="channel")
         shapes = {
@@ -298,8 +302,8 @@ class HYV4FlashChannelW4A8Method(FusedMoEMethodBase):
             raise RuntimeError("W4A8 weights must be processed after real CT loading")
         if x.dtype != torch.bfloat16 or x.device.type != "cuda":
             raise ValueError("Channel W4A8 apply requires device BF16 activations")
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Channel W4A8 model Graph execution is not qualified")
+        if torch.cuda.is_current_stream_capturing() and not self._graph_admitted:
+            raise RuntimeError("Channel W4A8 eager configuration cannot capture a Graph")
         # Core runs shared experts outside apply and owns final TP reduction.
         # Byte views are recreated, not copied/cached across layer device moves.
         return routed_reference(
