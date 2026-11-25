@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Instance-owned Channel-FP8 router projection; native selection is unchanged."""
 from types import MethodType
-import os
 
 import torch
 
 from ..adapter_api import optional_adapter_module
+from ..environment import fp8_fusions_enabled
 
 
 def _eligible(gate):
@@ -51,7 +51,7 @@ def _eligible_bound(gate):
 
 def bind_router(config, moe):
     """Bind at the existing owned decoder seam without changing Core classes."""
-    if os.getenv('VLLM_HCU_USE_CUSTOM_OPS', '1').lower() in ('0','false','off'):
+    if not fp8_fusions_enabled():
         return False
     p = config.parallel_config
     if (p.tensor_parallel_size != 1 or p.prefill_context_parallel_size != 1
