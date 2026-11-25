@@ -75,7 +75,7 @@ class HYV4DFlyQuantizationConfig(CompressedTensorsConfig):
         if scheme is not None:
             weights = scheme["weights"]
             if not isinstance(weights, QuantizationArgs) or weights.num_bits != 8:
-                raise ValueError("HYV4 DFly draft layers require BF16 or supported W8A8 FP8")
+                raise ValueError("HYV4 DFly draft layers require BF16 or supported W8A8 FP8/INT8")
         return scheme
 
 
@@ -353,7 +353,9 @@ class HYV4DFlyForCausalLM(nn.Module):
         super().__init__()
         if not (is_hcu_platform() or current_platform.is_cuda()):
             raise NotImplementedError("HYV4 DFly requires the HCU/CUDA runtime")
-        self.model = HYV4DFlyModel(vllm_config, maybe_prefix(prefix, "model"))
+        self.model = HYV4DFlyModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         self.config = self.model.config
         self.has_own_embed_tokens = False
         self.lm_head: ParallelLMHead | None = None
@@ -410,6 +412,10 @@ class HYV4DFlyForCausalLM(nn.Module):
             dtype = (
                 param.dtype
                 if param.dtype == torch.float8_e4m3fn
+                # CT W8A8 serializes dense/DFly linear weights as INT8.
+                # Preserve that storage contract, but do not relax norm,
+                # sink or other non-weight checkpoint dtype checks.
+                or (param.dtype == torch.int8 and name.endswith(".weight"))
                 or name.endswith((".weight_scale", ".weight_scale_inv"))
                 else torch.bfloat16
             )
@@ -490,13 +496,13 @@ class HYV4DFlyForCausalLM(nn.Module):
                                     CompressedTensorsConfig,
                                 )
                                 and required.get(name.removesuffix("_scale"))
-                                == torch.float8_e4m3fn
+                                in (torch.int8, torch.float8_e4m3fn)
                             )
                         )
                     ):
-                        # CT may retain the original BF16 dtype for FP8 linear
-                        # scales. Promote only these scales to Core's FP32 ABI;
-                        # keep non-scale parameters under strict dtype checks.
+                        # CT can retain BF16 channel scales for INT8/FP8
+                        # linears. Promote losslessly to Core's FP32 scale ABI,
+                        # without relaxing dtype checks on arbitrary tensors.
                         weight = weight.float()
                     if weight.dtype != required[name]:
                         raise ValueError(

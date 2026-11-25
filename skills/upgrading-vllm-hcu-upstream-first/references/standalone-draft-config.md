@@ -73,3 +73,18 @@ large integer seeds, caller-input reuse and stable destination addresses.
 the helper. It does not establish async transfers, device Graph replay, accepted
 draft tokens or MTP throughput; keep those gates separate before retiring any
 remaining performance requirement.
+# Model-family delivery
+
+A model port can pass the active package's boundary tests while all changed
+model code remains outside its wheel. Pre-merge the current target locally and
+inspect the actual wheel payload, installed entry points, real framework
+registry and CI selection for the new feature outside the repository. Do not
+restore a retired root package or add source fallbacks to hide missing delivery.
+
+Register missing metadata with public AutoConfig where appropriate, using a
+capability named for configuration parsing. Preflight all new names before
+publication; preserve official configs, refuse foreign owners and latch partial
+publication failures. Test actual Core `get_config`, nested/flat multimodal
+configs, serialization, geometry validation and fork/spawn discovery from an
+installed wheel. Passing those checks does not establish model registration,
+tokenizer/processor behavior, weights, attention, device accuracy or lifecycle.

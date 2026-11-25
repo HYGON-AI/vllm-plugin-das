@@ -5,6 +5,7 @@
 import math
 from collections.abc import Mapping
 from dataclasses import replace
+from fractions import Fraction
 from functools import partial
 
 import torch
@@ -68,47 +69,136 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
 
     def get_image_size_with_most_features(self):
         processor = self.get_hf_processor().image_processor
+        config = self.get_hf_config().vision_config
+        newline = int(config.use_image_newline_token)
         options = self._merge_and_resolve_mm_processor_kwargs({}).get(
             "images_kwargs", {}
         )
         factor = processor.patch_size * processor.merge_size
         maximum = options.get("max_pixels", processor.size["longest_edge"])
         minimum = options.get("min_pixels", processor.size["shortest_edge"])
-        if min(factor, minimum) <= 0 or maximum < minimum:
-            raise ValueError("Image pixel limits must be positive and ordered")
-        cells = max(1, maximum // factor**2)
-        config = self.get_hf_config().vision_config
+        cells = maximum // factor**2
+        if cells < 1 or minimum <= 0 or maximum < minimum:
+            raise ValueError("No image shape satisfies pixel bounds and patch alignment")
         max_edge = None
-        if config.use_2d_rope:
+        if getattr(config, "use_2d_rope", False):
             # Cache positions index raw patches, before the spatial merger.
             max_edge = (config.max_image_size // config.patch_size + 1) // (
                 processor.merge_size
             )
-        candidates = []
-        row_limit = math.isqrt(cells * 200)
+            if max_edge < 1:
+                raise ValueError("No image shape fits the vision 2D RoPE cache")
+        if not options.get("do_resize", getattr(processor, "do_resize", True)):
+            # No resize checks alignment/max_pixels, not aspect/min_pixels.
+            if max_edge is None:
+                return ImageSize(width=factor, height=cells * factor)
+            _, rows, cols = max(
+                (rows * (min(cells // rows, max_edge) + newline),
+                 rows, min(cells // rows, max_edge))
+                for rows in range(1, min(cells, max_edge) + 1)
+            )
+            return ImageSize(width=cols * factor, height=rows * factor)
+
+        best = None
+
+        def consider(height, width):
+            nonlocal best
+            h, w = smart_resize(height, width, factor, minimum, maximum)
+            # Raw witnesses may be unaligned or larger than the cache.
+            # Only the actual public resize output indexes its positions.
+            if max_edge is not None and (
+                h // factor > max_edge or w // factor > max_edge
+            ):
+                return
+            score = (h // factor) * (w // factor + newline)
+            candidate = (score, h, w, height, width)
+            if best is None or candidate[:3] > best[:3]:
+                best = candidate
+
+        def rounding_interval(count):
+            low = max(1, math.ceil((count - 0.5) * factor))
+            high = math.floor((count + 0.5) * factor)
+            # Python round uses ties-to-even, including the one-cell edge.
+            if round(low / factor) != count:
+                low += 1
+            if round(high / factor) != count:
+                high -= 1
+            return low, high
+
+        def consider_downscale(ratio):
+            height, width = ratio.numerator, ratio.denominator
+            scale = max(1, math.isqrt(maximum // (height * width)))
+            while (round(height * scale / factor) * round(width * scale / factor)
+                   * factor**2 <= maximum):
+                scale += 1
+            try:
+                consider(height * scale, width * scale)
+            except ValueError:
+                # Clamping a short axis to one cell can exceed max_pixels
+                # at an extreme ratio. The real processor rejects that input.
+                pass
+
+        # Nearest rounding checks aspect on the INPUT, not the aligned output.
+        # For each output row count only its largest reachable column count
+        # can maximize rows * (cols + newline). The slack bounds the search;
+        # it does not impose a new limit on requests.
+        extent = min(cells, math.isqrt(cells * 200) + 201)
         if max_edge is not None:
-            row_limit = min(row_limit, max_edge)
-        for rows in range(1, row_limit + 1):
-            cols = min(cells // rows, rows * 200)
+            extent = min(extent, max_edge)
+        for rows in range(1, extent + 1):
+            low_h, high_h = rounding_interval(rows)
+            cols = min(cells // rows, round(200 * high_h / factor))
             if max_edge is not None:
                 cols = min(cols, max_edge)
-            if cols and rows <= cols * 200:
-                try:
-                    height, width = smart_resize(
-                        rows * factor, cols * factor, factor, minimum, maximum
-                    )
-                except ValueError:
-                    # A candidate's minimum-area rounding may exceed max_pixels;
-                    # discard that shape, not otherwise valid user inputs.
-                    continue
-                if max_edge is not None and max(height, width) > max_edge * factor:
-                    continue
-                candidates.append(
-                    (height // factor * (width // factor + 1), height, width)
-                )
-        if not candidates:
-            raise ValueError("Image pixel limits cannot fit the vision 2D RoPE cache")
-        _, height, width = max(candidates)
+            if not cols or rows * cols * factor**2 < minimum:
+                continue
+            if max(rows, cols) <= 200 * min(rows, cols):
+                consider(rows * factor, cols * factor)
+                continue
+            low_w, high_w = rounding_interval(cols)
+            height = max(low_h, math.ceil(low_w / 200))
+            width = max(low_w, math.ceil(height / 200))
+            if height <= high_h and width <= high_w:
+                consider(height, width)
+
+        # Downscaling floors both axes and may return fewer than min_pixels.
+        # Its normalized axes are sqrt(area * ratio), sqrt(area / ratio).
+        # For each row count, intersect their floor intervals with [1/200,200]
+        # and choose an integer input ratio strictly inside. Upscaling needs no
+        # extra search: ceil preserves this integer aspect limit, so every
+        # accepted upscaled grid was already covered by the aligned candidates.
+        area = Fraction(maximum, factor**2)
+        edge = math.isqrt(maximum * 200) // factor
+        # The original aspect endpoints are closed. At a nonintegral cell
+        # budget an endpoint can supply the unique maximal floor grid.
+        for ratio in (Fraction(1, 200), Fraction(200)):
+            consider_downscale(ratio)
+        if max_edge is not None:
+            edge = min(edge, max_edge)
+        for rows in range(1, min(cells, edge) + 1):
+            cols = min(cells // rows, edge)
+            lower = max(Fraction(1, 200),
+                        Fraction(rows**2, 1) / area if rows > 1 else 0,
+                        area / (cols + 1)**2)
+            upper = min(Fraction(200), Fraction((rows + 1)**2, 1) / area,
+                        area / cols**2 if cols > 1 else 200)
+            if lower >= upper:
+                # Single-point intervals were covered by aligned inputs or
+                # the closed aspect endpoints above.
+                continue
+            middle = (lower + upper) / 2
+            denominator = 1
+            ratio = middle.limit_denominator(denominator)
+            while not lower < ratio < upper:
+                denominator *= 2
+                ratio = middle.limit_denominator(denominator)
+            consider_downscale(ratio)
+
+        if best is None:
+            if max_edge is not None:
+                raise ValueError("No image shape fits the vision 2D RoPE cache")
+            raise ValueError("No image shape satisfies pixel bounds and patch alignment")
+        _, _, _, height, width = best
         return ImageSize(width=width, height=height)
 
     def get_dummy_video_shape(
@@ -313,12 +403,24 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
     def get_mm_max_tokens_per_item(self, seq_len, mm_counts):
         config = self.get_hf_config().vision_config
         size = self.get_image_size_with_most_features()
+        processor = self.get_hf_processor()
+        image = processor.image_processor
+        image_options = self._merge_and_resolve_mm_processor_kwargs({}).get(
+            "images_kwargs", {}
+        )
+        height, width = size.height, size.width
+        if image_options.get("do_resize", getattr(image, "do_resize", True)):
+            height, width = smart_resize(
+                height, width, image.patch_size * image.merge_size,
+                image_options.get("min_pixels", image.size["shortest_edge"]),
+                image_options.get("max_pixels", image.size["longest_edge"]),
+            )
         image_tokens = vision_token_count(
-            (1, size.height // config.patch_size, size.width // config.patch_size),
+            (1, height // config.patch_size, width // config.patch_size),
             config,
             "image",
         )
-        video = self.get_hf_processor().video_processor
+        video = processor.video_processor
         options = self._merge_and_resolve_mm_processor_kwargs({}).get(
             "videos_kwargs", {}
         )

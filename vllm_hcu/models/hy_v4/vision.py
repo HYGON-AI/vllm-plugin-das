@@ -3,6 +3,7 @@
 # Copyright 2025 The HunYuan team.
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -305,6 +306,7 @@ class HYV4VisionTransformer(nn.Module):
         use_dp = is_vit_use_data_parallel(config.num_attention_heads)
         self.tp_size = 1 if use_dp else get_tensor_model_parallel_world_size()
         self.rotary_pos_emb = None
+        self.register_buffer("_vision_cos_sin_cache", None, persistent=False)
         if config.use_2d_rope:
             if config.rope_2d_percent != 1.0:
                 raise ValueError("HYV4 vision supports only full 2D RoPE")
@@ -333,6 +335,25 @@ class HYV4VisionTransformer(nn.Module):
         assert self.rotary_pos_emb is not None
         max_grid = max(max(h, w) for _, h, w in grid_thw)
         cos_table, sin_table = self.rotary_pos_emb.get_cos_sin(max_grid)
+        if cos_table.shape[0] < max_grid:
+            # Learned position embeddings are interpolated: their training
+            # edge is not an upper bound on grids admitted by preprocessing.
+            # Keep the factory-shared Core cache unchanged. Grow a local
+            # nonpersistent table using Core's frequencies, without creating
+            # a new CustomOp outside its model-construction config context.
+            cache = self._vision_cos_sin_cache
+            if cache is None or cache.shape[0] < max_grid:
+                capacity = cos_table.shape[0] if cache is None else cache.shape[0]
+                length = max(max_grid, 2 * capacity)
+                with torch.device(cos_table.device):
+                    inv_freq = self.rotary_pos_emb._compute_inv_freq(
+                        self.rotary_pos_emb.base
+                    )
+                    positions = torch.arange(length, dtype=torch.float32)
+                    angles = torch.outer(positions, inv_freq)
+                    cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+                self._vision_cos_sin_cache = cache
+            cos_table, sin_table = cache[:max_grid].chunk(2, dim=-1)
         indices = [
             torch.stack(
                 (torch.arange(h).repeat_interleave(w), torch.arange(w).repeat(h)),
@@ -472,22 +493,49 @@ class HYV4VisionTransformer(nn.Module):
             )
         return hidden
 
+    @contextmanager
+    def weight_loading_session(self):
+        depth = getattr(self, "_vision_loading_depth", 0)
+        if depth == 0:
+            self._vision_qkv_shards = {}
+        self._vision_loading_depth = depth + 1
+        try:
+            yield
+            if depth == 0:
+                missing = {
+                    name: sorted({"q", "k", "v"} - shards)
+                    for name, shards in self._vision_qkv_shards.items()
+                    if shards != {"q", "k", "v"}
+                }
+                if missing:
+                    raise ValueError(f"Incomplete vision QKV shards: {missing}")
+        finally:
+            self._vision_loading_depth = depth
+            if depth == 0:
+                self._vision_qkv_shards.clear()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded = set()
-        for name, weight in weights:
-            for projection, shard in (
-                ("q_proj", "q"),
-                ("k_proj", "k"),
-                ("v_proj", "v"),
-            ):
-                if f".{projection}." in name:
-                    name = name.replace(f".{projection}.", ".qkv.")
+        # AutoWeightsLoader can call this repeatedly for interleaved visual/text
+        # chunks. The parent keeps the audit open until the whole stream ends.
+        with self.weight_loading_session():
+            params = dict(self.named_parameters())
+            loaded = set()
+            for name, weight in weights:
+                for projection, shard in (
+                    ("q_proj", "q"),
+                    ("k_proj", "k"),
+                    ("v_proj", "v"),
+                ):
+                    if f".{projection}." in name:
+                        name = name.replace(f".{projection}.", ".qkv.")
+                        param = params[name]
+                        param.weight_loader(param, weight, shard)
+                        self._vision_qkv_shards.setdefault(name, set()).add(shard)
+                        break
+                else:
                     param = params[name]
-                    param.weight_loader(param, weight, shard)
-                    break
-            else:
-                param = params[name]
-                getattr(param, "weight_loader", default_weight_loader)(param, weight)
-            loaded.add(name)
-        return loaded
+                    getattr(param, "weight_loader", default_weight_loader)(param, weight)
+                    if ".qkv." in name:
+                        self._vision_qkv_shards[name] = {"q", "k", "v"}
+                loaded.add(name)
+            return loaded

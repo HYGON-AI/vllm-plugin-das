@@ -132,6 +132,15 @@ class SelectionTests(unittest.TestCase):
             report.write_text('<testsuite><testcase name="real"/></testsuite>')
             validate_result(report)
 
+    def test_active_indexpool_contract_runs_only_in_device_tier(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import test_files
+        suites = list((ROOT / 'tests/vllm033').glob('test_hyv4_flash_active_indexpool*.py'))
+        self.assertEqual(len(suites), 1)
+        suite = suites[0].relative_to(ROOT).as_posix()
+        self.assertNotIn(suite, test_files('portable'))
+        self.assertIn(suite, test_files('device'))
+
     def test_workflow_is_release_scoped_and_keeps_cpu_device_separate(self):
         source = (ROOT / '.github/workflows/hcu-pr-ci-v033.yml').read_text()
         self.assertIn('--release v0.33.0', source)

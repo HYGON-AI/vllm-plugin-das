@@ -126,6 +126,67 @@ def _validate_fp8_config(config: object) -> None:
             raise ValueError(error)
 
 
+def _validate_channel_w4a8_config(config: object) -> None:
+    """Admit only CT channel INT4 experts plus channel INT8 linears.
+
+    This does not remove activation metadata or select a W4A16 implementation.
+    Runtime selection and model qualification are separate gates.
+    """
+    error = "HYV4 Flash W4A8 requires symmetric channel INT4/INT8 weights, dynamic token INT8 activations, and packed CT metadata"
+    if not isinstance(config, dict) or (
+        config.get("quant_method") != "compressed-tensors"
+        or config.get("format") != "pack-quantized"
+        or config.get("quantization_status") != "compressed"
+        or config.get("kv_cache_scheme") is not None
+        or config.get("transform_config") is not None
+    ):
+        raise ValueError(error)
+    groups = config.get("config_groups")
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError(error)
+    bits_seen = set()
+    for group in groups.values():
+        if not isinstance(group, dict):
+            raise ValueError(error)
+        w, a = group.get("weights"), group.get("input_activations")
+        if not isinstance(w, dict) or not isinstance(a, dict):
+            raise ValueError(error)
+        bits = w.get("num_bits")
+        if type(bits) is not int or bits not in (4, 8):
+            raise ValueError(error)
+        expected_format = "pack-quantized" if bits == 4 else "int-quantized"
+        if (
+            group.get("format") != expected_format
+            or group.get("output_activations") is not None
+            or not isinstance(group.get("targets"), list)
+            or not group["targets"]
+            or any(not isinstance(t, str) or not t for t in group["targets"])
+            or any(w.get(k) != v for k, v in dict(
+                type="int", strategy="channel", symmetric=True, dynamic=False,
+            ).items())
+            or any(a.get(k) != v for k, v in dict(
+                num_bits=8, type="int", strategy="token", symmetric=True,
+                dynamic=True,
+            ).items())
+            or any(q.get(k) is not None for q in (w, a)
+                   for k in ("group_size", "block_structure", "actorder", "scale_dtype", "zp_dtype"))
+            or any(q.get("observer_kwargs") not in (None, {}) for q in (w, a))
+        ):
+            raise ValueError(error)
+        bits_seen.add(bits)
+    if bits_seen != {4, 8}:
+        raise ValueError(error)
+
+
+def validate_flash_quant_config(config: object) -> str:
+    """Return the admitted storage family without changing the source config."""
+    if isinstance(config, dict) and config.get("format") == "pack-quantized":
+        _validate_channel_w4a8_config(config)
+        return "channel_w4a8"
+    _validate_fp8_config(config)
+    return "fp8"
+
+
 def get_engram_cpu_offload(storage: object | None) -> bool:
     """Absent Core Engram settings mean TP-local device tables for Flash."""
     if storage is None:

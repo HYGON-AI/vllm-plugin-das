@@ -177,6 +177,37 @@ loading, tokenizer, sparse attention, Graph, drafted/accepted tokens, model
 accuracy or performance. See the [configuration validation boundary](
 ../docs/validation/vllm033-step5-config.md).
 
+## HYV4 Flash configuration metadata
+
+`das_hcu_hyv4_flash_config` provides `hyv4-flash-config`. It registers the two
+distinct `hy_v4_flash` and `hy_v4_flash_vl` config types through public
+`AutoConfig.register()` during Adapter extension activation. The text config
+inherits official Core `HYV4Config`; ordinary HYV4 configs and model registry
+entries retain their official owners. Flash-specific IndexPool, SWA, Engram
+and vision fields use the existing candidate's validation and serialization.
+
+Both names are checked for foreign ownership before publication. A partial
+commit or later ownership drift latches a fatal failure; health checks never
+repair the mapping. Discovery imports no framework. Forked children must
+activate their inherited mapping, and spawned children discover the installed
+entry point. The capability can be required using the existing Adapter
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
+
+The optional `das_hcu_hyv4_flash_model` entry point delivers the active Flash
+model implementation. Select it with
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model` on pinned vLLM 0.33.0.
+Unselected discovery imports no model and claims no model capability. This
+model owns the `HYV4FlashForCausalLM`/`HYV4FlashVLForConditionalGeneration` names;
+the separate optimized HY4 static-EPLB architecture and its entry points remain
+available. Flash quantized/latent parallel admission remains narrower than
+that static path and must not be treated as EPLB qualification.
+
+Activation health certifies registry/config/DFly ownership only. Checkpoint,
+DFly generation, HiSparse admission, changed-input Graph replay and measured
+performance need their own installed-artifact validation. See the
+[model integration and runtime gates](../docs/hy4_flash.md). In particular,
+HiSparse plus DFly or an unqualified Graph path remains unsupported.
+
 ## DSV4.1 HCU decode defaults
 
 Eligible DSpark draft LL receive quantization, INT8 direct GEMM, and Shared

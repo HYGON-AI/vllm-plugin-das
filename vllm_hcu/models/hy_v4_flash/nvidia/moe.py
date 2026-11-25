@@ -68,6 +68,10 @@ class HYV4FlashMoE(HYV4MoEFused):
             # shared partials into the same domain and skips the final reduce.
             if is_hcu_platform():
                 up._hcu_fuse_shared_and_routed_tp_all_reduce = True
+        if config.flash_w4a8_backend == "adapter_reference":
+            from .w4a8 import HYV4FlashW4A8Config
+
+            quant_config = HYV4FlashW4A8Config.for_moe(quant_config)
         super().__init__(
             config,
             quant_config=quant_config,
