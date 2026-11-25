@@ -47,6 +47,17 @@ SwiGLU clipping is passed as `gemm1_limit`; Core retains routing, shared-expert
 execution and TP reduction. Only the admitted Flash serialized channel-INT4 /
 dynamic-token-INT8 recipe is eligible; FP8 selection is unchanged.
 
+CPU weight offload is temporarily rejected at model configuration admission
+for this AITER W4A8 candidate, before expert loading or the first forward.
+This includes active `--cpu-offload-gb` (with or without UVA, including
+selective parameter lists) and prefetch weight offload. Core's non-UVA
+`functional_call` swaps layer parameters during forward, while this method's
+prepared native views/scales assume resident storage. UVA and prefetch
+lifecycles are not yet qualified either. Leave CPU offload at its default zero
+until migration-aware native aliases and Graph replay are validated. This
+protection does not change the exact CT reference or FP8 selector admission;
+it does not establish offload support for those separate methods.
+
 AITER token INT8 arithmetic uses FP32 `absmax/127`, while the exact CT oracle
 uses `absmax/127.5` with BF16 scale/quotient rounding. These are different
 numerical contracts. The local four-expert real-weight screening and

@@ -229,6 +229,25 @@ def validate_w4a8_execution(vllm_config):
     return True
 
 
+def _validate_aiter_w4a8_weight_residency(vllm_config):
+    """Reject unqualified migration before native packed aliases are created."""
+    offload = getattr(vllm_config, "offload_config", None)
+    if offload is None:
+        return
+    backend = offload.offload_backend
+    uva_active = backend in ("auto", "uva") and offload.uva.cpu_offload_gb > 0
+    prefetch_active = (
+        backend in ("auto", "prefetch")
+        and offload.prefetch.offload_group_size > 0
+    )
+    if uva_active or prefetch_active:
+        raise NotImplementedError(
+            "AITER W4A8 currently requires resident GPU expert weights; "
+            "CPU weight offload (UVA or prefetch) is not supported yet. "
+            "Disable --cpu-offload-gb and prefetch weight offload."
+        )
+
+
 def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
     """Compose real Core CT and model-local W4A8; never register a quant method.
 
@@ -297,6 +316,8 @@ def prepare_flash_quant_config(config, quant_config, *, for_moe: bool = False):
                 "Channel W4A8 requires HCU and explicit --moe-backend aiter "
                 "or flash_w4a8_backend=adapter_reference"
             )
+        if aiter_requested:
+            _validate_aiter_w4a8_weight_residency(current)
         validate_w4a8_execution(current)
         if for_moe:
             if aiter_requested:
