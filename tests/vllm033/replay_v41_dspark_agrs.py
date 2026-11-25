@@ -30,7 +30,11 @@ except ModuleNotFoundError as e:
     if e.name!='hcu_vllm_das.dspark_agrs':raise
     prod=None
 RESULTS=[]
-def require():assert prod is not None,'owned DSpark AG-RS module absent'
+def require():
+    assert prod is not None,'owned DSpark AG-RS module absent'
+    source=Path(prod.__file__).resolve()
+    expected=Path(__file__).resolve().parents[2]/'adapter_extension/src'
+    assert source.is_relative_to(expected),'AG-RS imported outside candidate worktree: '+str(source)
 def case(name,fn):
     try:fn();RESULTS.append(dict(case=name,status='passed'))
     except Exception as e:
@@ -97,7 +101,18 @@ def capacities_and_scope():
             assert local.scheduler_config is cfg.scheduler_config and local.compilation_config is cfg.compilation_config
             assert prod.is_owned_draft(local) and not prod.is_owned_draft(cfg)
             base.config_module.validate_topology(local,NS(**{**vars(moe),'moe_parallel_config':NS(**{**vars(moe.moe_parallel_config),'all2all_backend':'allgather_reducescatter'})}))
-            cfg.scheduler_config.max_num_batched_tokens=r*(n+1)-1;reject(lambda:prod.draft_config(cfg))
+            # The target scheduler bounds VERIFY rows independently; the
+            # draft receives its own query buffer capacity. A budget smaller
+            # than a complete VERIFY pass is valid, but must still fit at
+            # least one token per request slot.
+            cfg.scheduler_config.max_num_batched_tokens=r*(n+1)-1
+            bounded=prod.draft_config(cfg)
+            capacity=prod._capacity_from_metadata(bounded)
+            assert capacity.budget==cfg.scheduler_config.max_num_batched_tokens
+            assert capacity.verify_rows==min(r*(n+1),capacity.budget)
+            assert capacity.query_rows>=r*(n if cfg.speculative_config.draft_model_config.hf_config.sample_from_anchor else n+1)
+            cfg.scheduler_config.max_num_batched_tokens=r-1
+            reject(lambda:prod.draft_config(cfg))
         cfg,_=config();bad=copy.copy(cfg);bad.model_config=NS(**{**vars(cfg.model_config),'enforce_eager':False});reject(lambda:prod.draft_config(bad))
         for key in ('tensor_parallel_size','pipeline_parallel_size','decode_context_parallel_size','prefill_context_parallel_size'):
             bad=copy.copy(cfg);bad.parallel_config=copy.copy(cfg.parallel_config);setattr(bad.parallel_config,key,2);reject(lambda:prod.draft_config(bad))
@@ -215,5 +230,7 @@ def main():
     case('packed_CT_modular_AG_RS_pipeline',modular_pipeline)
     root=Path(__file__).resolve().parents[2]
     report=dict(passed=sum(x['status']=='passed' for x in RESULTS),total=len(RESULTS),cases=RESULTS,cuda_initialized=torch.cuda.is_initialized(),native_agrs_source=native_a2a.__file__,source_hashes={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (root/'adapter_extension/src/hcu_vllm_das').rglob('*agrs*.py')},boundary='CPU native manager/PF, CT loader and modular orchestration; transport/provider/quant/permutation and native constructor device boundary doubled. No whole model, GPU or Graph validation.')
+    loaded=[prod,inspect.getmodule(HcuDSparkDeepseekV41ForCausalLM),base.config_module,importlib.import_module('hcu_adapter')]
+    report['loaded_sources']={m.__name__:dict(path=str(Path(m.__file__).resolve()),sha256=hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()) for m in loaded}
     Path(sys.argv[1]).write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2));return 0 if report['passed']==report['total'] and not report['cuda_initialized'] else 1
 if __name__=='__main__':sys.exit(main())
