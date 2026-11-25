@@ -11,13 +11,13 @@ pytestmark = [pytest.mark.hcu,
 
 
 @pytest.fixture
-def consumer():
+def consumer(monkeypatch):
     from vllm.config import CompilationConfig,VllmConfig,set_current_vllm_config
     from vllm.distributed import parallel_state
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.plugins import load_general_plugins
     load_general_plugins()
-    parallel_state._TP=SimpleNamespace(rank_in_group=0,world_size=1)
+    monkeypatch.setattr(parallel_state, '_TP', SimpleNamespace(rank_in_group=0,world_size=1))
     config=VllmConfig(compilation_config=CompilationConfig(mode=0,custom_ops=['all']))
     with set_current_vllm_config(config):
         gate=GateLinear(5120,384,out_dtype=torch.float32,params_dtype=torch.bfloat16).cuda()
