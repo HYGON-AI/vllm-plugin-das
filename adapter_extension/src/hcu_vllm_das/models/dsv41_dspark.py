@@ -75,6 +75,9 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
             from ..moe.shared_act_quant import bind_dspark_shared_experts_fp8
 
             bind_dspark_shared_experts_fp8(constructor_config, self.model)
+            from ..qkv_split import bind_dspark_qkv
+
+            bind_dspark_qkv(self.model)
         if native_ll:
             from hcu_vllm_das.dspark_ll import install_model_entry_reset
             install_model_entry_reset(self, vllm_config, 128)

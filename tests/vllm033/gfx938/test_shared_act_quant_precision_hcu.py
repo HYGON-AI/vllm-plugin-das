@@ -216,7 +216,7 @@ def test_dspark_constructor_binds_native_shared_consumers(
     from vllm.config import get_current_vllm_config
     from vllm.distributed import parallel_state
     from vllm.models.deepseek_v4.amd.model import DeepseekV4MLP
-    from hcu_vllm_das import dspark_agrs, dspark_backend, dspark_post
+    from hcu_vllm_das import dspark_agrs, dspark_backend, dspark_post, qkv_split
     from hcu_vllm_das.adapter_api import adapter_module
     from hcu_vllm_das.models.dsv41_dspark import (
         HcuDSV41DraftWeightAliasModel, HcuDSparkDeepseekV41ForCausalLM,
@@ -242,6 +242,7 @@ def test_dspark_constructor_binds_native_shared_consumers(
     monkeypatch.setattr(dspark_agrs, "draft_config", lambda _: local)
     monkeypatch.setattr(dspark_backend, "native_draft_ll_requested", lambda _: False)
     monkeypatch.setattr(dspark_post, "requested", lambda _: False)
+    monkeypatch.setattr(qkv_split, "bind_dspark_qkv", lambda _: 0)
     observed = []
 
     def allocate(self, *, vllm_config, prefix=""):
