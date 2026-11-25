@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Opt-in publication of the active Core033 Flash implementation.
+"""Model-scoped publication of the active Core033 Flash implementation.
 
-Select HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model, or require the
-entry-point name das_hcu_hyv4_flash_model (not the spec's display name).
-Unselected discovery/activation imports no model and claims no capability.
+The registered Flash config requests this runtime when parsed or restored in a
+worker. Explicit required capabilities and extensions still assert startup
+availability. Unselected discovery imports no model.
 ACTIVE certifies owner/import compatibility only, never checkpoint, HIP,
 DFly generation, HiSparse or performance acceptance.
 """
@@ -21,6 +21,8 @@ from hcu_adapter.extensions import (
     is_fatal_extension_error,
 )
 from packaging.version import InvalidVersion, Version
+
+from .model_runtime_activation import ModelRuntimeActivation
 
 CAPABILITY = "hyv4-flash-model"
 _ENTRY_POINT = "das_hcu_hyv4_flash_model"
@@ -213,7 +215,7 @@ def check_health():
             _checking = False
 
 
-def _activate(context, expected_selection=None):
+def _activate(context, expected_selection=None, *, model_selected=False):
     global _publication, _publishing, _selected
     with _lock:
         _raise_if_failed()
@@ -233,7 +235,7 @@ def _activate(context, expected_selection=None):
                 "environment must agree; select "
                 "HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=" + CAPABILITY
             )
-        if not any(selection):
+        if not any(selection) and not model_selected:
             if _publication is not None:
                 _fatal("Flash runtime cannot be disabled after publication")
             _selected = False
@@ -333,6 +335,17 @@ def activate(context):
     _activate(context)
 
 
+def _activate_for_model(context):
+    _activate(context, model_selected=True)
+
+
+_model_activation = ModelRuntimeActivation(_activate_for_model, spawn_by_default=True)
+
+
+def request_model_runtime():
+    _model_activation.request()
+
+
 def _requested_by_environment():
     return any(_environment_selection())
 
@@ -345,7 +358,17 @@ def extension_spec():
         selection = _environment_selection()
 
     def activate_discovered(context):
-        _activate(context, selection)
+        model_selected = _model_activation.requested
+        try:
+            _activate(context, selection, model_selected=model_selected)
+            _model_activation.bind(context)
+        except Exception as error:
+            if (_model_activation.requested and not any(selection)
+                    and not is_fatal_extension_error(error)):
+                # This process already received a Flash model configuration.
+                # The usual optional-extension recovery cannot serve that model.
+                _fatal(f"selected Flash runtime activation failed: {error}")
+            raise
 
     def health_discovered():
         with _lock:

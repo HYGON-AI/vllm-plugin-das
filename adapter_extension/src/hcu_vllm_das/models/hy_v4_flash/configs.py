@@ -8,6 +8,7 @@ from typing import Any
 from huggingface_hub.dataclasses import strict
 from transformers.configuration_utils import ALLOWED_LAYER_TYPES, PreTrainedConfig
 
+from ...model_runtime_activation import ModelRuntimeConfig
 from .vision_config import (
     HYV4Config,
     HYV4VLConfig,
@@ -28,8 +29,16 @@ _SPARSE_ALIASES = {
 }
 
 
+class _FlashRuntimeConfig(ModelRuntimeConfig):
+    @classmethod
+    def request_runtime(cls):
+        from ...hyv4_flash_model_activation import request_model_runtime
+
+        request_model_runtime()
+
+
 @strict
-class HYV4FlashConfig(HYV4Config):
+class HYV4FlashConfig(_FlashRuntimeConfig, HYV4Config):
     model_type = "hy_v4_flash"
     base_config_key = "text_config"
 
@@ -277,7 +286,7 @@ class HYV4FlashConfig(HYV4Config):
 
 
 @strict
-class HYV4FlashVLConfig(HYV4VLConfig):
+class HYV4FlashVLConfig(_FlashRuntimeConfig, HYV4VLConfig):
     model_type = "hy_v4_flash_vl"
     default_architecture = "HYV4FlashVLForConditionalGeneration"
     sub_configs = {
