@@ -44,6 +44,34 @@ assert not any(name == 'torch' or name.startswith('vllm') or
 """)
 
 
+@pytest.mark.parametrize("request_first", [True, False])
+def test_model_selection_uses_the_same_core_qualification(request_first):
+    run_child("""
+import importlib
+from types import SimpleNamespace as NS
+m = importlib.import_module('hcu_vllm_das.hyv4_flash_model_activation')
+context = NS(vllm_version='0.32.0', requested_extensions=set(),
+             requested_capabilities=set())
+request_first = """ + repr(request_first) + """
+try:
+    if request_first:
+        m.request_model_runtime()
+        s = m.extension_spec()
+        assert s.capabilities == frozenset({'hyv4-flash-model'})
+        s.activate(context)
+    else:
+        s = m.extension_spec()
+        assert not s.capabilities
+        s.activate(context)
+        m.request_model_runtime()
+except RuntimeError as e:
+    assert 'pinned vLLM 0.33.0' in str(e), e
+else:
+    raise AssertionError('model selection bypassed Core qualification')
+assert m._publication is None
+""")
+
+
 @pytest.mark.parametrize("version", ["0.32.0", "0.34.0", "0.33.0rc1",
                                       "0.33.0.dev1", "0.33.0.post1", "1!0.33.0"])
 def test_selected_wrong_core_fails_before_model_import(version):

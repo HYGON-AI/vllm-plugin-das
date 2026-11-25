@@ -1,9 +1,10 @@
 # HYV4 Flash on vLLM 0.33 (candidate)
 
-The active v0.33 wheel now delivers opt-in `HYV4FlashForCausalLM` and
-`HYV4FlashVLForConditionalGeneration` registration through
-`das_hcu_hyv4_flash_model`. Select the `hyv4-flash-model` capability on pinned
-vLLM 0.33.0. Unselected discovery does not import the model or claim ownership.
+On vLLM 0.33.0, parsing a registered HY4 Flash configuration activates the
+installed HCU model runtime. Restoring the configuration in spawned workers
+replays that selection. The runtime defaults to `spawn` if the process has not
+selected a worker method. `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model`
+remains available to assert the capability explicitly at startup.
 The separate optimized HY4/static-EPLB owners remain intact. Configuration and
 registry health do not certify checkpoint accuracy or performance; the dated
 component/runtime evidence below retains its original scope. Current aligned
@@ -17,8 +18,8 @@ until independently qualified.
 The active `hyv4-flash-config` capability registers `hy_v4_flash` and
 `hy_v4_flash_vl` with public Transformers AutoConfig. It inherits official
 Core's text configuration and preserves the candidate's Flash/vision config
-fields and validation. It does not touch Core's model registry or register
-the legacy plugin platform. Real installed config parsing, serialization,
+fields and validation. It requests model registration only when a Flash
+configuration is parsed or restored. Real installed config parsing, serialization,
 foreign-owner refusal, partial-commit failure and process lifecycle contracts
 are selected by `tests/vllm033/test_hyv4_flash_config_cpu.py` in portable CI.
 This first part of the port does not close model implementation, tokenizer,
