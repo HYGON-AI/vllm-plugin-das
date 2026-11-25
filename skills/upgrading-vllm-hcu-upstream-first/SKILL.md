@@ -40,6 +40,12 @@ configuration unless a measured model-specific requirement justifies an
 override. The deprecated `--mamba-cache-mode` may still parse in v0.33 but
 does not enable fine-grained behavior and must not be used as a feature flag.
 
+KV cache precision is a separate hardware gate. On the current gfx936
+validation host, `fp8_e5m2` is the accepted FP8 KV route while the official
+runtime rejects `fp8_e4m3` with its gfx92a/gfx938 requirement. Keep the dtype
+requested by the target hardware/checkpoint and record the startup gate; do
+not infer E4M3 support from a successful E5M2 run.
+
 The shared-prefix option being accepted is not proof that a junction
 checkpoint was created. Validate an owner, junction and sibling request, and
 record the effective manager page, hit deltas, output equality and MTP/Graph

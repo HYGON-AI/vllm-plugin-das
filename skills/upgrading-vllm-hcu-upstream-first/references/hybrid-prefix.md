@@ -30,6 +30,12 @@ unit only when every prefix-cacheable KV group has a block size divisible by
 it. A 64-token attention kernel page therefore does not by itself make 64 a
 valid match unit.
 
+KV precision follows a separate platform capability check. In the current
+gfx936 v0.33 environment, `fp8_e5m2` was accepted for the Qwen3.8-27B TP2
+route, while `fp8_e4m3` was rejected by the official runtime's gfx92a/gfx938
+gate. Record this result with the target hardware and do not generalize one
+FP8 format's admission to the other.
+
 For Qwen3.8-27B, 64 is the validated starting value used by the local BF16
 TP2 smoke. The observed manager page may be 832 or 1600 depending on the
 resolved model/speculative layout. Record the page from startup/runtime
