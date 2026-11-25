@@ -117,7 +117,10 @@ def test_real_pcp_attention_keeps_native_schedule_and_source_cache(chain, ratio)
     assert attention.indexer.k_cache.get_kv_cache_spec(cfg).num_states == 64 // ratio
 
 
-def test_prefill_subchunks_keep_windows_candidates_and_release_scores(chain, monkeypatch):
+@pytest.mark.parametrize('use_candidates', [False, True])
+def test_prefill_subchunks_keep_windows_candidates_and_release_scores(
+    chain, monkeypatch, use_candidates,
+):
     layer = make_attention(chain).indexer.indexer_op
     bind_cache(layer.k_cache)
     meta = metadata(chain, layer.k_cache, prefill=True)
@@ -127,14 +130,18 @@ def test_prefill_subchunks_keep_windows_candidates_and_release_scores(chain, mon
     chunk.token_end = 5
     chunk.cu_seqlen_ks = torch.tensor([0, 0, 2, 2, 2], dtype=torch.int32)
     chunk.cu_seqlen_ke = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
-    layer.fp4_query_chunk_rows = 2
-    layer.candidate_blocks = torch.arange(10, dtype=torch.int32).reshape(5, 2)
+    layer.max_model_len = 1048576
+    layer.fp4_max_logits_bytes = 4 * 32768 * 2
+    layer.fp4_query_chunk_rows = 2 if use_candidates else 1
+    if use_candidates:
+        layer.candidate_blocks = torch.arange(10, dtype=torch.int32).reshape(5, 2)
     layer.candidate_block_size = 2
     layer.candidate_write = False
     original_select = scorer._select
     seen, refs = [], []
     def prefill(q, kv, weights, ks, ke, clean, width, *args):
         assert not refs or refs[-1]() is None, 'previous logits still live'
+        assert width == (layer.max_model_len if use_candidates else 8)
         seen.append((ks.clone(), ke.clone(), weights.clone()))
         result = torch.full((len(ks), width), -float('inf'))
         for i, count in enumerate((ke - ks).tolist()):
@@ -143,7 +150,8 @@ def test_prefill_subchunks_keep_windows_candidates_and_release_scores(chain, mon
         return result
     banks = []
     def select(logits, starts, ends, out, bank, block, write):
-        banks.append(bank.clone())
+        if bank is not None:
+            banks.append(bank.clone())
         # Independently check candidate row alignment, then run production topk.
         assert block == 2 and not write
         original_select(logits, starts, ends, out, None, block, write)
@@ -156,7 +164,10 @@ def test_prefill_subchunks_keep_windows_candidates_and_release_scores(chain, mon
     assert torch.equal(torch.cat([x[0] for x in seen]), chunk.cu_seqlen_ks)
     assert torch.equal(torch.cat([x[1] for x in seen]), chunk.cu_seqlen_ke)
     assert torch.equal(torch.cat([x[2] for x in seen]), weights)
-    assert torch.equal(torch.cat(banks), layer.candidate_blocks)
+    if use_candidates:
+        assert torch.equal(torch.cat(banks), layer.candidate_blocks)
+    else:
+        assert not banks
     assert output[:5].tolist() == [[0,-1,-1,-1], [0,1,-1,-1],
                                    [0,-1,-1,-1], [0,1,-1,-1], [0,1,2,-1]]
     assert all(ref() is None for ref in refs)
