@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Write native BF16 WO_A directly in the following INT8 consumer's layout."""
+"""Write native BF16 WO_A directly in the following native consumer's layout."""
 from __future__ import annotations
 
 import inspect
@@ -63,7 +63,12 @@ def configured(config, device):
         return False
 
     from .quantization.ct_w4a8 import HcuDSV41CTW4A8Config
-    if _BLAS_OVERRIDDEN or not isinstance(config.quant_config, HcuDSV41CTW4A8Config):
+    from .quantization.dsv41_channel_fp8 import HcuDSV41ChannelFP8Config
+
+    # Both consumers take the same BF16 [tokens, groups * rank] input.
+    # Worker-native byte parity and the runtime projection guards stay mandatory.
+    if _BLAS_OVERRIDDEN or not isinstance(
+            config.quant_config, (HcuDSV41CTW4A8Config, HcuDSV41ChannelFP8Config)):
         return False
     parallel = config.parallel_config
     mc = config.model_config
