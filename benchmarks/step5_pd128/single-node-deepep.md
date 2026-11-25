@@ -25,13 +25,12 @@ python -m pip install --no-deps \
 ```
 
 The local EP8 Prefill path uses the nightly wheel's explicit Pair32
-weight packer and contiguous WASP GEMM mode 1002 for G1 and G2.
-Both shapes produced bit-identical outputs to the original wheel's
-Step5 entry point in a gfx938 operator check. The nightly BN384 mode
-1003 was slower for G1. On 2026-11-24, the S7 nightly run with mode
-1002 completed the 128K batch of 32 requests at 22,067.00 input tok/s
-with no preemptions or inference JIT. The S9 result below uses the
-original wheel.
+weight packer and contiguous WASP GEMM mode 1000 for G1 and G2.
+DeepEP fused scatter aligns each expert segment to 256 rows for this
+kernel. On 2026-11-25, the unmodified nightly wheel completed two
+S9 128K, 32-request formal rounds at 23,803.17 and 23,825.48 input
+tok/s with no preemptions or inference JIT. The S9 result below uses
+the original Step5-specific wheel.
 
 Run [`serve_ep8_wasp128_prefill.sh`](serve_ep8_wasp128_prefill.sh) on the
 eight-device host. Set the model, tokenizer, qualified hipBLASLt directory,

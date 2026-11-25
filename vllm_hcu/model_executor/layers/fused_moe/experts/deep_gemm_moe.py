@@ -714,10 +714,15 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 )
             else:
                 grouped_fp8 = m_grouped_fp8_gemm_nt_contiguous
-                if step5_channel_fp8 and fused_scatter is not None and align_used == 128:
-                    if local_num_experts == 44:
+                if step5_channel_fp8 and fused_scatter is not None:
+                    ep8_mode1000 = local_num_experts == 44 and getattr(
+                        self, "_hcu_step5_ep8_pair32_mode1000", False
+                    )
+                    if ep8_mode1000 and align_used != _HCU_HT_EP_TOKEN_ALIGNMENT:
+                        raise ValueError("Step5 EP8 Pair32 mode 1000 requires 256-row expert alignment")
+                    if local_num_experts == 44 and (ep8_mode1000 or align_used == 128):
                         from ..ep8_wasp128 import grouped_fp8
-                    else:
+                    elif align_used == 128:
                         from ..step5_wasp128 import grouped_fp8
                 grouped_fp8(
                     (a1q, a1q_scale),

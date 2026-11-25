@@ -178,9 +178,12 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                 prepare._hcu_step5_fused_scatter_enabled = True
                 experts._hcu_step5_fused_scatter_enabled = True
                 if prepare.num_dispatchers_ == 8:
-                    from .ep8_wasp128 import available
+                    from .ep8_wasp128 import available, nightly_weight_packer
 
-                    prepare._hcu_step5_wasp128_enabled = available(moe_config)
+                    mode1000 = nightly_weight_packer(moe_config) is not None
+                    experts._hcu_step5_ep8_pair32_mode1000 = mode1000
+                    # The public mode 1000 kernel consumes 256 rows per expert tile.
+                    prepare._hcu_step5_wasp128_enabled = not mode1000 and available(moe_config)
 
     return kernel
 

@@ -263,7 +263,7 @@ def test_nightly_wasp128_matches_pair32_packing_and_gemm(monkeypatch, case):
         for k, n in ((4096, 3072), (1536, 4096)):
             a = (torch.empty(1, k, device="meta"), None)
             ep8_wasp128.grouped_fp8(a, None, torch.empty(1, n, device="meta"), None)
-        assert calls[2:] == ([1002, 1002] if case == "prefill" else ["native"] * 2)
+        assert calls[2:] == ([1000, 1000] if case == "prefill" else ["native"] * 2)
 
 
 @pytest.mark.parametrize("output_offset", [0, 4096])

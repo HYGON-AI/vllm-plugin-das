@@ -102,7 +102,7 @@ def grouped_fp8(a, b, out, experts):
     if callable(native) or pair32 is not None:
         init_logger("vllm.hcu.step5_wasp128").info_once(
             "EP8 WASP128 native G1/G2 active through DeepGEMM%s",
-            " (Pair32 mode 1002)" if pair32 is not None else "",
+            " (Pair32 mode 1000)" if pair32 is not None else "",
             scope="process",
         )
         if callable(native):
@@ -110,8 +110,7 @@ def grouped_fp8(a, b, out, experts):
         shape = (a[0].size(1), out.size(1))
         if shape not in ((4096, 3072), (1536, 4096)):
             raise ValueError(f"Unsupported Step5 WASP128 GEMM shape: {shape}")
-        # The nightly BN384 mode (1003) regresses G1 on gfx938.
-        return pair32(a, b, out, experts, config={"MODE": 1002})
+        return pair32(a, b, out, experts, config={"MODE": 1000})
 
     bn = 384 if a[0].size(1) == 4096 else 256
     return _operator()(
