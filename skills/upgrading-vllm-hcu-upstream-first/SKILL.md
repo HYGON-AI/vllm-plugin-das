@@ -187,6 +187,16 @@ present, describes the legacy root version file; inspect the production
 `adapter_extension` metadata independently. Static matches do not validate
 ABI compatibility, HCU execution, correctness, model quality or speed.
 
+When a new test file enters the v0.33 portable directory, inspect the actual
+source/portable/device file lists and pytest markers. A fixture opt-in alone
+does not exclude hardware tests: an unauthorized skip still fails the strict
+result gate. Keep suites with process-wide allocator limits in fresh children,
+retaining their full assertions, authorization and child JUnit checks. Resolve
+Core AST fixtures from an explicit override, the CI's `VLLM_TARGET_ROOT`, or
+the installed package spec; a developer's sibling checkout is not an installed
+CI prerequisite. Preserve missing-file failures and test the corrected default
+without manufacturing a checkout or replacing Core's interface signature.
+
 For NIXL, derive the package and descriptor ABI from the selected Core target.
 Module discovery, distribution-version checks and Ray aliases must select one
 native provider. A working older `nixl` UCX transfer does not satisfy a target

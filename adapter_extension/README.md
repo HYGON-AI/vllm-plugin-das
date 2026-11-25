@@ -389,6 +389,55 @@ Schema4 additionally verifies that the seven official INT8 oracle symbols
 remain identical across activation, the module is owned by the Core wheel,
 and explicit Triton selection resolves to an official expert.
 
+## Shared channel-FP8 AITER MoE interface
+
+`hcu_vllm_das.moe.aiter_fp8` exposes `Problem`, `get_config`,
+`prepare_weights`, and `run`. Callers supply actual expert/input/output shapes,
+top-k, compute dtype and activation parameters. `get_config` calls the installed
+public `aiter.moe.get_aiter_moe_config` first, including the `use_shuffle` preference and the
+requested solution type. It records `vendor_query` or `qualified_profile` rather
+than treating a missing tuning row as a hit. An optional `QualifiedProfile`
+must match the exact static problem, dtype, architecture, layout and token bound
+and identify its independent native evidence. The common interface contains no
+HY4 shapes, router scaling or expert-count constants.
+
+```python
+from hcu_vllm_das.moe import aiter_fp8
+
+problem = aiter_fp8.Problem(M, E, N1, N2, K, topk, x.dtype,
+    activation="silu", gated=True, gemm1_limit=limit,
+    architecture=actual_architecture)
+selected = aiter_fp8.get_config(problem, use_shuffle=True,
+    profiles=consumer_qualified_profiles, solution_type="asm")
+# Once, after loading and before capture. Keep only the prepared parameters.
+prepared = aiter_fp8.prepare_weights(w1, w2, s1, s2, selected)
+y = aiter_fp8.run(x, topk_weights, topk_ids, prepared, selected,
+    routed_scaling_factor=1.0)
+```
+
+Returned `need_shuffle` / `need_shuffle_scale` flags determine preparation. Packing uses public `aiter_moe_shfl_weight` and, only if required by the returned
+config, its scale counterpart. Prepared weights retain a layout signature and
+own no duplicate canonical buffers. Later token-count configs must be layout
+compatible; different packed stage IDs refuse instead of repacking during
+capture. Config mutation and replaced/modified prepared buffers refuse. Treat
+inference weights as immutable: they may have no Torch version counter. A reload
+needs canonical buffers, a new prepared owner and recaptured graphs. This API
+does not qualify every model, geometry, dtype or activation supported by AITER;
+each consumer retains native and full-model gates.
+
+HYV4 Flash opts in through `--moe-backend aiter` for serialized channel-FP8
+routed experts. Dense/DFly and auto/triton retain their official Core owners.
+`--hf-overrides '{"flash_aiter_moe_use_shuffle": false}'` selects the raw control;
+the explicit AITER route otherwise prepares shuffled weights. The layout policy
+is frozen at construction; the resolved HF flag participates in Core ModelConfig hash factors. Current admitted
+expert geometries are genuine gfx938 ordinary TP4/TP8, E512/K1536/N384 or192,
+BF16 input, top16 and clamp10. The qualified ASM11007+21000/BM32 profile is used
+only after a vendor lookup miss; no global architecture or FP8 oracle is changed.
+Core keeps CT loading, routing, prepare/finalize and TP reduction. Its router
+already applies3.998, so the vendor receives factor1.0. Startup logs distinguish
+the selected backend, config provenance and raw/shuffled layout. Component
+qualification is not full-model accuracy or performance acceptance.
+
 ## AITER INT8 backend
 
 Select `--moe-backend aiter`. On compatible gfx936 and gfx938 hosts the

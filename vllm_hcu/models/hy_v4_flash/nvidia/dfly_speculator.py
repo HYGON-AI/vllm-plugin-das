@@ -221,7 +221,7 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         config.model_config.hf_text_config = draft.config
         logger.info(
             "HYV4 DFly: %d layers, N=%d, TP=%d, DP=%d (TP-local draft), "
-            "target index/KV=%s/%s, %s writable KV aliases, "
+            "target index/KV=%s/%s, cache dtype=%s, "
             "max length=%d, draft quantization=%s, draft sampling=%s",
             len(draft.model.layers),
             self.num_speculative_steps,

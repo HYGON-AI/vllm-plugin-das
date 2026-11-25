@@ -220,6 +220,13 @@ def test_runtime_admission_is_explicit_eager_tp_only(
         )
     )
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    # Exercise the real import-light HiSparse policy without importing the
+    # legacy package initializer against the intentionally isolated Core stub.
+    hisparse = ModuleType("vllm_hcu.models.hy_v4_flash.hisparse")
+    hisparse.__dict__.update(
+        definitions(FLASH / "hisparse.py", {"validate_flash_hisparse"})
+    )
+    monkeypatch.setitem(sys.modules, hisparse.__name__, hisparse)
     platforms = ModuleType("vllm.platforms")
     platforms.current_platform = SimpleNamespace(is_cuda=lambda: True)
     monkeypatch.setitem(sys.modules, platforms.__name__, platforms)
@@ -265,6 +272,7 @@ def test_runtime_admission_is_explicit_eager_tp_only(
         parallel_config=parallel,
         use_v2_model_runner=True,
         kv_transfer_config=None,
+        attention_config=SimpleNamespace(hisparse_config=None),
         lora_config=None,
         speculative_config=None,
         cache_config=SimpleNamespace(cache_dtype="auto"),

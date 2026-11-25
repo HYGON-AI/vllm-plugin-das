@@ -24,6 +24,14 @@ are selected by `tests/vllm033/test_hyv4_flash_config_cpu.py` in portable CI.
 This first part of the port does not close model implementation, tokenizer,
 multimodal processor, attention, weights, device or accuracy gates.
 
+## MR-level readiness and remaining qualification
+
+A scoped MR can be reviewed and moved to Ready on its own source/CPU and
+applicable native evidence. The historical model-delivery findings below gate
+claims of installed full-model or joint qualification, not every validated
+increment. Native, checkpoint, long-context, Graph and end-to-end joint gates
+remain explicit; source results do not close them.
+
 ## Remaining v0.33 model integration blocker
 
 The original prospective integration of PR #493 head `acab29bb2228` with release target
@@ -51,8 +59,8 @@ Its source, portable, device and gfx938 CI selectors select no
 boundary; it does not exercise delivery of this MR's feature. Earlier AST-body
 and source-overlay model results retain their original scope.
 
-Before this MR is merge-ready, port only the missing model behavior into the
-active plugin package after comparing it with Core's current implementations;
+Before claiming installed model execution support, port the missing model
+behavior into the active plugin package after comparing it with Core's implementations;
 connect registration through the Adapter extension lifecycle; and add wheel,
 installed discovery and applicable runtime coverage to the v0.33 CI matrix.
 Keep official HYV4 registrations and platform ownership intact. Packaging and
