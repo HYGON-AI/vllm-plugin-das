@@ -786,6 +786,7 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
     module.current_platform = SimpleNamespace(is_rocm=lambda: False)
     assert adapter.apply_to_module(module) is True
     builder = Builder()
+    builder.kv_cache_spec = SimpleNamespace(block_size=256, storage_block_size=64)
     builder.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(prefill_context_parallel_size=2)
     )
@@ -797,6 +798,7 @@ def test_indexer_metadata_adapter_propagates_pcp_world_size():
     metadata = builder.build(0, common)
 
     assert metadata.pcp_world_size == 2
+    assert metadata.indexer_page_size == 64
 
 
 def test_rocm_indexer_metadata_adapter_skips_unused_lightop_schedule(

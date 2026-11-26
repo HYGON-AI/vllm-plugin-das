@@ -971,3 +971,71 @@ def test_lightop_deepseek_v4_fused_insert_updates_q_and_cache() -> None:
         token_scales = raw_cache[scale_start : scale_start + 8]
         assert torch.all(token_data == sentinel)
         assert torch.all(token_scales == sentinel)
+
+
+@pytest.mark.parametrize("next_n", [1, 8])
+def test_bf16_indexer_decode_ignores_interleaved_pages(next_n: int) -> None:
+    from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _restore_collapsed_bf16_page,
+        rocm_fp8_paged_mqa_logits,
+    )
+
+    device = _hcu_device()
+    if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx936":
+        pytest.skip("requires the gfx936 BF16 indexer")
+    pages, page_size, heads, dim = 4, 64, 64, 128
+    stride = 585792  # Observed BLHNC page stride, in BF16 elements.
+    generator = torch.Generator().manual_seed(1126)
+    keys = torch.randn(pages, page_size, dim, generator=generator, dtype=torch.bfloat16)
+    q = torch.randn(2, next_n, heads, dim, generator=generator, dtype=torch.bfloat16)
+    weights = torch.rand(2 * next_n, heads, generator=generator)
+    table = torch.tensor([[3, 0, 2], [1, 2, 0]], dtype=torch.int32)
+    ends = torch.tensor([[128], [65]], dtype=torch.int32) + torch.arange(
+        next_n, dtype=torch.int32
+    )
+    expected = torch.full((2, next_n, 192), -torch.inf)
+    for batch, ids in enumerate(table):
+        logical_keys = keys[ids.long()].reshape(-1, dim).float()
+        for j, length in enumerate(ends[batch].tolist()):
+            dots = (q[batch, j].float() @ logical_keys[:length].T).relu()
+            expected[batch, j, :length] = (dots * weights[batch * next_n + j, :, None]).sum(0)
+
+    backing = torch.empty(pages * stride, dtype=torch.bfloat16, device=device)
+    cache = backing.as_strided((pages, page_size, 1, dim), (stride, dim, dim, 1))
+    # NaN sentinels make reads from another layer visible in every valid row.
+    backing.fill_(float("nan"))
+    cache[:, :, 0].copy_(keys)
+    lengths = ends[:, 0] if next_n == 1 else ends
+    actual = rocm_fp8_paged_mqa_logits(
+        q.to(device), cache, weights.to(device), lengths.to(device), table.to(device),
+        None, expected.shape[-1],
+    )
+    torch.testing.assert_close(
+        actual.cpu().reshape_as(expected), expected, atol=2e-4, rtol=1e-5
+    )
+    collapsed = cache[:, :1, 0]
+    restored = _restore_collapsed_bf16_page(collapsed, page_size, dim)
+    restored_logits = rocm_fp8_paged_mqa_logits(
+        q.to(device), restored.unsqueeze(-2), weights.to(device),
+        lengths.to(device), table.to(device), None, expected.shape[-1],
+    )
+    torch.testing.assert_close(restored_logits, actual, atol=0, rtol=0)
+
+    # Reuse pages to cross the capped launch grid with a small physical cache.
+    repeats = 45
+    long_table = table.repeat(1, repeats)
+    long_ends = ends + (repeats - 1) * expected.shape[-1]
+    long_logits = rocm_fp8_paged_mqa_logits(
+        q.to(device), cache, weights.to(device), long_ends.to(device),
+        long_table.to(device), None, long_table.shape[1] * page_size,
+        clean_logits=False,
+    ).cpu().reshape(2, next_n, -1)
+    for batch in range(2):
+        for j in range(next_n):
+            length = int(ends[batch, j])
+            start = int(long_ends[batch, j]) - length
+            torch.testing.assert_close(
+                long_logits[batch, j, start:start + length],
+                expected[batch, j, :length],
+                atol=2e-4, rtol=1e-5,
+            )
