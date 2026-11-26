@@ -6,6 +6,7 @@ from ..environment import dsv41_profile_worker_enabled
 
 WORKER = "hcu_vllm_das.dsv41.worker.HcuDSV41PcpWorker"
 HT_FIXED_CAPACITY_KEY = "hcu_dsv41_w4a8_ht_fixed_capacity"
+HT_SENDER_INT8_KEY = "hcu_dsv41_w4a8_ht_sender_int8"
 
 
 def local_token_bound(global_tokens, max_reqs, pcp_size):

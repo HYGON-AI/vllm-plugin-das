@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 from .dspark_capacity import token_capacity
-from .dsv41.profile_worker import HT_FIXED_CAPACITY_KEY
+from .dsv41.profile_worker import HT_FIXED_CAPACITY_KEY, HT_SENDER_INT8_KEY
 from .layer_split_config import KEY as LAYER_SPLIT_KEY
 
 _KEY = '_hcu_dsv41_pcp_dspark_draft'
@@ -46,6 +46,7 @@ def draft_config(cfg):
     # The target's calibrated physical slots do not describe draft experts.
     result.additional_config.pop('hcu_static_eplb', None)
     result.additional_config.pop(LAYER_SPLIT_KEY, None)
+    result.additional_config.pop(HT_SENDER_INT8_KEY, None)
     previous = result.additional_config.get(_KEY)
     previous_fixed_ht = (
         previous.get('target_fixed_ht', False) if isinstance(previous, dict) else False

@@ -9,8 +9,13 @@ import torch.distributed as dist
 
 from hcu_vllm_das.moe.ct_w4a8_prepare import (
     FixedHTExpertTokens,
+    FixedHTInt8ExpertTokens,
     HcuCTHTPrepareAndFinalize,
     fixed_ht_batch_capacity,
+)
+from hcu_vllm_das.moe.ct_w4a8_runtime import (
+    contiguous_aligned_rows,
+    deepgemm_moe_permute,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -30,7 +35,28 @@ def combine(prepare, capacity, x, ids, weights, num_experts, expert_map):
     else:
         assert isinstance(counts, FixedHTExpertTokens)
         assert q.size(0) == capacity and counts.expert_num_tokens_cpu is None
-        assert not q[~live.any(dim=1)].any()
+        padding = ~live.any(dim=1, keepdim=True)
+        if isinstance(counts, FixedHTInt8ExpertTokens):
+            local_experts = counts.expert_num_tokens.numel()
+            aligned = contiguous_aligned_rows(capacity, ids.size(1), local_experts)
+            data, scales, indices, inverse, _ = deepgemm_moe_permute(
+                aq=q, aq_scale=scale, topk_ids=received_ids,
+                local_num_experts=local_experts, expert_map=None, expert_tokens_meta=counts,
+                aq_out=q.new_empty((aligned, q.size(1))), block_size=q.size(1),
+            )
+            token_rows, _ = live.nonzero(as_tuple=True)
+            destinations = inverse[live].long()
+            assert destinations.unique().numel() == destinations.numel()
+            torch.testing.assert_close(data[destinations], q[token_rows], rtol=0, atol=0)
+            torch.testing.assert_close(scales[destinations], scale[token_rows], rtol=0, atol=0)
+            torch.testing.assert_close(indices[destinations].long(), received_ids[live], rtol=0, atol=0)
+            assert (indices >= 0).sum().item() == destinations.numel()
+            # The synthetic reduction below touches every row. Production gather
+            # only consumes routed experts, so it needs neither of these writes.
+            q = q.masked_fill(padding, 0)
+            scale = scale.masked_fill(padding, 0)
+        else:
+            assert not q[padding.squeeze(1)].any()
     # Make each expert return the quantized input, weighted per live route.
     # Use the native combine handle to return those rows to their senders.
     reduced = (q.float() * scale * received_weights.masked_fill(~live, 0).sum(
@@ -41,13 +67,13 @@ def combine(prepare, capacity, x, ids, weights, num_experts, expert_map):
     return output, counts.expert_num_tokens
 
 
-def check_case(prepare, capacity, x, ids, weights, num_experts, expert_map):
+def check_case(prepare, sender_int8, capacity, x, ids, weights, num_experts, expert_map):
     expected, expected_counts = combine(prepare, None, x, ids, weights,
                                         num_experts, expert_map)
-    actual, actual_counts = combine(prepare, capacity, x, ids, weights,
-                                    num_experts, expert_map)
-    torch.testing.assert_close(actual_counts, expected_counts, rtol=0, atol=0)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for owner in (prepare, sender_int8):
+        actual, actual_counts = combine(owner, capacity, x, ids, weights, num_experts, expert_map)
+        torch.testing.assert_close(actual_counts, expected_counts, rtol=0, atol=0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def check_clamp_quant(experts):
@@ -122,6 +148,8 @@ def main():
     worst = sum(rows + sender for sender in range(ranks))
     prepare = HcuCTHTPrepareAndFinalize(buffer, ranks, 1, rank * local_experts,
                                         fixed_receive_tokens=worst)
+    sender_int8 = HcuCTHTPrepareAndFinalize(buffer, ranks, 1, rank * local_experts,
+                                            fixed_receive_tokens=worst, fixed_sender_int8=True)
     num_experts = local_experts * ranks
     expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
     expert_map[rank * local_experts:(rank + 1) * local_experts] = torch.arange(
@@ -135,7 +163,7 @@ def main():
         for skewed in (False, True):
             dest = torch.full_like(rows_index, ranks - 1) if skewed else (rows_index + rank) % ranks
             ids = dest[:, None] * local_experts + torch.arange(2, device="cuda")
-            check_case(prepare, worst, x, ids, weights, num_experts, expert_map)
+            check_case(prepare, sender_int8, worst, x, ids, weights, num_experts, expert_map)
         for capacity, local_rows in ((2, 1), (16, 2)):
             if rank == 0:
                 print(f"checking {capacity}-token warmup geometry", flush=True)
@@ -145,9 +173,9 @@ def main():
                 routes.fill_(-1)
             route_weights = torch.full(routes.shape, 0.125, device="cuda")
             route_weights.masked_fill_(routes < 0, 0)
-            check_case(prepare, capacity, x[:local_rows], routes, route_weights,
+            check_case(prepare, sender_int8, capacity, x[:local_rows], routes, route_weights,
                        num_experts, expert_map)
-        print(f"rank {rank}: fixed and dynamic dispatch/combined outputs match", flush=True)
+        print(f"rank {rank}: BF16 dynamic/fixed and INT8 fixed outputs match", flush=True)
         if rank == 0:
             check_clamp_quant(local_experts)
         dist.barrier()
