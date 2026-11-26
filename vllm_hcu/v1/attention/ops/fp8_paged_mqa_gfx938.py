@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Direct sparse-indexer logits from HIPC 16-by-16 shuffled FP8 pages."""
+"""Sparse-indexer logits from strided BF16 pages or HIPC shuffled FP8 pages."""
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -36,6 +36,8 @@ def _paged_logits(
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     FILL_TAIL: tl.constexpr,
+    CACHE_TOKEN_STRIDE: tl.constexpr = 0,
+    CACHE_DIM_STRIDE: tl.constexpr = 1,
 ):
     row = tl.program_id(0)
     batch = row // NEXT_N
@@ -60,44 +62,59 @@ def _paged_logits(
                 tokens < MAX_LEN,
             )
         return
-    logical_page = tokens // PAGE_SIZE
-    valid = (tokens < MAX_LEN) & (tokens < end) & (logical_page < TABLE_WIDTH)
-    page = tl.load(
-        Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
-    ).to(tl.int64)
-    valid = valid & (page >= 0) & (page < NUM_PAGES)
-    # HCU still faults on masked OOB pointers; clamp before forming addresses.
-    page = tl.where(valid, page, 0)
-    slot = tokens % PAGE_SIZE
-    # Keep the full physical-page address in int64. Layer-split caches can
-    # exceed the signed-int32 offset range because pages retain their packed
-    # cross-layer stride.
-    page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
-    in_page_offset = (
-        (slot[None, :] // 16) * (16 * DIM)
-        + (dims[:, None] // 16) * 256
-        + (slot[None, :] % 16) * 16
-        + dims[:, None] % 16
-    )
-    offset = page_base[None, :] + in_page_offset.to(tl.int64)
-    keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
     query_values = tl.load(
         Q + batch * Q_BATCH + query * Q_NEXT + heads[:, None] * Q_HEAD + dims[None, :],
         (heads[:, None] < HEADS) & (dims[None, :] < DIM),
         0.0,
     )
-    dots = tl.dot(query_values, keys)
     weights = tl.load(Weights + row * W_ROW + heads * W_HEAD, heads < HEADS, 0)
-    scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
-        tl.pointer_type(tl.float32)
-    )
-    scales = tl.load(scale_ptr, valid, 0)
-    scores = tl.sum(tl.maximum(dots, 0) * weights[:, None], axis=0) * scales
-    tl.store(
-        Out + row * MAX_LEN + tokens,
-        tl.where(valid, scores, -float("inf")),
-        tokens < MAX_LEN,
-    )
+    # For long BF16 contexts the launch is capped. Each CTA visits only tiles
+    # inside its query's live context, including during graph replay.
+    tile_count = 1
+    if Cache.dtype.element_ty == tl.bfloat16 and not FILL_TAIL:
+        live_tiles = tl.cdiv(tl.minimum(end, MAX_LEN), BLOCK_T)
+        tile_count = tl.cdiv(live_tiles - tl.program_id(1), tl.num_programs(1))
+    for step in range(tile_count):
+        tile_tokens = tokens + step * tl.num_programs(1) * BLOCK_T
+        logical_page = tile_tokens // PAGE_SIZE
+        valid = (tile_tokens < MAX_LEN) & (tile_tokens < end) & (logical_page < TABLE_WIDTH)
+        page = tl.load(
+            Tables + batch * T_BATCH + logical_page * T_PAGE, valid, other=-1
+        ).to(tl.int64)
+        valid = valid & (page >= 0) & (page < NUM_PAGES)
+        # HCU still faults on masked OOB pointers; clamp before forming addresses.
+        page = tl.where(valid, page, 0)
+        slot = tile_tokens % PAGE_SIZE
+        # Keep the full physical-page address in int64. Layer-split caches can
+        # exceed the signed-int32 offset range because pages retain their packed
+        # cross-layer stride.
+        page_base = page.to(tl.int64) * CACHE_PAGE_STRIDE
+        if Cache.dtype.element_ty == tl.bfloat16:
+            in_page_offset = (
+                slot[None, :] * CACHE_TOKEN_STRIDE + dims[:, None] * CACHE_DIM_STRIDE
+            )
+        else:
+            in_page_offset = (
+                (slot[None, :] // 16) * (16 * DIM)
+                + (dims[:, None] // 16) * 256
+                + (slot[None, :] % 16) * 16
+                + dims[:, None] % 16
+            )
+        offset = page_base[None, :] + in_page_offset.to(tl.int64)
+        keys = tl.load(Cache + offset, (dims[:, None] < DIM) & valid[None, :], 0.0)
+        dots = tl.dot(query_values, keys)
+        scores = tl.sum(tl.maximum(dots, 0) * weights[:, None], axis=0)
+        if Cache.dtype.element_ty != tl.bfloat16:
+            scale_ptr = (Cache + page_base + PAGE_SIZE * DIM + slot * 4).to(
+                tl.pointer_type(tl.float32)
+            )
+            scores *= tl.load(scale_ptr, valid, 0)
+        tl.store(
+            Out + row * MAX_LEN + tile_tokens,
+            tl.where(valid, scores, -float("inf")),
+            tile_tokens < MAX_LEN,
+        )
+
 
 def gfx938_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
@@ -144,6 +161,27 @@ def gfx938_fp8_paged_mqa_logits(
         or kv_cache_fp8.dtype not in (torch.uint8, q_fp8.dtype)
     ):
         raise ValueError("cache must contain dense physical HIPC FP8 pages")
+    return strided_paged_mqa_logits(
+        q_fp8, kv_cache_fp8.view(q_fp8.dtype), weights, context_lens,
+        block_tables, max_model_len, fill_tail,
+    )
+
+
+def strided_paged_mqa_logits(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    fill_tail: bool,
+) -> torch.Tensor:
+    """Read physical page strides directly for BF16 or preshuffled FP8 keys."""
+    batch, next_n, heads, dim = q.shape
+    if cache.dtype == torch.bfloat16 and (
+        q.dtype != cache.dtype or cache.shape[2:] != (1, dim) or q.stride(-1) != 1
+    ):
+        raise ValueError("BF16 paged MQA requires matching keys and contiguous query D")
     if weights.shape != (batch * next_n, heads) or weights.dtype != torch.float32:
         raise ValueError("weights must be float32 [batch * next_n, heads]")
     if context_lens.shape not in ((batch,), (batch, next_n)):
@@ -158,26 +196,28 @@ def gfx938_fp8_paged_mqa_logits(
         t.dtype not in (torch.int32, torch.int64) for t in (context_lens, block_tables)
     ):
         raise ValueError("lengths and page IDs must be int32 or int64")
-    tensors = (kv_cache_fp8, weights, context_lens, block_tables)
-    if not q_fp8.is_cuda or any(t.device != q_fp8.device for t in tensors):
+    tensors = (cache, weights, context_lens, block_tables)
+    if not q.is_cuda or any(t.device != q.device for t in tensors):
         raise ValueError("all inputs must be on the same GPU")
     if not isinstance(max_model_len, int) or max_model_len < 0:
         raise ValueError("max_model_len must be a nonnegative integer")
     output = torch.empty(
-        (batch * next_n, max_model_len), dtype=torch.float32, device=q_fp8.device
+        (batch * next_n, max_model_len), dtype=torch.float32, device=q.device
     )
     if max_model_len == 0:
         return output
 
-    cache = kv_cache_fp8.view(q_fp8.dtype)
-    _paged_logits[(batch * next_n, triton.cdiv(max_model_len, 64))](
-        q_fp8,
+    tiles = triton.cdiv(max_model_len, 64)
+    if cache.dtype == torch.bfloat16 and not fill_tail:
+        tiles = min(tiles, 128)
+    _paged_logits[(batch * next_n, tiles)](
+        q,
         cache,
         weights,
         context_lens,
         block_tables,
         output,
-        *q_fp8.stride()[:3],
+        *q.stride()[:3],
         *weights.stride(),
         context_lens.stride(0),
         context_lens.stride(1) if context_lens.ndim == 2 else 0,
@@ -195,6 +235,8 @@ def gfx938_fp8_paged_mqa_logits(
         triton.next_power_of_2(dim),
         64,
         fill_tail,
+        CACHE_TOKEN_STRIDE=cache.stride(1),
+        CACHE_DIM_STRIDE=cache.stride(-1),
         num_warps=4,
     )
     return output
