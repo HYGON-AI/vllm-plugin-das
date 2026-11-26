@@ -27,6 +27,18 @@ def derive_short_bound(indexers):
     return min(limits) if limits else None
 
 
+def indexer_capacity_covers(indexers, max_model_len):
+    """Allow Core auto-fit within one unchanged indexer constructor capacity."""
+    effective = _integer(max_model_len)
+    capacities = {
+        _integer(getattr(owner, "max_model_len", None)) for owner in indexers
+    }
+    if effective is None or len(capacities) != 1 or None in capacities:
+        return False
+    capacity = capacities.pop()
+    return 0 < effective <= capacity
+
+
 def required_bound(limits, lookahead):
     """Only CPU integer budgets are admitted; tensor conversion is forbidden."""
     lookahead = _integer(lookahead)

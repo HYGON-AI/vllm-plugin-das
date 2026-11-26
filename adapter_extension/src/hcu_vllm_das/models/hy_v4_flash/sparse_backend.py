@@ -11,6 +11,7 @@ from vllm.models.hy_v4.nvidia.flashmla_sparse import (
     HYV4FlashMLASparseImpl as CoreSinkImpl,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from ...environment import fp8_fusions_enabled
 from .hisparse_runtime import (
@@ -36,17 +37,46 @@ class FlashSparseImpl(CoreSinkImpl):
         super().__init__(*args, **kwargs)
         self._hcu_ops = get_flashmla_ops() if is_hcu_platform() else None
         # Qualify the current worker device once, outside compilation/capture.
-        # The native 512-column layout is qualified only on gfx938.
+        # Keep bank and real-head admission scoped to qualified worker pairs.
         self._hcu_window_device = None
+        self._hcu_fp8_ds_mla_writer = False
         self._hcu_small_head_device = None
+        self._hcu_small_head_counts = (8, 16)
+        self._hcu_query_concat_device = None
+        self._hcu_query_concat_op = None
         if self._hcu_ops is not None and torch.cuda.is_available():
             device = torch.cuda.current_device()
-            arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-            if arch == "gfx938":
+            properties = torch.cuda.get_device_properties(device)
+            arch = properties.gcnArchName.split(":")[0]
+            self._hcu_fp8_ds_mla_writer = arch == "gfx936"
+            qualified_worker = arch == "gfx938"
+            if arch == "gfx936":
+                from .fullgraph_runner import _qualified_worker_tuple
+
+                qualified_worker = _qualified_worker_tuple(
+                    parallel.tensor_parallel_size, arch,
+                    getattr(properties, "multi_processor_count", None))
+            if qualified_worker:
+                self._hcu_small_head_counts = (
+                    (4, 8) if arch == "gfx936" else (8, 16))
                 self._hcu_window_device = torch.device("cuda", device)
+                if (arch == "gfx936" and self.kv_cache_dtype == "fp8_ds_mla"
+                        and self.num_heads in (4, 8)):
+                    self._hcu_query_concat_device = self._hcu_window_device
                 if fp8_fusions_enabled():
                     self._hcu_small_head_device = self._hcu_window_device
         self._install_hisparse_hook()
+        if self._hcu_query_concat_device is not None:
+            try:
+                from lightop.kvcache import fused_concat_and_store_mla_kv_cache
+            except ImportError:
+                pass  # The existing ATen concat remains a valid copy fallback.
+            else:
+                from hcu_adapter._base import Missing
+
+                if (callable(fused_concat_and_store_mla_kv_cache)
+                        and not isinstance(fused_concat_and_store_mla_kv_cache, Missing)):
+                    self._hcu_query_concat_op = fused_concat_and_store_mla_kv_cache
 
     def _install_hisparse_hook(self):
         # Core prepares the handle and selects write_target BEFORE calling our
@@ -58,6 +88,7 @@ class FlashSparseImpl(CoreSinkImpl):
         if isinstance(self.index_group, HiSparseMLAIndexGroup):
             # Keep the separately qualified HiSparse reader ABI unchanged.
             self._hcu_small_head_device = None
+            self._hcu_query_concat_device = None
             install_hisparse_prewrite_hook(
                 self, self.index_group.cache(self.index_group_index)
             )
@@ -181,6 +212,12 @@ class FlashSparseImpl(CoreSinkImpl):
         args = (kv_c_normed, k_pe, kv_cache, slot_mapping,
                 kv_cache_dtype, k_scale, skip_scale)
         if call is None:
+            if (getattr(self, "_hcu_fp8_ds_mla_writer", False)
+                    and kv_cache_dtype == "fp8_ds_mla"):
+                from .fp8_ds_mla_cache import write_fp8_ds_mla_cache
+
+                return write_fp8_ds_mla_cache(
+                    kv_c_normed, k_pe, kv_cache, slot_mapping)
             return writer(*args)
         binding, metadata = call
         binding.validate_batch(
@@ -191,6 +228,46 @@ class FlashSparseImpl(CoreSinkImpl):
             lambda: writer(*args), kv_cache=kv_cache,
             slot_mapping=slot_mapping, rows=kv_c_normed.shape[0],
         )
+
+    def _concat_query_for_mqa(self, q):
+        device = self._hcu_query_concat_device
+        if device is None or not isinstance(q, tuple) or len(q) != 2:
+            return q
+        nope, rope = q
+        if not (
+            nope.ndim == 3 and rope.ndim == 3
+            and nope.shape[:2] == rope.shape[:2]
+            and nope.shape[1] == self.num_heads and self.num_heads in (4, 8)
+            and nope.shape[2] == 512 and rope.shape[2] == 64
+            and nope.dtype == rope.dtype == torch.bfloat16
+            and nope.device == rope.device == device
+            and nope.stride(-1) == rope.stride(-1) == 1
+        ):
+            return q
+        workspace, *_ = current_workspace_manager().get_simultaneous(
+            *self.workspace_specs
+        )
+        rows, heads = nope.shape[:2]
+        if not (
+            workspace.ndim == 3 and workspace.shape[0] >= rows
+            and workspace.shape[1:] == (heads, 576)
+            and workspace.dtype == torch.bfloat16 and workspace.device == device
+            and workspace.is_contiguous()
+        ):
+            return q  # Never reinterpret a padded H64 or another owner's buffer.
+        output = workspace[:rows]
+        if rows == 0:
+            return output
+        if self._hcu_query_concat_op is None:
+            torch.cat((nope, rope), dim=-1, out=output)
+        else:
+            locations = torch.arange(rows * heads, dtype=torch.int64, device=device)
+            # BF16 output selects plain-copy MODE0, independently of KV FP8 format.
+            self._hcu_query_concat_op(
+                nope.reshape(rows * heads, 512), rope.reshape(rows * heads, 64),
+                output.view(rows * heads, 1, 576), locations, "fp8_e4m3",
+            )
+        return output
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
         call = self._checked_hisparse_call(layer)
@@ -210,6 +287,8 @@ class FlashSparseImpl(CoreSinkImpl):
         # consume the physical hot cache returned by that real IndexGroup path.
         reader = super().forward_mqa
         if call is None:
+            if getattr(self, "_hcu_query_concat_device", None) is not None:
+                q = self._concat_query_for_mqa(q)
             return reader(q, kv_c_and_k_pe_cache, attn_metadata, layer)
         return binding.read(
             lambda: reader(q, kv_c_and_k_pe_cache, attn_metadata, layer)
@@ -271,7 +350,8 @@ class FlashSparseImpl(CoreSinkImpl):
         return (
             q.device == self._hcu_window_device
             and q.ndim == 4 and q.shape[0] == 1
-            and q.shape[2] in (8, 16) and q.shape[3] == 576
+            and q.shape[2] in getattr(self, "_hcu_small_head_counts", (8, 16))
+            and q.shape[3] == 576
             and q.dtype == torch.bfloat16
             and self.fp8_decode_padded_heads == 64
             and cache.device == q.device and cache.dtype == torch.uint8
@@ -286,13 +366,14 @@ class FlashSparseImpl(CoreSinkImpl):
 
     def _use_fp8_small_heads(self, q, cache, indices):
         # The public sparse API takes the real query head count. Qualification
-        # covers gfx938 BF16 Q576 with the contiguous 64-row FP8 cache656 ABI;
+        # covers the admitted gfx938/TP4 and gfx936/TP8 BF16 Q576 worker pairs;
         # other layouts retain Core's padding. No device/env probe during replay.
         return (
             self._hcu_small_head_device is not None
             and q.device == self._hcu_small_head_device
             and q.ndim == 4 and q.shape[0] == 1 and q.shape[1] > 0
-            and q.shape[2] in (8, 16) and q.shape[3] == 576
+            and q.shape[2] in getattr(self, "_hcu_small_head_counts", (8, 16))
+            and q.shape[3] == 576
             and q.dtype == torch.bfloat16
             and self.fp8_decode_padded_heads == 64
             and cache.device == q.device and cache.dtype == torch.uint8

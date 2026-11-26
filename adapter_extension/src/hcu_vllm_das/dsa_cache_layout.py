@@ -135,6 +135,13 @@ class DsaLayerSplitCacheBuilder(DefaultKVCacheConfigBuilder):
 
 def builder_for_config(config):
     if split_config(config) is None:
+        transfer = config.kv_transfer_config
+        if (transfer is not None and transfer.kv_role == 'kv_consumer'
+                and transfer.kv_connector == 'HcuLayerSplitMooncakeConnector'):
+            from .mooncake_layer_split import draft_context_enabled, validate_config
+            if draft_context_enabled(config):
+                validate_config(config)
+                return 'hcu_vllm_das.dsa_cache_pools.DSparkConsumerCacheBuilder'
         return None
     from .dsa_cache_pools import select_scheduler
     select_scheduler(config)

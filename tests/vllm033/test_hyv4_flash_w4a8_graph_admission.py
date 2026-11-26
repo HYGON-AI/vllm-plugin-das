@@ -57,10 +57,13 @@ def validate(api, cfg):
     return function(cfg)
 
 
+@pytest.mark.parametrize("tensor_parallel_size", [4, 8])
 @pytest.mark.parametrize("disable_custom_all_reduce", [True, False])
-def test_qualified_fullpiecewise_preserves_config(api, disable_custom_all_reduce):
+def test_qualified_fullpiecewise_preserves_config(
+        api, disable_custom_all_reduce, tensor_parallel_size):
     cfg = current()
     cfg.parallel_config.disable_custom_all_reduce = disable_custom_all_reduce
+    cfg.parallel_config.tensor_parallel_size = tensor_parallel_size
     before = deepcopy(cfg)
     assert validate(api, cfg) is True
     assert cfg == before
@@ -77,7 +80,7 @@ def test_eager_retains_reference_execution(api):
     ("compilation_config", "cudagraph_mode", NS(name="PIECEWISE")),
     ("compilation_config", "cudagraph_mode", NS(name="FULL")),
     ("parallel_config", "tensor_parallel_size", 2),
-    ("parallel_config", "tensor_parallel_size", 8),
+    ("parallel_config", "tensor_parallel_size", 16),
     ("parallel_config", "data_parallel_size", 2),
     ("parallel_config", "pipeline_parallel_size", 2),
     ("parallel_config", "prefill_context_parallel_size", 2),

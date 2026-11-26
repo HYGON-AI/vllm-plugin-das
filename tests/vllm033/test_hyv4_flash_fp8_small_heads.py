@@ -6,6 +6,7 @@ Run with pytest or ``python -m unittest discover -s tests/vllm033 -p '*small_hea
 """
 
 import ast
+import importlib.util
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace as NS
@@ -129,7 +130,7 @@ class SmallHeadContracts(unittest.TestCase):
 
         def properties(index):
             self.cuda.property_reads.append(index)
-            return NS(gcnArchName=self.cuda.arch)
+            return NS(gcnArchName=self.cuda.arch, multi_processor_count=64)
 
         self.cuda.get_device_properties = properties
 
@@ -168,10 +169,17 @@ class SmallHeadContracts(unittest.TestCase):
         parent.__path__ = []
         swa = ModuleType(package + ".swa")
         swa.FlashWindowIndexer = WindowProducer
+        # Load the actual pure tuple predicate for the added gfx936 branch.
+        # This fixture remains TP4/64CU, so gfx936 stays an unqualified fallback.
+        gate_name = package + ".fullgraph_runner"
+        spec = importlib.util.spec_from_file_location(
+            gate_name, self.source.with_name("fullgraph_runner.py"))
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
         group = ModuleType("vllm.v1.attention.backends.mla.index_group")
         group.HiSparseMLAIndexGroup = HiSparseGroup
         self.modules = patch.dict(sys.modules, {
-            package: parent, package + ".swa": swa,
+            package: parent, package + ".swa": swa, gate_name: gate,
             "vllm.v1.attention.backends.mla.index_group": group,
         })
         self.modules.start()
@@ -182,6 +190,7 @@ class SmallHeadContracts(unittest.TestCase):
                         uint8="uint8", int32="int32"),
             "F": NS(pad=pad), "fp8_fusions_enabled": master_policy,
             "get_current_vllm_config": lambda: NS(parallel_config=NS(
+                tensor_parallel_size=4,
                 prefill_context_parallel_size=1, decode_context_parallel_size=1)),
             "get_flashmla_ops": lambda: self.provider,
             "is_hcu_platform": lambda: True,
