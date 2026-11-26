@@ -305,6 +305,60 @@ class CacheFormatPolicy(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     function(owner, *inputs, None)
 
+    def test_dfly_derived_width_keeps_all_indices_and_e5_real_heads(self):
+        # Execute the actual draft width construction: the target's 2048
+        # entries and six query positions occupy a padded 2176-column buffer.
+        tree = ast.parse((SOURCE / "dfly.py").read_text(encoding="utf-8"))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "HYV4DFlyModel")
+        ctor = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "__init__")
+        assignments = [n for n in ctor.body if isinstance(n, ast.Assign)
+                       and any(ast.unparse(t) in ("self.query_width", "config.index_topk")
+                               for t in n.targets)]
+        self.assertEqual(len(assignments), 2)
+        config = SimpleNamespace(target_index_topk=2048, context_local_window=None)
+        scope = {"self": SimpleNamespace(), "config": config,
+                 "spec": SimpleNamespace(num_speculative_tokens=5),
+                 "round_up": lambda n, k: ((n + k - 1) // k) * k}
+        exec(compile(ast.Module(body=assignments, type_ignores=[]),
+                     "<actual-dfly-width>", "exec"), scope)
+        self.assertEqual(config.index_topk, 2176)
+
+        namespace = {"torch": SimpleNamespace(bfloat16="bf16", uint8="u8", int32="i32"),
+                     "F": SimpleNamespace(pad=lambda q, padding: Tensor(
+                         (1, q.shape[1], q.shape[2] + padding[3], 576), q.dtype))}
+        small_heads = actual_method("_use_fp8_small_heads", namespace)
+        kernel = actual_method("_fp8_flash_mla_kernel", namespace)
+        for formats, expected_heads in ((("e4m3", "e5m2"), None), (("e4m3",), 64)):
+            codec = self.select(formats=lambda: formats)
+            for heads in (4, 8):
+                with self.subTest(codec=codec.name, heads=heads):
+                    calls = []
+                    def decode(**kwargs):
+                        calls.append(kwargs)
+                        return Tensor((1, 7, 64, 512), "bf16"), Tensor((1, 64, 7), "f32")
+                    owner = SimpleNamespace(
+                        _hcu_ops=SimpleNamespace(get_metadata=lambda: (object(), None),
+                                                 with_kvcache=decode),
+                        _hcu_fp8_cache_format=codec, _hcu_window_device="cuda:0",
+                        _hcu_small_head_device="cuda:0", _hcu_small_head_counts=(4, 8),
+                        _use_window_fp8_prefix=lambda *args: False,
+                        fp8_decode_padded_heads=64, _sinks_for_query=lambda *args: None,
+                        softmax_scale=.0625)
+                    owner._use_fp8_small_heads = lambda *args: small_heads(owner, *args)
+                    indices = Tensor((1, 7, config.index_topk), "i32")
+                    kernel(owner, Tensor((1, 7, heads, 576), "bf16"),
+                           Tensor((2, 64, 656), "u8"), indices, None)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0]["indices"].shape, indices.shape)
+                    self.assertIsNot(calls[0]["indices"], indices)
+                    self.assertEqual(calls[0]["q"].shape[2], expected_heads or heads)
+                    if codec.name == "e5m2":
+                        self.assertEqual(calls[0]["kv_cache_format"], "e5m2")
+                    else:
+                        self.assertNotIn("kv_cache_format", calls[0])
+
     def test_actual_worker_ctor_policy_and_hisparse_domain(self):
         tree = ast.parse((SOURCE / "sparse_backend.py").read_text(encoding="utf-8"))
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)

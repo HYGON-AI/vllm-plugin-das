@@ -413,6 +413,11 @@ class FlashSparseImpl(CoreSinkImpl):
         # The public sparse API takes the real query head count. Qualification
         # covers the admitted gfx938/TP4 and gfx936/TP8 BF16 Q576 worker pairs;
         # other layouts retain Core's padding. No device/env probe during replay.
+        codec = getattr(self, "_hcu_fp8_cache_format", None)
+        # DFly's 2048 target entries plus six query positions are rounded to
+        # 2176. Preserve the complete draft union and the E5 real-head path;
+        # the separately qualified legacy E4 domain stays unchanged.
+        e5 = codec is not None and codec.name == "e5m2"
         return (
             self._hcu_small_head_device is not None
             and q.device == self._hcu_small_head_device
@@ -426,7 +431,8 @@ class FlashSparseImpl(CoreSinkImpl):
             and cache.is_contiguous()
             and indices.ndim == 3
             and indices.shape[:2] == q.shape[:2]
-            and indices.shape[-1] in (512, 2048)
+            and (indices.shape[-1] in (512, 2048)
+                 or (e5 and indices.shape[-1] == 2176))
             and indices.dtype == torch.int32 and indices.device == q.device
             and indices.stride(-1) == 1
         )
@@ -456,7 +462,7 @@ class FlashSparseImpl(CoreSinkImpl):
             and kv_c_and_k_pe_cache.stride(-1) == 1
             and topk_indices.device == q.device and topk_indices.dtype == torch.int32
             and topk_indices.ndim == 3 and topk_indices.shape[:2] == q.shape[:2]
-            and topk_indices.shape[-1] in (512, 2048)
+            and topk_indices.shape[-1] in (512, 2048, 2176)
             and topk_indices.stride(-1) == 1
         ):
             raise ValueError("E5 sparse656 requires the qualified ordinary H4/H8 layout")
