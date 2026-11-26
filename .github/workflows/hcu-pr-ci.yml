@@ -24,6 +24,7 @@ env:
 jobs:
   static-and-select:
     name: Static gate and test selection
+    if: vars.HCU_CI_RUNNER_MODE_V0281 == 'legacy'
     runs-on:
       - self-hosted
       - ci
@@ -298,6 +299,14 @@ jobs:
     permissions:
       contents: read
 
+  arc-hcu-ci:
+    name: ARC PR contracts and selected tests
+    if: vars.HCU_CI_RUNNER_MODE_V0281 == '' || vars.HCU_CI_RUNNER_MODE_V0281 == 'k8s'
+    uses: ./.github/workflows/_hcu-pr-ci-k8s.yml
+    permissions:
+      contents: read
+      issues: read
+
   ci-gate:
     name: ci-gate
     if: always()
@@ -305,11 +314,11 @@ jobs:
       - static-and-select
       - authorize-hcu
       - selected-hcu-tests
-    runs-on:
-      - self-hosted
-      - ci
-      - bw1100
+      - arc-hcu-ci
+    runs-on: ubuntu-latest
     env:
+      RUNNER_MODE: ${{ vars.HCU_CI_RUNNER_MODE_V0281 }}
+      ARC_RESULT: ${{ needs.arc-hcu-ci.result }}
       STATIC_RESULT: ${{ needs.static-and-select.result }}
       AUTH_RESULT: ${{ needs.authorize-hcu.result }}
       HCU_RESULT: ${{ needs.selected-hcu-tests.result }}
@@ -319,6 +328,17 @@ jobs:
     steps:
       - name: Enforce aggregate result
         run: |
+          case "${RUNNER_MODE:-k8s}" in
+            k8s)
+              if [[ "$ARC_RESULT" != "success" ]]; then
+                echo "ARC PR contracts or selected HCU tests did not pass."
+                exit 1
+              fi
+              exit 0
+              ;;
+            legacy) ;;
+            *) echo "HCU_CI_RUNNER_MODE_V0281 must be legacy or k8s" >&2; exit 2 ;;
+          esac
           echo "static=$STATIC_RESULT auth=$AUTH_RESULT hcu=$HCU_RESULT"
           echo "selected=$HAS_JOBS authorized=$AUTHORIZED groups=$GROUPS"
           if [[ "$STATIC_RESULT" != "success" ]]; then

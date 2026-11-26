@@ -146,6 +146,55 @@ def test_mooncake_uses_v028_page_layout(mooncake):
 
 
 @pytest.mark.parametrize(
+    ("indexer_n_heads", "disable_qsa", "expected"),
+    [(8, None, "BLHNC"), (8, "0", "BLHNC"), (8, "1", "LBHNC"), (None, None, "LBHNC")],
+)
+def test_mooncake_layout_follows_qwen4_exp_qsa(
+    mooncake, monkeypatch, indexer_n_heads, disable_qsa, expected
+):
+    """QSA supports only block-first layouts; BLHNC keeps heads contiguous."""
+    if disable_qsa is None:
+        monkeypatch.delenv("VLLM_HCU_DISABLE_QSA", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_DISABLE_QSA", disable_qsa)
+    hf_config = SimpleNamespace(indexer_n_heads=indexer_n_heads)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=False, hf_text_config=hf_config)
+    )
+    assert mooncake.MooncakeConnector.get_required_kvcache_layout(config) == expected
+
+
+def test_qsa_layout_is_resolved_and_registrable(mooncake):
+    from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
+    from vllm.v1.kv_cache_interface import KVCacheTensor, create_kv_cache_views
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    assert KVCacheLayout.BLHNC in QSAStateBackend.supported_kv_cache_layouts()
+    assert KVCacheLayout.LBHNC not in QSAStateBackend.supported_kv_cache_layouts()
+
+    name = "model.layers.0.self_attn"
+    spec = mooncake.FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    raw = torch.zeros(4 * spec.page_size_bytes, dtype=torch.int8)
+    placement = KVCacheTensor(
+        size=raw.numel(), layers=[name],
+        layer_stride=raw.numel(), block_stride=spec.page_size_bytes,
+    )
+    for layout, ok in ((KVCacheLayout.BLHNC, True), (KVCacheLayout.BLNHC, False)):
+        cache = create_kv_cache_views(raw, spec, 4, layout, placement)[0]
+        worker = _worker(mooncake, blocks_first=False, tp_size=1)
+        worker._layer_specs[name] = spec
+        worker._layer_group_indices[name] = 0
+        if ok:
+            worker.register_kv_caches({name: cache})
+            assert worker.kv_block_len_per_layer == [spec.page_size_bytes]
+        else:
+            with pytest.raises(ValueError, match="BLHNC when Qwen4Exp QSA"):
+                worker.register_kv_caches({name: cache})
+
+
+@pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"remote_block_lens": [64, 64]}, "inconsistent cache-entry counts"),
@@ -274,10 +323,10 @@ def test_phase1_feature_gates(mooncake):
     )
     with pytest.raises(ValueError, match="positive number"):
         mooncake._validate_phase1_kv_cache_config(valid, 0)
-    with pytest.raises(NotImplementedError, match="Mamba/GDN"):
-        mooncake._validate_phase1_kv_cache_config(
-            SimpleNamespace(has_mamba_layers=True, kv_cache_groups=[object()]), 1
-        )
+    # Mamba/GDN groups are accepted; per-layer support is checked at registration.
+    mooncake._validate_phase1_kv_cache_config(
+        SimpleNamespace(has_mamba_layers=True, kv_cache_groups=[object()]), 1
+    )
     with pytest.raises(ValueError, match="at least one"):
         mooncake._validate_phase1_kv_cache_config(
             SimpleNamespace(has_mamba_layers=False, kv_cache_groups=[]), 1
@@ -1276,3 +1325,175 @@ def test_final_pp_stage_registers_backbone_and_only_declared_draft_cache(mooncak
     assert worker.registered_layer_names == names
     assert worker.registered_layer_indices == [77, 78]
     assert len(worker.engine.calls) == 1
+
+
+def _mamba_spec(mooncake, *, padded=False):
+    spec = mooncake.MambaSpec(
+        block_size=16,
+        shapes=((3, 4), (2, 5)),
+        dtypes=(torch.float16, torch.float32),
+    )
+    if padded:
+        spec = mooncake.MambaSpec(
+            block_size=16, shapes=spec.shapes, dtypes=spec.dtypes,
+            page_size_padded=spec.page_size_bytes + 40,
+        )
+    return spec
+
+
+def _mamba_worker(
+    mooncake, name, spec, *, tp_size=1, num_blocks=4, wrapped=False, kernel_ratio=1
+):
+    from vllm.v1.kv_cache_interface import (
+        KVCacheTensor,
+        UniformTypeKVCacheSpecs,
+        create_kv_cache_views,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    worker = _worker(mooncake, blocks_first=False, tp_size=tp_size, tp_rank=0)
+    worker._has_mamba = True
+    raw = torch.zeros(num_blocks * spec.page_size_bytes, dtype=torch.int8)
+    placement = KVCacheTensor(
+        size=raw.numel(), layers=[name],
+        layer_stride=raw.numel(), block_stride=spec.page_size_bytes,
+    )
+    cache = create_kv_cache_views(
+        raw, spec, num_blocks, KVCacheLayout.LBHNC, placement,
+    )[0]
+    # Hybrid/MTP groups wrap per-layer specs; the worker unwraps per layer.
+    group_spec = (
+        UniformTypeKVCacheSpecs(block_size=spec.block_size, kv_cache_specs={name: spec})
+        if wrapped
+        else spec
+    )
+    worker._layer_specs[name] = spec
+    worker._layer_group_indices[name] = 0
+    worker._physical_blocks_per_logical_kv_block = kernel_ratio
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=group_spec)]
+    )
+    worker.register_kv_caches({name: cache})
+    return worker, cache
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_mamba_registration_uses_state_page_as_one_region(mooncake, padded):
+    name = "model.layers.0.linear_attn"
+    spec = _mamba_spec(mooncake, padded=padded)
+    worker, cache = _mamba_worker(mooncake, name, spec)
+    assert worker.block_len_per_layer == [spec.page_size_bytes]
+    assert worker.kv_block_len_per_layer == [spec.state_content_size_bytes]
+    assert worker.kv_block_len_per_layer[0] <= worker.block_len_per_layer[0]
+    regions = worker._get_transfer_regions(
+        worker.kv_caches_base_addr, worker.block_len_per_layer,
+        worker.kv_block_len_per_layer, worker.registered_layer_names,
+        worker.registered_layer_indices, worker.registered_group_indices,
+        num_blocks_per_layer=worker.num_blocks_per_layer,
+    )
+    assert len(regions) == 1 and regions[0].num_blocks == 4
+
+
+@pytest.mark.parametrize("kernel_ratio", [1, 2])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_mamba_state_pages_transfer_exact_bytes(mooncake, padded, wrapped, kernel_ratio):
+    """Copy GDN state pages through the real planner, skipping null blocks.
+
+    Enough capacity is registered that a misclassified group (state ids
+    expanded as attention kernel blocks) stays in bounds and would silently
+    copy the wrong pages instead of being rejected.
+    """
+    import ctypes
+
+    name = "model.layers.0.linear_attn"
+    num_blocks = 16
+    spec = _mamba_spec(mooncake, padded=padded)
+    kwargs = dict(num_blocks=num_blocks, wrapped=wrapped, kernel_ratio=kernel_ratio)
+    producer, p_cache = _mamba_worker(mooncake, name, spec, **kwargs)
+    consumer, d_cache = _mamba_worker(mooncake, name, spec, **kwargs)
+    payload = spec.state_content_size_bytes
+    p_bytes = p_cache.view(torch.int8).reshape(num_blocks, -1)
+    for page in range(num_blocks):
+        p_bytes[page, :payload] = page + 1
+    # Bytes past the payload are page padding and must not travel.
+    p_bytes[:, payload:] = 99
+
+    def regions_of(worker):
+        return worker._get_transfer_regions(
+            worker.kv_caches_base_addr, worker.block_len_per_layer,
+            worker.kv_block_len_per_layer, worker.registered_layer_names,
+            worker.registered_layer_indices, worker.registered_group_indices,
+            num_blocks_per_layer=worker.num_blocks_per_layer,
+        )
+
+    null = mooncake.NULL_BLOCK_ID
+    metadata = _metadata(
+        mooncake, remote_tp_rank=0, remote_tp_size=1,
+        req_blocks={"d": ("x", [[null, 3]])},
+        num_blocks_per_layer=consumer.num_blocks_per_layer,
+    )
+    send = mooncake.SendBlockMeta(
+        p_req_id="p", transfer_id="x", local_block_ids=[[null, 2]],
+        ready=asyncio.Event(),
+    )
+    src, dst, lengths, errors, message = asyncio.run(
+        producer._build_transfer_params(
+            [("d", send)], metadata, regions_of(producer), regions_of(consumer),
+        )
+    )
+    assert errors == [] and message is None
+    assert lengths == [payload]
+    for src_ptr, dst_ptr, length in zip(src, dst, lengths):
+        ctypes.memmove(dst_ptr, src_ptr, length)
+    d_bytes = d_cache.view(torch.int8).reshape(num_blocks, -1)
+    torch.testing.assert_close(d_bytes[3, :payload], p_bytes[2, :payload])
+    assert torch.count_nonzero(d_bytes[3, payload:]) == 0
+    assert all(
+        torch.count_nonzero(d_bytes[i]) == 0 for i in range(num_blocks) if i != 3
+    )
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_mamba_group_block_ids_stay_in_logical_space(mooncake, wrapped):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    attn = "model.layers.1.self_attn"
+    gdn = "model.layers.0.linear_attn"
+    attn_spec = mooncake.FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    mamba_spec = _mamba_spec(mooncake)
+    if wrapped:
+        attn_spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={attn: attn_spec})
+        mamba_spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={gdn: mamba_spec})
+    worker = _worker(mooncake, blocks_first=False)
+    worker._physical_blocks_per_logical_kv_block = 2
+    worker.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=attn_spec),
+            SimpleNamespace(kv_cache_spec=mamba_spec),
+        ]
+    )
+    assert worker._logical_to_kernel_block_ids([[1, 3], [2]]) == [[2, 3, 6, 7], [2]]
+
+
+def test_mamba_group_classification_rejects_mixed_wrapper(mooncake):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    attn_spec = mooncake.FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    mixed = UniformTypeKVCacheSpecs(
+        block_size=16, kv_cache_specs={"a": attn_spec, "m": _mamba_spec(mooncake)}
+    )
+    with pytest.raises(ValueError, match="mixes Mamba"):
+        mooncake._is_mamba_group_spec(mixed)
+
+
+def test_mamba_guard_premise_tp_ratio_detects_heterogeneous_tp(mooncake):
+    name = "model.layers.0.linear_attn"
+    spec = _mamba_spec(mooncake)
+    worker, _ = _mamba_worker(mooncake, name, spec, tp_size=2)
+    assert worker.transfer_topo.tp_ratio(1) != 1
+    assert worker.transfer_topo.tp_ratio(2) == 1

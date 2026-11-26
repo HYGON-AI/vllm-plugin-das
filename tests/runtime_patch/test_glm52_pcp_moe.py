@@ -502,3 +502,364 @@ def test_hash_router_receives_gathered_auxiliaries_in_real_forward_impl(
     result = runner._forward_impl(make_hidden(), make_logits(), None, ids)
     torch.testing.assert_close(result, make_hidden())
     assert context.is_padding is padding
+
+
+@pytest.mark.parametrize("with_ids", [False, True])
+@pytest.mark.parametrize("with_padding", [False, True])
+@pytest.mark.parametrize("raise_in_router", [False, True])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("pcp_size", [1, 2])
+def test_naive_dispatch_aligns_routing_auxiliaries(
+    monkeypatch, moe_runner_module, with_ids, with_padding,
+    raise_in_router, sequence_parallel, pcp_size,
+):
+    """DP ranks may have different row counts and different padding bits."""
+    # This matrix models DP/PCP only. Real TP>1 SP coordinates are below.
+    monkeypatch.setattr(moe_runner_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    from contextlib import nullcontext
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner._ep_fused_combine = False
+    runner.gate = None
+    runner._shared_experts = None
+    runner.moe_config = SimpleNamespace(
+        dp_size=4, tp_size=1, pcp_size=pcp_size,
+        is_sequence_parallel=sequence_parallel,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    runner.routed_experts = SimpleNamespace(
+        _ensure_moe_quant_config_init=lambda: None,
+        quant_method=SimpleNamespace(supports_internal_mk=False),
+    )
+    # Ranks have [2, 1, 3, 2] rows, with nonidentical padding patterns.
+    masks = [torch.tensor(bits) for bits in (
+        [False, True], [False], [True, False, True], [False, False],
+    )]
+    ids = [torch.arange(10 * rank, 10 * rank + len(mask))
+           for rank, mask in enumerate(masks)]
+    # The runner's backing buffer may extend beyond this layer's local rows.
+    original_mask = torch.tensor([False, True, True, True]) if with_padding else None
+    context = SimpleNamespace(is_padding=original_mask)
+    expected_mask = torch.cat(masks)
+    hidden = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    logits = hidden + 100
+    calls = []
+
+    class Group:
+        def dispatch_router_logits(self, x, gate, sp, extra_tensors=None):
+            assert sp == sequence_parallel
+            calls.append(extra_tensors)
+            torch.testing.assert_close(x, hidden[:2])
+            torch.testing.assert_close(gate, logits[:2])
+            if extra_tensors is None:
+                return hidden, logits
+            gathered = []
+            for tensor in extra_tensors:
+                if tensor.dtype == torch.int32:
+                    torch.testing.assert_close(tensor, masks[0].to(torch.int32))
+                    gathered.append(torch.cat(masks).to(torch.int32))
+                else:
+                    torch.testing.assert_close(tensor, ids[0])
+                    gathered.append(torch.cat(ids))
+            return hidden, logits, gathered
+
+        def combine(self, tensor, sp):
+            assert sp == sequence_parallel
+            return tensor[:2 * pcp_size]
+
+    class PCPGroup:
+        def all_gather(self, tensor, dim=0):
+            assert tensor.dtype != torch.bool
+            peer = ~tensor.to(torch.bool) if tensor.dtype == torch.int32 else tensor + 200
+            if tensor.dtype == torch.int32:
+                peer = peer.to(torch.int32)
+            return torch.cat((tensor, peer), dim=dim)
+
+        def reduce_scatter(self, tensor, dim=0):
+            return tensor[:2]
+
+    if pcp_size == 2:
+        expected_mask = torch.cat((expected_mask, ~expected_mask))
+    expected_hidden = hidden if pcp_size == 1 else torch.cat((hidden, hidden + 200))
+    expected_logits = logits if pcp_size == 1 else torch.cat((logits, logits + 200))
+    expected_ids = torch.cat(ids)
+    if pcp_size == 2:
+        expected_ids = torch.cat((expected_ids, expected_ids + 200))
+    monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: PCPGroup())
+    monkeypatch.setattr(moe_runner_module, "get_ep_group", lambda: Group())
+    monkeypatch.setattr(moe_runner_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(moe_runner_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(runner, "_sequence_parallel_context", nullcontext)
+    monkeypatch.setattr(runner, "_maybe_sync_shared_experts_stream", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_use_int8_allgatherv_dispatch", lambda _x: False)
+
+    def route_and_apply(*, hidden_states, router_logits, input_ids, **kwargs):
+        torch.testing.assert_close(hidden_states, expected_hidden)
+        torch.testing.assert_close(router_logits, expected_logits)
+        if with_padding:
+            assert context.is_padding.shape[0] == router_logits.shape[0]
+            torch.testing.assert_close(context.is_padding, expected_mask)
+        else:
+            assert context.is_padding is None
+        if with_ids:
+            torch.testing.assert_close(input_ids, expected_ids)
+        else:
+            assert input_ids is None
+        if raise_in_router:
+            raise RuntimeError("router failure")
+        return None, hidden_states
+
+    monkeypatch.setattr(runner, "_apply_quant_method", route_and_apply)
+    if raise_in_router:
+        with pytest.raises(RuntimeError, match="router failure"):
+            runner._forward_impl(hidden[:2], logits[:2], None, ids[0] if with_ids else None)
+    else:
+        result = runner._forward_impl(hidden[:2], logits[:2], None, ids[0] if with_ids else None)
+        torch.testing.assert_close(result, hidden[:2])
+    assert context.is_padding is original_mask
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("use_ep", [False, True])
+@pytest.mark.parametrize("raise_in_router", [False, True])
+@pytest.mark.parametrize("tp_size,bits,bitmap_scope", [
+    pytest.param(tp, bits, scope, id=f"tp{tp}-{name}-{scope}")
+    for tp in (2, 4)
+    for name, bits in (
+        ("tail", [False, False, True, True]),
+        ("interior", [False, True, False, False]),
+        ("uneven", [False, True, False]),
+        ("single", [False]),
+        ("empty", []),
+    )
+    for scope in ("tp_global", "tp_local", "inferred_local")
+    if scope != "inferred_local" or (len(bits) + tp - 1) // tp > 1
+])
+def test_sequence_parallel_padding_uses_activation_coordinates(
+    monkeypatch, moe_runner_module, tp_size, use_ep, bitmap_scope,
+    raise_in_router, bits,
+):
+    """Use Core's real SP chunk; double only the rank-ordered collective.
+
+    The one-row case has identical local/global shapes. Such local producers
+    must declare their coordinate domain rather than rely on shape inference.
+    """
+    from contextlib import nullcontext
+    from vllm.model_executor.models import utils as model_utils
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    global_mask = torch.tensor(bits, dtype=torch.bool)
+    global_hidden = torch.arange(2 * len(bits), dtype=torch.float32).reshape(-1, 2)
+    local_rows = (len(bits) + tp_size - 1) // tp_size
+    expected_mask = torch.cat((
+        global_mask, torch.ones(tp_size * local_rows - len(bits), dtype=torch.bool),
+    ))
+    rank_holder = [0]
+    for module in (model_utils, moe_runner_module):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank_holder[0], raising=False)
+    chunks = []
+    for rank in range(tp_size):
+        rank_holder[0] = rank
+        chunks.append(model_utils.sequence_parallel_chunk_impl(global_hidden))
+    expected_hidden = torch.cat(chunks)
+    expected_logits = expected_hidden + 100
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        dp_size=1, pcp_size=1, sp_size=tp_size,
+        # EP collapses expert TP, but not the activation SP partition.
+        tp_size=1 if use_ep else tp_size,
+        is_sequence_parallel=True,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(supports_internal_mk=False),
+    )
+    for rank in range(tp_size):
+        rank_holder[0] = rank
+        runner.moe_config.tp_rank = 0 if use_ep else rank
+        start = rank * local_rows
+        local_mask = expected_mask[start:start + local_rows]
+        original_mask = global_mask if bitmap_scope == "tp_global" else local_mask.clone()
+        additional_kwargs = (
+            {"hcu_moe_padding_is_local": True} if bitmap_scope == "tp_local" else {}
+        )
+        context = SimpleNamespace(is_padding=original_mask, additional_kwargs=additional_kwargs)
+        before = original_mask.clone()
+        calls = []
+
+        class Group:
+            def dispatch_router_logits(self, x, gate, sp, extra_tensors=None):
+                assert sp
+                torch.testing.assert_close(x, chunks[rank])
+                torch.testing.assert_close(gate, chunks[rank] + 100)
+                assert len(extra_tensors) == 1
+                wire_mask, = extra_tensors
+                assert wire_mask.dtype == torch.int32
+                # Other ranks contribute independent expected slices. This
+                # rank must contribute what the real runner actually sent.
+                gathered = expected_mask.to(torch.int32)
+                gathered[start:start + local_rows] = wire_mask
+                calls.append(wire_mask)
+                return expected_hidden, expected_logits, [gathered]
+
+        monkeypatch.setattr(moe_runner_module, "get_ep_group", lambda: Group())
+        monkeypatch.setattr(moe_runner_module, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(moe_runner_module, "get_forward_context", lambda: context)
+        error = pytest.raises(RuntimeError, match="router failure") if raise_in_router else nullcontext()
+        with error:
+            with runner._dispatched_routing_inputs(chunks[rank], chunks[rank] + 100, None) as routed:
+                routed_hidden, routed_logits, routed_ids = routed
+                torch.testing.assert_close(routed_hidden, expected_hidden)
+                torch.testing.assert_close(routed_logits, expected_logits)
+                assert routed_ids is None
+                torch.testing.assert_close(context.is_padding, expected_mask)
+                # Model the native router sentinel, including interior masks.
+                ids = torch.arange(expected_mask.numel())
+                torch.testing.assert_close(
+                    ids.masked_fill(context.is_padding, -1),
+                    ids.masked_fill(expected_mask, -1),
+                )
+                if raise_in_router:
+                    raise RuntimeError("router failure")
+        assert len(calls) == 1
+        assert context.is_padding is original_mask
+        assert context.additional_kwargs is additional_kwargs
+        torch.testing.assert_close(original_mask, before)
+
+
+@pytest.mark.parametrize(("tp_size", "num_tokens"), [(2, 2), (4, 2), (4, 4)])
+@pytest.mark.parametrize("raise_in_router", [False, True])
+@pytest.mark.parametrize("initial_padding", [False, True])
+def test_hc_sp_producer_single_row_bitmap_reaches_runner(
+    monkeypatch, moe_runner_module, tp_size, num_tokens,
+    raise_in_router, initial_padding,
+):
+    """Exercise the real HC-SP producer, not a hand-marked local bitmap."""
+    from contextlib import nullcontext
+    from vllm_hcu.patch.worker.core_fix import patch_qwen4_exp_sp as sp
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    rank_holder = [0]
+    for module in (sp, moe_runner_module):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank_holder[0])
+        monkeypatch.setattr(module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(sp, "envs", SimpleNamespace(VLLM_MOE_SKIP_PADDING=True))
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        dp_size=2, pcp_size=1, sp_size=tp_size, tp_size=1,
+        is_sequence_parallel=True,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(supports_internal_mk=False),
+    )
+    expected = torch.tensor([False] * num_tokens + [True] * (tp_size - num_tokens))
+    expected = expected.repeat(2)
+    hidden = torch.arange(num_tokens * 2, dtype=torch.float32).view(num_tokens, 2)
+    gathered_masks = []
+    for rank in range(tp_size):
+        rank_holder[0] = rank
+        context = SimpleNamespace(
+            is_padding=torch.zeros(num_tokens, dtype=torch.bool) if initial_padding else None,
+            additional_kwargs={},
+        )
+        for module in (sp, moe_runner_module):
+            monkeypatch.setattr(module, "get_forward_context", lambda: context)
+        local_hidden = sp.shard_tokens_for_hc_sp(hidden)
+        original_mask = context.is_padding
+
+        class Group:
+            def dispatch_router_logits(self, x, logits, is_sp, extra_tensors=None):
+                assert is_sp
+                assert len(extra_tensors) == 1
+                # Only collective/native boundaries are doubled. The current
+                # rank's real producer/runner payload replaces its expected row.
+                bitmap = expected.to(extra_tensors[0].dtype)
+                bitmap[rank] = extra_tensors[0][0]
+                gathered_masks.append(bitmap.to(torch.bool))
+                return x.repeat(tp_size * 2, 1), logits.repeat(tp_size * 2, 1), [bitmap]
+
+        monkeypatch.setattr(moe_runner_module, "get_ep_group", lambda: Group())
+        error = pytest.raises(RuntimeError, match="router failure") if raise_in_router else nullcontext()
+        with error:
+            with runner._dispatched_routing_inputs(local_hidden, local_hidden + 1, None):
+                torch.testing.assert_close(context.is_padding, expected)
+                if raise_in_router:
+                    raise RuntimeError("router failure")
+        assert context.is_padding is original_mask
+    assert len(gathered_masks) == tp_size
+
+
+@pytest.mark.parametrize("skip_padding", ["0", "1"])
+@pytest.mark.parametrize("with_ids", [False, True])
+@pytest.mark.parametrize("rank", [0, 3])
+def test_routing_bitmap_preserves_ipc_provider_selection(
+    monkeypatch, moe_runner_module, skip_padding, with_ids, rank,
+):
+    """Real runner -> Core AGRS -> HCU wrapper -> real IPC eligibility."""
+    from vllm.distributed.device_communicators import all2all
+    from tests.runtime_patch.test_ipc_all_gather import (
+        _logical_gather, _patched_communicator,
+    )
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", skip_padding)
+    ag = _logical_gather(rank=rank)
+    ag.world_size = 4
+    decisions = []
+
+    def native_gather(tensors, sizes):
+        # Native communication only: record the wrapper's provider decision
+        # and emulate rank-ordered rows with distinct per-rank padding masks.
+        decisions.append("ipc")
+        outputs = [torch.cat([t] * 4) for t in tensors]
+        if len(tensors) > 2:
+            assert tensors[-1].dtype == torch.int32
+            assert tensors[-1].shape == (2,)
+            outputs[-1] = torch.tensor([0, 1, 1, 0, 0, 0, 1, 1], dtype=torch.int32)
+        return outputs
+
+    monkeypatch.setattr(ag, "gather", native_gather)
+    comm = _patched_communicator(monkeypatch, ag)
+    comm.world_size, comm.rank_in_group = 4, rank
+    masks = torch.tensor([False, True, True, False, False, False, True, True])
+    original = masks[rank * 2:rank * 2 + 2].clone()
+    context = SimpleNamespace(
+        is_padding=original, additional_kwargs={},
+        dp_metadata=SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: [2] * 4),
+    )
+    for module in (all2all, moe_runner_module):
+        monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(all2all, "get_dp_group", lambda: comm)
+    manager = object.__new__(all2all.AgRsAll2AllManager)
+    manager.dp_world_size = 4
+    monkeypatch.setattr(moe_runner_module, "get_ep_group", lambda: manager)
+    monkeypatch.setattr(moe_runner_module, "is_forward_context_available", lambda: True)
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        dp_size=4, pcp_size=1, tp_size=1, is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(supports_internal_mk=False),
+    )
+    hidden = torch.zeros(2, 64, dtype=torch.bfloat16)
+    logits = torch.zeros(2, 512)
+    manager.dispatch_router_logits(hidden, logits)  # eligible baseline
+    assert decisions == ["ipc"]
+    ids = torch.arange(2, dtype=torch.int64) if with_ids else None
+    with runner._dispatched_routing_inputs(hidden, logits, ids) as (x, gate, routed_ids):
+        assert decisions == ["ipc", "ipc"]
+        assert not comm.events  # never entered original all_gatherv fallback
+        assert x.shape == (8, 64) and gate.shape == (8, 512)
+        torch.testing.assert_close(context.is_padding, masks)
+        if with_ids:
+            torch.testing.assert_close(routed_ids, ids.repeat(4))
+    assert context.is_padding is original

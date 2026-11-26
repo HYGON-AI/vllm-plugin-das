@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 
 import importlib.util
@@ -649,7 +650,7 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MoERunner")
     names = {"_maybe_dispatch", "_maybe_combine", "do_naive_dispatch_combine",
-             "_pcp_routing_inputs"}
+             "_dispatched_routing_inputs"}
     methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     calls = []
     group = NS(all_gather=lambda x, **kw: calls.append("gather") or x,
@@ -675,19 +676,23 @@ def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
     assert runner._maybe_combine(None, x) is x
     ids = torch.tensor([17, 23])
     for _ in range(2):
-        with runner._pcp_routing_inputs(ids, 2) as routing_ids:
+        with runner._dispatched_routing_inputs(x, logits, ids) as dispatched:
+            routed_x, routed_logits, routing_ids = dispatched
+            assert routed_x is x and routed_logits is logits
             assert routing_ids is ids
             assert context.is_padding is padding
         assert context.is_padding is padding
     assert calls == []
     runner._quant_method = NS(supports_internal_mk=False)
-    runner._maybe_dispatch(x, logits)
-    runner._maybe_combine(None, x)
-    with runner._pcp_routing_inputs(ids, 1) as routing_ids:
+    with runner._dispatched_routing_inputs(x[:1], logits[:1], ids) as dispatched:
+        routed_x, routed_logits, routing_ids = dispatched
+        torch.testing.assert_close(routed_x, x[:1])
+        torch.testing.assert_close(routed_logits, logits[:1])
         torch.testing.assert_close(routing_ids, ids[:1])
         torch.testing.assert_close(context.is_padding, padding[:1])
+    runner._maybe_combine(None, routed_x)
     assert context.is_padding is padding
-    assert calls == ["gather", "gather", "scatter", "gather", "gather"]
+    assert calls == ["gather", "gather", "gather", "gather", "scatter"]
 
 
 def test_offload_sleep_and_nonstandard_activation_rejected(runtime):
@@ -1099,4 +1104,55 @@ def test_pcp_metadata_from_actual_context_builders(runtime, monkeypatch, builder
             # Control for the actual creation branch; DP2/PCP8 is not a
             # supported MegaMoE configuration and must not be sent to apply.
             assert context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
+    assert contexts == []
+
+
+def test_hcu_context_preserves_supplied_metadata_for_deepep_low_latency(
+    monkeypatch,
+):
+    from contextlib import contextmanager
+
+    module, sp_property = _native_context_symbols()
+    parallel = NS(
+        tensor_parallel_size=1,
+        data_parallel_size=2,
+        data_parallel_rank=0,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=True,
+        is_moe_model=True,
+        all2all_backend="deepep_low_latency",
+    )
+    parallel.use_sequence_parallel_moe = sp_property.fget(parallel)
+    config = NS(parallel_config=parallel)
+    contexts = []
+
+    @contextmanager
+    def override(context):
+        contexts.append(context)
+        try:
+            yield
+        finally:
+            contexts.pop()
+
+    module.track_batchsize = False
+    module.current_platform = NS(set_additional_forward_context=lambda **kw: {})
+    module.create_forward_context = lambda *args, **kw: NS(dp_metadata=args[2])
+    module.override_forward_context = override
+    hcu = load_file(
+        monkeypatch,
+        "test_hcu_context_low_latency",
+        "vllm_hcu/forward_context_runtime.py",
+    )
+    supplied = torch.tensor([2, 7], dtype=torch.int32)
+
+    with hcu.set_forward_context(
+        module,
+        None,
+        config,
+        num_tokens=2,
+        num_tokens_across_dp=supplied,
+    ):
+        metadata = contexts[-1].dp_metadata
+
+    assert metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
     assert contexts == []

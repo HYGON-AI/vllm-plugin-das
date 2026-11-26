@@ -4,6 +4,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
@@ -68,6 +69,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
@@ -78,6 +80,30 @@ logger = init_logger(__name__)
 _CMPL_UUID_RE = re.compile(
     r"cmpl-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 )
+
+
+def _is_mamba_group_spec(spec: KVCacheSpec) -> bool:
+    # Hybrid/MTP groups may wrap per-layer specs in UniformTypeKVCacheSpecs,
+    # so classify a group by its layers, matching worker registration.
+    if not isinstance(spec, UniformTypeKVCacheSpecs):
+        return isinstance(spec, MambaSpec)
+    kinds = {isinstance(s, MambaSpec) for s in spec.kv_cache_specs.values()}
+    if len(kinds) != 1:
+        raise ValueError(
+            "Mooncake KV cache group mixes Mamba/GDN and non-Mamba layers: "
+            f"{sorted(spec.kv_cache_specs)}."
+        )
+    return kinds.pop()
+
+
+def _uses_qwen4_exp_qsa(model_config) -> bool:
+    # Mirrors Qwen4Exp's own switch; VLLM_HCU_DISABLE_QSA=1 builds dense layers.
+    if os.environ.get("VLLM_HCU_DISABLE_QSA", "0") == "1":
+        return False
+    hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    return getattr(hf_config, "indexer_n_heads", None) is not None
 
 
 def ttft_trace_enabled() -> bool:
@@ -764,11 +790,6 @@ def _validate_phase1_kv_cache_config(
             "HCU Mooncake requires a positive number of physical kernel "
             "blocks per logical KV block."
         )
-    if kv_cache_config.has_mamba_layers:
-        raise NotImplementedError(
-            "HCU Mooncake phase-1 does not support Mamba/GDN hybrid cache "
-            "groups."
-        )
     if not kv_cache_config.kv_cache_groups:
         raise ValueError(
             "HCU Mooncake requires at least one KV cache group."
@@ -908,11 +929,16 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             or vllm_config.model_config.use_mla
         ):
             return None
+        # Both layouts keep whole heads contiguous in each per-layer page. QSA
+        # packs its side pages beside the main KV inside each block and only
+        # supports block-first layouts, so LBHNC would fall back to BLNHC.
+        layout = "BLHNC" if _uses_qwen4_exp_qsa(vllm_config.model_config) else "LBHNC"
         logger.info_once(
-            "HCU MooncakeConnector setting KV cache layout to LBHNC for "
-            "heterogeneous TP-safe KV transfer."
+            "HCU MooncakeConnector setting KV cache layout to %s for "
+            "heterogeneous TP-safe KV transfer.",
+            layout,
         )
-        return "LBHNC"
+        return layout
 
     ############################################################
     # Scheduler Side Methods
@@ -925,6 +951,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
+
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -1115,6 +1145,14 @@ class MooncakeConnectorScheduler:
             request.max_tokens = 1
             params["_p_side_truncated"] = True
 
+    def on_new_request(self, request: "Request") -> None:
+        # Truncate before the scheduler's local prefix-cache lookup: a later
+        # truncation would leave a full-length cache hit against the shorter
+        # prompt and nothing left to schedule.
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_decode") and self._has_mamba:
+            self._truncate_mamba_request_for_prefill(request)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -1153,9 +1191,6 @@ class MooncakeConnectorScheduler:
             )
             if count > 0:
                 return count, True
-
-        if params.get("do_remote_decode") and self._has_mamba:
-            self._truncate_mamba_request_for_prefill(request)
 
         # No remote prefill for this request.
         return 0, False
@@ -1320,6 +1355,7 @@ class MooncakeConnectorWorker:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
+        self._has_mamba = kv_cache_config.has_mamba_layers
         self.use_mla = self.model_config.use_mla
         # Capture device BEFORE TransferEngine init — MNNVL's NVLink allocator
         # may change the current CUDA device during engine.initialize().
@@ -1730,6 +1766,16 @@ class MooncakeConnectorWorker:
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
                 return
+        if self._has_mamba and self.transfer_topo.tp_ratio(meta.remote_tp_size) != 1:
+            # The TP offset math below slices a page by head. A GDN page packs
+            # conv and SSM state, so slicing it would copy the wrong bytes
+            # without raising. Only equal P/D TP is supported for now.
+            await reject_metadata(
+                "Mooncake Mamba/GDN state transfer requires equal producer and "
+                f"consumer TP size; producer={self.tp_size}, "
+                f"consumer={meta.remote_tp_size}."
+            )
+            return
         local_regions = self._get_transfer_regions(
             self.kv_caches_base_addr,
             self.block_len_per_layer,
@@ -1945,7 +1991,7 @@ class MooncakeConnectorWorker:
                 self._physical_blocks_per_logical_kv_block,
                 block_arange,
             ).tolist()
-            if not isinstance(group_specs[i].kv_cache_spec, MambaSpec)
+            if not _is_mamba_group_spec(group_specs[i].kv_cache_spec)
             else group
             for i, group in enumerate(block_ids)
         ]
@@ -1994,9 +2040,8 @@ class MooncakeConnectorWorker:
             for group_index, (local_group, remote_group) in enumerate(
                 zip(send_meta.local_block_ids, remote_block_ids_per_group)
             ):
-                is_mamba_group = isinstance(
-                    group_specs[group_index].kv_cache_spec,
-                    MambaSpec,
+                is_mamba_group = _is_mamba_group_spec(
+                    group_specs[group_index].kv_cache_spec
                 )
                 if is_mamba_group:
                     # Mamba/GDN prefix caching can use null blocks only as
@@ -2293,7 +2338,8 @@ class MooncakeConnectorWorker:
             if not cache[0].is_contiguous():
                 raise ValueError(
                     "HCU Mooncake requires canonical contiguous [H, N, C] "
-                    f"page contents; layer={layer_name}. Use KV cache layout LBHNC."
+                    f"page contents; layer={layer_name}. Use KV cache layout "
+                    "LBHNC, or BLHNC when Qwen4Exp QSA is enabled."
                 )
             base_addr = cache.data_ptr()
             block_len = cache.stride(0) * cache.element_size()
@@ -2323,10 +2369,24 @@ class MooncakeConnectorWorker:
                         raise ValueError(
                             "Mooncake KV page shape does not match its spec."
                         )
+            elif isinstance(layer_spec, MambaSpec):
+                # v0.28 gives a Mamba/GDN layer the same [B, H, N, C] byte view
+                # as attention: conv and SSM state are packed inside one page,
+                # and mamba blocks are never split into kernel blocks. One
+                # page is therefore one region whose payload is the packed state
+                # content (stride(0) may exceed it when page_size_padded is set).
+                kv_block_len = layer_spec.state_content_size_bytes
+                page_view_len = cache[0].numel() * cache.element_size()
+                if page_view_len < kv_block_len:
+                    raise ValueError(
+                        "Mooncake Mamba/GDN page is smaller than its state "
+                        f"content: layer={layer_name}, page={page_view_len}, "
+                        f"state={kv_block_len}."
+                    )
             else:
                 raise NotImplementedError(
-                    "HCU Mooncake supports attention KV pages only; "
-                    f"layer={layer_name}, spec={type(layer_spec).__name__}."
+                    "HCU Mooncake supports attention and Mamba/GDN KV pages "
+                    f"only; layer={layer_name}, spec={type(layer_spec).__name__}."
                 )
             # Keep padded page strides separate from head payload lengths.
             # MLA copies its complete aligned page; sharded attention copies

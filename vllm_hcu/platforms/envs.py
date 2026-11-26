@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     VLLM_USE_OPT_CAT: bool = False
     VLLM_HCU_USE_CAT_MLA: bool = True
     VLLM_HCU_DISABLE_DSA: bool = False
+    VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX: bool = True
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
     VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
+    VLLM_HCU_USE_AITER_SAMPLER: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
@@ -366,6 +368,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DISABLE_DSA":
         lambda: (os.environ.get("VLLM_HCU_DISABLE_DSA", "False").lower() in
                     ("true", "1")),  
+    # GLM DSA MTP decoder target compatibility is enabled by default; set 0 to disable.
+    "VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX":
+        lambda: (os.environ.get("VLLM_HCU_GLM_MTP_QUANT_PREFIX_FIX", "True").lower()
+                 in ("true", "1")),
     # If set, vllm will use mixed P/D batch for fp8 (num_attention_heads / tp < 32)
     "VLLM_HCU_USE_FP8_MIXED_BATCH":
         lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
@@ -483,6 +489,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If use AITER MHC impl, please set True
     "VLLM_HCU_USE_AITER_MHC":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MHC", "True").lower() in
+                    ("true", "1")),
+
+    # Use AITER top-k/top-p sampling kernels when vLLM selects its ROCm AITER
+    # sampler (VLLM_ROCM_USE_AITER=1). Also requires VLLM_HCU_USE_CUSTOM_OPS;
+    # either switch off keeps PyTorch-native sampling.
+    "VLLM_HCU_USE_AITER_SAMPLER":
+        lambda: (os.environ.get("VLLM_HCU_USE_AITER_SAMPLER", "True").lower() in
                     ("true", "1")),
 
     # If use TileLang MHC prenorm impl, please set True

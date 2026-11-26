@@ -125,9 +125,12 @@ def test_hcu_qwen3_dspark_vendor_kernel_replays_in_cuda_graph(
     block_table = torch.tensor(
         [[0, 1], [2, 3]], device=device, dtype=torch.int32
     )
-    descales = tuple(
-        torch.tensor(1.0, device=device).expand(batch_size, kv_heads)
+    scalar_descales = tuple(
+        torch.tensor(1.0, device=device, dtype=torch.float32)
         for _ in range(3)
+    )
+    descales = tuple(
+        scale.expand(batch_size, kv_heads) for scale in scalar_descales
     )
     common = {
         "q": q,
@@ -145,11 +148,20 @@ def test_hcu_qwen3_dspark_vendor_kernel_replays_in_cuda_graph(
         "k_descale": descales[1],
         "v_descale": descales[2],
     }
+    # The native paged ABI requires scalar FP32 scales. Keep expanded views
+    # on the HCU path to exercise its broadcast-to-scalar adapter, including
+    # graph capture and replay, against the same backing values.
+    reference_kwargs = {
+        **common,
+        "q_descale": scalar_descales[0],
+        "k_descale": scalar_descales[1],
+        "v_descale": scalar_descales[2],
+    }
     reference_out = torch.empty_like(q)
     actual_out = torch.empty_like(q)
 
     reference = vendor_varlen(
-        out=reference_out, layout="bshd", **common
+        out=reference_out, layout="bshd", **reference_kwargs
     ).clone()
     actual = hcu_varlen(out=actual_out, **common).clone()
     torch.cuda.synchronize(device)
@@ -164,7 +176,7 @@ def test_hcu_qwen3_dspark_vendor_kernel_replays_in_cuda_graph(
     actual_out.fill_(float("nan"))
     graph.replay()
     replay_reference = vendor_varlen(
-        out=reference_out, layout="bshd", **common
+        out=reference_out, layout="bshd", **reference_kwargs
     ).clone()
     torch.cuda.synchronize(device)
 

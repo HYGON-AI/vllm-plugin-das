@@ -26,6 +26,26 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx936",
+    target="tests/accuracy/test_grouped_w4a16_moe_accuracy.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_config_selection.py",
+    est_time=120,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_tp2_group128_moec.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_aiter_moe_tp2_group32.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
     target="tests/kernels/test_kimi_k3_kda_checkpoints_numeric.py",
     est_time=180,
 )
@@ -147,6 +167,11 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_grouped_w4a16_scale_reload.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
     target="tests/patch/test_clean_process_bootstrap.py",
     est_time=300,
 )
@@ -169,6 +194,11 @@ register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_quant_gemm_aiter.py",
     est_time=180,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_compressed_tensors_w4a8.py",
+    est_time=60,
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -209,6 +239,11 @@ register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_qwen4_exp_qsa_fp8.py",
     est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_indexer_rope_return.py",
+    est_time=10,
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -572,5 +607,39 @@ register_hcu_ci(
 register_hcu_ci(
     job="single-node-topology",
     target="tests/distributed/single_node/test_topology_contracts.py",
+    est_time=60,
+)
+
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_bf16_indexer_gather.py",
+    est_time=30,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_bf16_indexer_gather.py",
+    est_time=30,
+)
+
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=45,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_deepseek_v4_compressor_kv_offset.py",
+    est_time=45,
+)
+
+# INT8 fallback: multidimensional MTP projections and native graph replay.
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_int8_fallback_leading_dims.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/kernels/test_int8_fallback_leading_dims.py",
     est_time=60,
 )

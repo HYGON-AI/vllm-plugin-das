@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import inspect
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import ModuleType
 
 from ._common import (
@@ -122,6 +122,8 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(capture)
     def capture_with_separate_eager_comm(self, create_forward_fn, *args, **kwargs):
         def create_forward(desc, warmup):
+            from vllm.config.compilation import CUDAGraphMode
+
             from vllm_hcu.forward_context_runtime import (
                 deepep_auto_capture_mode_scope,
             )
@@ -138,12 +140,17 @@ def apply_to_module(module: ModuleType) -> bool:
                 return forward_with_capture_mode
 
             @functools.wraps(forward)
-            def eager_forward(*forward_args, **forward_kwargs):
+            def eager_forward(cg_mode, *forward_args, **forward_kwargs):
+                collective_scope = (
+                    use_torch_collectives_for_warmup()
+                    if cg_mode == CUDAGraphMode.NONE
+                    else nullcontext()
+                )
                 with (
                     deepep_auto_capture_mode_scope(capture_mode),
-                    use_torch_collectives_for_warmup(),
+                    collective_scope,
                 ):
-                    return forward(*forward_args, **forward_kwargs)
+                    return forward(cg_mode, *forward_args, **forward_kwargs)
 
             return eager_forward
 

@@ -56,8 +56,41 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
         else None
     )
 
+    descale_positions = {
+        parameter: tuple(signature.parameters).index(parameter)
+        for parameter in ("q_descale", "k_descale", "v_descale")
+        if parameter in signature.parameters
+        and signature.parameters[parameter].kind
+        is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    }
+
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any):
+        # Core expands layer-global scales to [batch, kv_heads]. The vendor
+        # paged-attention ABI requires one FP32 value, including for 64-token
+        # pages used by decode/MTP. Collapse only genuine scalar broadcasts:
+        # taking the first element of per-sequence/head scales is incorrect.
+        key_cache = args[1] if len(args) > 1 else kwargs.get("k")
+        if isinstance(key_cache, torch.Tensor) and key_cache.ndim == 4:
+            positional = list(args)
+            for parameter in ("q_descale", "k_descale", "v_descale"):
+                position = descale_positions.get(parameter)
+                is_positional = position is not None and len(positional) > position
+                descale = positional[position] if is_positional else kwargs.get(parameter)
+                if (
+                    isinstance(descale, torch.Tensor)
+                    and descale.numel() > 1
+                    and all(
+                        size == 1 or stride == 0
+                        for size, stride in zip(descale.shape, descale.stride())
+                    )
+                ):
+                    scalar = descale.as_strided((1,), (1,))
+                    if is_positional:
+                        positional[position] = scalar
+                    else:
+                        kwargs[parameter] = scalar
+            args = tuple(positional)
         layout = _flash_attn_layout()
         if layout == "bhsd":
             key_cache = args[1] if len(args) > 1 else kwargs.get("k")
@@ -72,15 +105,6 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
             )
             if use_bshd_compat:
                 layout = "bshd"
-                # vLLM expands each layer-global KV scale to [batch, heads],
-                # while this vendor path accepts exactly one scalar. Recover
-                # a zero-copy scalar view of the shared backing value.
-                for descale_name in ("q_descale", "k_descale", "v_descale"):
-                    descale = kwargs.get(descale_name)
-                    if isinstance(descale, torch.Tensor) and descale.numel() > 1:
-                        kwargs[descale_name] = descale.as_strided(
-                            (1,), (1,), descale.storage_offset()
-                        )
                 # The vendor compatibility path casts BF16 queries directly
                 # to the FP8 cache dtype before dispatch. That cast has an
                 # implicit unit scale, but the kernel requires all three

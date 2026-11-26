@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 from types import ModuleType
@@ -406,6 +407,54 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(builder)
     def hcu_build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
+        query_start_loc_cpu = getattr(
+            common_attn_metadata, "query_start_loc_cpu", None
+        )
+        if (
+            is_prefilling is not None
+            and query_start_loc_cpu is not None
+            and getattr(common_attn_metadata, "causal", True) is not False
+        ):
+            num_actual_reqs = is_prefilling.numel()
+            query_offsets = query_start_loc_cpu[: num_actual_reqs + 1].numpy()
+            query_lens = query_offsets[1:] - query_offsets[:-1]
+            decode_mask = ~is_prefilling.numpy()
+            multi_token_decodes = (
+                query_lens > self.reorder_batch_threshold
+            ) & decode_mask
+            if (
+                self.query_len_support == mla.QueryLenSupport.UNIFORM
+                and query_lens.size > 0
+                and decode_mask.any()
+                and (query_lens != query_lens[0]).any()
+            ):
+                num_decodes = mla.split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold,
+                    require_uniform=True,
+                    treat_short_extends_as_decodes=not self.use_pcp,
+                )[0]
+                multi_token_decodes[num_decodes:] |= decode_mask[num_decodes:]
+            if multi_token_decodes.any():
+                seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+                if seq_lens_cpu is None:
+                    vllm_config = getattr(self, "vllm_config", None)
+                    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+                    speculative_config = getattr(vllm_config, "speculative_config", None)
+                    if (
+                        getattr(scheduler_config, "async_scheduling", None) is False
+                        and getattr(
+                            speculative_config, "enable_adaptive_verification", False
+                        ) is False
+                    ):
+                        seq_lens_cpu = getattr(
+                            common_attn_metadata, "seq_lens_cpu_upper_bound", None
+                        )
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+                common_attn_metadata = copy.copy(common_attn_metadata)
+                common_attn_metadata.seq_lens_cpu_upper_bound = seq_lens_cpu
         result = builder(self, common_prefix_len, common_attn_metadata, fast_build)
         result.num_kv_actual_tokens = getattr(
             common_attn_metadata,
