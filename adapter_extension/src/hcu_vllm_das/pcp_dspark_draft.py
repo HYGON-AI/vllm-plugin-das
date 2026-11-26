@@ -36,6 +36,12 @@ def draft_config(cfg):
         raise ValueError('PCP DSpark draft requires eager TP1/DP1 and target PCP/EP HT')
     capacity = token_capacity(cfg)
     result = copy.copy(cfg)
+    # DFlash retains the target kernel config. Apply the requested MoE backend
+    # only to this owned draft, leaving the resident target configuration intact.
+    backend = getattr(spec, 'moe_backend', None)
+    if backend is not None and backend != cfg.kernel_config.moe_backend:
+        result.kernel_config = copy.copy(cfg.kernel_config)
+        result.kernel_config.moe_backend = backend
     result.additional_config = dict(cfg.additional_config or {})
     # The target's calibrated physical slots do not describe draft experts.
     result.additional_config.pop('hcu_static_eplb', None)

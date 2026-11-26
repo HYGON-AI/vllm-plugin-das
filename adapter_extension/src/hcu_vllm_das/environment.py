@@ -119,3 +119,7 @@ def register_compile_factors(vllm_envs: object) -> None:
 
 __all__ = ["custom_ops_enabled", "dsv41_profile_worker_enabled",
            "rms_norm_enabled", "fp8_fusions_enabled", "register_compile_factors"]
+
+
+def dsv41_megamoe_forward_pool_enabled() -> bool:
+    return _flag("VLLM_HCU_DSV41_MEGAMOE_FORWARD_POOL", default=False)
