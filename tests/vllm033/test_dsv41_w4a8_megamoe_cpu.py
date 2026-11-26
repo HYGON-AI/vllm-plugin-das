@@ -158,3 +158,40 @@ def test_replay_tiles_follow_common_pcp_extent(monkeypatch, rows, expected):
     ex.run(out, x, x, x)
     assert seen == expected
     assert torch.equal(out, x)
+
+
+def test_gemm2_uses_provider_scale_order(monkeypatch):
+    from contextlib import nullcontext
+
+    # Give each channel and each expert a distinct checkpoint scale.
+    hidden, intermediate = 16, 8
+    scales = torch.arange(1, 33, dtype=torch.float32).reshape(2, hidden, 1)
+    layer = NS(
+        apply_router_weight_on_input=False, swiglu_limit=10.0,
+        expert_map_manager=NS(num_fused_shared_experts=0),
+        w13_weight_shape=torch.tensor([[intermediate, hidden]] * 2),
+        w2_weight_shape=torch.tensor([[hidden, intermediate]] * 2),
+        w13_weight_packed=torch.zeros(2, 2 * intermediate, hidden // 8, dtype=torch.int32),
+        w2_weight_packed=torch.zeros(2, hidden, intermediate // 8, dtype=torch.int32),
+        w13_weight_scale=torch.ones(2, 2 * intermediate, 1),
+        w2_weight_scale=scales.clone(),
+    )
+
+    def transform(l1, l2, mode):
+        assert mode == "w4a8"
+        w1, s1 = l1
+        w2, s2 = l2
+        return (w1[..., ::2], s1), (w2[..., ::2], s2.flip(-1))
+
+    method = NS(_processed=False, _packed=NS(), buffer_capacity=1,
+                moe=NS(hidden_dim=hidden, intermediate_size_per_partition=intermediate, ep_size=2),
+                mega=NS(transform_weights_for_mega_moe=transform),
+                get_fused_moe_quant_config=lambda layer: None)
+    monkeypatch.setattr(w4, "get_ep_group", lambda: NS(world_size=2, rank_in_group=1))
+    monkeypatch.setattr(w4, "_layer_buffer", lambda *args: nullcontext(None))
+    monkeypatch.setattr(w4, "W4A8MegaExperts", lambda moe, quant, buf, l1, l2, mega: l2)
+    monkeypatch.setattr(w4, "MegaKernel", lambda prepare, experts: experts)
+
+    w4.HcuDSV41W4A8MegaMoEMethod._process_weights(method, layer)
+    _, kernel_scales = method.moe_kernel
+    torch.testing.assert_close(kernel_scales, scales.squeeze(-1).flip(-1) / 16)

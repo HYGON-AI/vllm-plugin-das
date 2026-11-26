@@ -183,6 +183,7 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
             p1[row].copy_(l1[0])
             p2[row].copy_(l2[0])
             s1[row].copy_(l1[1])
+            s2[row].copy_(l2[1])
         s1.div_(16)
         s2.div_(16)
         # Keep the registered parameters used by Core's native CT W4A8 apply.
