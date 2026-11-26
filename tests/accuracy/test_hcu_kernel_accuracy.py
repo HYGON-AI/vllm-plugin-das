@@ -964,6 +964,7 @@ def test_lightop_deepseek_v4_fused_insert_updates_q_and_cache() -> None:
 @pytest.mark.parametrize("next_n", [1, 8])
 def test_bf16_indexer_decode_ignores_interleaved_pages(next_n: int) -> None:
     from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _restore_collapsed_bf16_page,
         rocm_fp8_paged_mqa_logits,
     )
 
@@ -1000,6 +1001,13 @@ def test_bf16_indexer_decode_ignores_interleaved_pages(next_n: int) -> None:
     torch.testing.assert_close(
         actual.cpu().reshape_as(expected), expected, atol=2e-4, rtol=1e-5
     )
+    collapsed = cache[:, :1, 0]
+    restored = _restore_collapsed_bf16_page(collapsed, page_size, dim)
+    restored_logits = rocm_fp8_paged_mqa_logits(
+        q.to(device), restored.unsqueeze(-2), weights.to(device),
+        lengths.to(device), table.to(device), None, expected.shape[-1],
+    )
+    torch.testing.assert_close(restored_logits, actual, atol=0, rtol=0)
 
     # Reuse pages to cross the capped launch grid with a small physical cache.
     repeats = 45

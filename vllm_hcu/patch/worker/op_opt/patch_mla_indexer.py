@@ -115,6 +115,9 @@ def apply_to_module(module: ModuleType) -> bool:
             common_attn_metadata, "num_kv_actual_tokens",
             common_attn_metadata.num_actual_tokens,
         )
+        result.indexer_page_size = getattr(
+            getattr(self, "kv_cache_spec", None), "storage_block_size", None
+        )
         vllm_config = getattr(self, "vllm_config", None)
         if vllm_config is None:
             result.pcp_world_size = effective_pcp_metadata_world_size(

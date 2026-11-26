@@ -951,6 +951,7 @@ def rocm_fp8_paged_mqa_logits(
     if kcache_layout not in henvs.INDEXER_KCACHE_LAYOUTS:
         raise ValueError(f"Unsupported indexer K-cache layout: {kcache_layout!r}")
     batch_size, next_n = q_fp8.shape[:2]
+    legacy_cache = kv_cache_fp8.ndim == 4
     kv_cache_fp8 = _paged_mqa_cache_kernel_view(kv_cache_fp8)
     is_gfx938 = on_gfx938()
     if is_gfx938:
@@ -958,6 +959,11 @@ def rocm_fp8_paged_mqa_logits(
     elif kcache_layout == "normal":
         raise ValueError("kcache_layout='normal' is only supported on gfx938")
     block_size = kv_cache_fp8.shape[1]
+    if (
+        not is_gfx938 and legacy_cache and kv_cache_fp8.dtype == torch.bfloat16
+        and block_size == 1 and kv_cache_fp8.stride(0) > kv_cache_fp8.stride(1)
+    ):
+        raise ValueError("Collapsed BF16 indexer cache requires an explicit page size")
 
     # LightOp's BF16 decode reader assumes consecutive physical pages.
     # BLHNC shares each block across layers, leaving gaps in a layer's view.
@@ -1670,6 +1676,20 @@ def _indexer_cache_as_hipc_view(kv_cache: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _restore_collapsed_bf16_page(
+    cache: torch.Tensor, page_size: int | None, head_dim: int
+) -> torch.Tensor:
+    # The block stride can include other layers. Use the indexer's storage
+    # block size for the token count and retain the actual stride and offset.
+    if (
+        page_size is None or page_size <= 1
+        or cache.size(-1) != head_dim or cache.stride()[1:] != (head_dim, 1)
+        or cache.stride(0) < page_size * head_dim
+    ):
+        raise ValueError("Cannot restore the physical page of the collapsed BF16 indexer cache")
+    return cache.as_strided((cache.size(0), page_size, head_dim), cache.stride())
+
+
 def _indexer_cache_as_bf16_nhd_view(
     kv_cache: torch.Tensor, head_dim: int
 ) -> torch.Tensor:
@@ -1768,6 +1788,14 @@ def rocm_aiter_sparse_attn_indexer_native(
     device = hidden_states.device if k is None else k.device
     # HIPC cache writer/gather require the physical page axis. Keep the
     # official view unchanged for the LightOp paged-MQA decode contract.
+    if (
+        kv_cache.ndim == 3 and kv_cache.size(1) == 1
+        and kv_cache.dtype == torch.bfloat16 and not on_gfx938()
+        and kv_cache.stride(0) > kv_cache.stride(1)
+    ):
+        kv_cache = _restore_collapsed_bf16_page(
+            kv_cache, getattr(layer_attn_metadata, "indexer_page_size", None), head_dim
+        )
     hipc_kv_cache = _indexer_cache_as_hipc_view(kv_cache)
 
     # during speculative decoding, k may be padded to the CUDA graph batch

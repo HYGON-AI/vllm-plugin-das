@@ -97,6 +97,23 @@ def test_collapsed_bf16_indexer_cache_restores_page_before_normalizing():
     assert normalized.data_ptr() == collapsed.data_ptr()
 
 
+@pytest.mark.parametrize("page_size", [None, 0, 128])
+def test_collapsed_bf16_indexer_rejects_unknown_or_oversized_page(page_size):
+    cache = torch.empty(2, 64, 128, dtype=torch.bfloat16)[:, :1]
+    with pytest.raises(ValueError, match="collapsed BF16"):
+        sparse._restore_collapsed_bf16_page(cache, page_size, 128)
+
+
+def test_decode_rejects_collapsed_bf16_without_page_metadata(monkeypatch):
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    cache = torch.empty(2, 64, 128, dtype=torch.bfloat16)[:, :1]
+    with pytest.raises(ValueError, match="explicit page size"):
+        sparse.rocm_fp8_paged_mqa_logits(
+            torch.empty(1, 1, 1, 128), cache.unsqueeze(-2), torch.ones(1, 1),
+            torch.tensor([2]), torch.tensor([[1]]), None, 2,
+        )
+
+
 def test_bf16_writer_passes_logical_4d_cache_as_nhd_to_kernel(monkeypatch):
     kernel = _FakeTritonKernel()
     monkeypatch.setattr(sparse, "_indexer_k_bf16_cache_kernel", kernel)
@@ -134,8 +151,10 @@ def test_bf16_gather_passes_logical_4d_cache_as_nhd_to_kernel(monkeypatch):
     assert kernel.args[4:10] == (64, 1, 2, 64 * 128, 128, 2)
 
 
-@pytest.mark.parametrize("gfx938", [False, True])
-def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
+@pytest.mark.parametrize("gfx938, page_stride", [
+    (True, None), (False, None), (False, 64 * 128), (False, 2 * 64 * 128),
+])
+def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938, page_stride):
     from vllm import _custom_ops as ops
 
     prefix = "test.indexer"
@@ -147,6 +166,7 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
         schedule_metadata=None,
     )
     metadata = SimpleNamespace(
+        indexer_page_size=64,
         num_kv_actual_tokens=1,
         slot_mapping=torch.tensor([3], dtype=torch.int64),
         num_decodes=1,
@@ -160,12 +180,28 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
         lambda: SimpleNamespace(attn_metadata={prefix: metadata}),
     )
     monkeypatch.setattr(sparse, "on_gfx938", lambda: gfx938)
+    monkeypatch.setattr(sparse.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
     monkeypatch.setattr(ops, "indexer_k_quant_and_cache", lambda *args: None)
-    monkeypatch.setattr(sparse, "indexer_k_bf16_cache_triton", lambda *args: None)
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8)
+    if page_stride is not None:
+        backing = torch.empty(3 * page_stride, dtype=torch.bfloat16)
+        pages = backing.as_strided((2, 64, 128), (page_stride, 128, 1), 128)
+        pages.copy_(torch.randn_like(pages))
+        cache = pages[:, :1]
+
+    def check_writer(k, writer_cache, slots):
+        if page_stride is not None:
+            assert writer_cache.data_ptr() == pages.data_ptr()
+            torch.testing.assert_close(writer_cache, pages)
+
+    monkeypatch.setattr(sparse, "indexer_k_bf16_cache_triton", check_writer)
     calls = []
 
     def logits(*args, **kwargs):
+        if page_stride is not None:
+            assert args[1].data_ptr() == pages.data_ptr()
+            torch.testing.assert_close(args[1].squeeze(-2), pages)
         calls.append(kwargs)
         return torch.tensor([[1.0, 3.0, 2.0, 0.0, -torch.inf, -torch.inf]])
 
@@ -173,7 +209,7 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938):
     output = torch.empty((1, 2), dtype=torch.int32)
     result = sparse.rocm_aiter_sparse_attn_indexer_native(
         torch.zeros((1, 8)), prefix,
-        torch.zeros((1, 64, 132), dtype=torch.uint8),
+        cache,
         torch.zeros((1, 2, 128), dtype=torch.bfloat16).to(torch.float8_e4m3fn),
         torch.zeros((1, 128), dtype=torch.bfloat16),
         torch.ones((1, 2), dtype=torch.float32),
