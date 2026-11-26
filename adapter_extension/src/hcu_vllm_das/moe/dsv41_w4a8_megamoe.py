@@ -159,6 +159,10 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
     def _process_weights(self, layer):
         if self._processed:
             raise RuntimeError("MegaMoE packed weights cannot be postprocessed twice")
+        if self._packed.state != "loaded":
+            raise RuntimeError(
+                f"Cannot pack W4A8 MegaMoE weights: expected loaded state, got {self._packed.state!r}"
+            )
         if (layer.apply_router_weight_on_input or layer.expert_map_manager.num_fused_shared_experts
                 or layer.swiglu_limit != 10.0):
             raise ValueError("DSV4.1 W4A8 requires separate shared experts, output routing and clamp=10")

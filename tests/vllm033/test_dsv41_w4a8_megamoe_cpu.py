@@ -135,6 +135,18 @@ def test_w4a8_failed_reload_blocks_forward():
         method.apply(None, None, None, None, None, None)
 
 
+@pytest.mark.parametrize("state", ["loading", "packing", "failed", "ready"])
+def test_w4a8_requires_loaded_state_before_packing(state):
+    method = object.__new__(w4.HcuDSV41W4A8MegaMoEMethod)
+    method._processed = False
+    method._failure = None
+    method._packed = NS(state=state)
+    with pytest.raises(RuntimeError, match="expected loaded"):
+        method.process_weights_after_loading(None)
+    assert method._packed.state == state
+    assert not method._processed
+
+
 def test_actual_provider_has_async_w4a8_scale_abi():
     assert w4.w4a8_provider().__name__ == "deepgemm.mega"
     assert not torch.cuda.is_initialized()
@@ -183,7 +195,7 @@ def test_gemm2_uses_provider_scale_order(monkeypatch):
         w2, s2 = l2
         return (w1[..., ::2], s1), (w2[..., ::2], s2.flip(-1))
 
-    method = NS(_processed=False, _packed=NS(), buffer_capacity=1,
+    method = NS(_processed=False, _packed=NS(state="loaded"), buffer_capacity=1,
                 moe=NS(hidden_dim=hidden, intermediate_size_per_partition=intermediate, ep_size=2),
                 mega=NS(transform_weights_for_mega_moe=transform),
                 get_fused_moe_quant_config=lambda layer: None)
