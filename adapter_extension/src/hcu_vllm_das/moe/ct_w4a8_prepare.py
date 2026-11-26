@@ -33,17 +33,41 @@ class FixedHTExpertTokens(mk.ExpertTokensMetadata):
     """Receive routes and counts are indexed by the local physical expert."""
 
 
+class FixedHTInt8ExpertTokens(FixedHTExpertTokens):
+    """Padding rows have route IDs of -1 and an unspecified INT8 payload."""
+
+
 def _check_quant(config):
     if config.quant_dtype != torch.int8 or not config.per_act_token_quant or config.block_shape is not None:
         raise ValueError('HCU CT W4A8 requires dynamic per-token INT8 preparation')
 
 
-class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
-    """DeepEP HT with receiver-side INT8 quantization and native combine."""
+def _quantize_ht_rows(x):
+    if x.shape[0] == 0:
+        return x.to(torch.int8), torch.empty((0, 1), dtype=torch.float32, device=x.device)
+    q, scale = moe_kernel_quantize_input(
+        x, None, quant_dtype=torch.int8, per_act_token_quant=True, block_shape=None,
+    )
+    if scale.ndim == 1:
+        scale = scale.unsqueeze(-1)
+    return q, scale
 
-    def __init__(self, *args, fixed_receive_tokens=None, **kwargs):
+
+def _check_ht_quantized(q, scale, shape, device):
+    if (not isinstance(q, torch.Tensor) or not isinstance(scale, torch.Tensor)
+            or q.dtype != torch.int8 or tuple(q.shape) != shape or q.device != device
+            or scale.dtype != torch.float32 or scale.device != device
+            or tuple(scale.shape) != (shape[0], 1)):
+        raise RuntimeError('HCU HT requires INT8 data and one FP32 scale per token')
+
+
+class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
+    """DeepEP HT with per-token INT8 quantization and native combine."""
+
+    def __init__(self, *args, fixed_receive_tokens=None, fixed_sender_int8=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.fixed_receive_tokens = fixed_receive_tokens
+        self.fixed_sender_int8 = fixed_sender_int8
 
     def prepare_async(self, a1, topk_weights, topk_ids, num_experts, expert_map,
                       apply_router_weight_on_input, quant_config, defer_input_quant=False):
@@ -63,16 +87,11 @@ class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
             )
 
         def receive():
-            x, _, meta, ids, weights = receiver()
-            if x.shape[0] == 0:
-                q, scale = x.to(torch.int8), torch.empty((0, 1), dtype=torch.float32, device=x.device)
-            else:
-                q, scale = moe_kernel_quantize_input(x, None, quant_dtype=torch.int8,
-                    per_act_token_quant=True, block_shape=None)
-            if scale.ndim == 1:
-                scale = scale.unsqueeze(-1)
-            if q.dtype != torch.int8 or scale.dtype != torch.float32 or scale.device != q.device or tuple(scale.shape) != (q.shape[0], 1):
-                raise RuntimeError('HCU HT did not produce INT8 and per-token scales')
+            x, scale, meta, ids, weights = receiver()
+            if isinstance(meta, FixedHTInt8ExpertTokens):
+                return x, scale, meta, ids, weights
+            q, scale = _quantize_ht_rows(x)
+            _check_ht_quantized(q, scale, tuple(x.shape), x.device)
             return q, scale, meta, ids, weights
         return receive
 
@@ -85,6 +104,16 @@ class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
                 raise ValueError("router weighting on input requires topk=1")
             a1 = a1 * topk_weights.to(a1.dtype)
 
+        source_shape = tuple(a1.shape)
+        receive_shape = (capacity, a1.size(1))
+        device = a1.device
+        sender_int8 = self.fixed_sender_int8
+        payload = a1
+        if sender_int8:
+            q, scale = _quantize_ht_rows(a1)
+            _check_ht_quantized(q, scale, source_shape, device)
+            payload = (q.contiguous(), scale.contiguous())
+
         # Fixed receive capacity skips the host count read. Let DeepEP place
         # the communication dependency on the caller's stream for buffer reuse.
         per_rank, per_rdma, per_expert, to_rank, layout_event = (
@@ -92,8 +121,8 @@ class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
                 topk_idx=topk_ids, num_experts=num_experts, async_finish=False,
             )
         )
-        x, local_ids, weights, _, handle, event = self.buffer.dispatch(
-            x=a1,
+        received, local_ids, weights, _, handle, event = self.buffer.dispatch(
+            x=payload,
             num_tokens_per_rank=per_rank,
             num_tokens_per_rdma_rank=per_rdma,
             is_token_in_rank=to_rank,
@@ -113,8 +142,15 @@ class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
         def receive():
             if event.event is not None:
                 event.current_stream_wait()
+            if sender_int8:
+                if not isinstance(received, tuple) or len(received) != 2:
+                    raise RuntimeError("DeepEP HT did not return the INT8 payload and scales")
+                x, scale = received
+                _check_ht_quantized(x, scale, receive_shape, device)
+            else:
+                x = received
             shape = (capacity, topk_ids.size(1))
-            if (tuple(x.shape) != (capacity, a1.size(1))
+            if (tuple(x.shape) != receive_shape
                     or local_ids is None or tuple(local_ids.shape) != shape
                     or weights is None or tuple(weights.shape) != shape):
                 raise RuntimeError("DeepEP HT returned an incompatible fixed receive layout")
@@ -122,6 +158,8 @@ class HcuCTHTPrepareAndFinalize(DeepEPHTPrepareAndFinalize):
             # unused route slots with -1. Count only live local routes.
             local_experts = num_experts // self.num_dispatchers()
             counts = count_expert_num_tokens(local_ids, local_experts, None)
+            if sender_int8:
+                return x, scale, FixedHTInt8ExpertTokens(counts, None), local_ids, weights
             # DeepEP does not initialize the payload in unused receive
             # rows. Give the per-token quantizer defined input there.
             x.masked_fill_((local_ids == -1).all(dim=1, keepdim=True), 0)

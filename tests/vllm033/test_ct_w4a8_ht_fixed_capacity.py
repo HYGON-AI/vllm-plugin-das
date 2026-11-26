@@ -92,16 +92,25 @@ def test_draft_buffer_is_separate_even_at_same_capacity_and_reused(monkeypatch):
 
 
 @pytest.mark.parametrize("live_rows", [0, 2])
-def test_fixed_dispatch_ignores_padding_and_preserves_combine_handle(monkeypatch, live_rows):
+@pytest.mark.parametrize("sender_int8", [False, True])
+def test_fixed_dispatch_ignores_padding_and_preserves_combine_handle(
+    monkeypatch, live_rows, sender_int8,
+):
     routes = torch.full((8, 2), -1, dtype=torch.int64)
     if live_rows:
         routes[:live_rows] = torch.tensor([[0, 1], [0, -1]])
     wire = torch.full((8, 4), float("nan"), dtype=torch.bfloat16)
     wire[:live_rows] = 1
+    wire_q = torch.full((8, 4), -101, dtype=torch.int8)
+    wire_q[:live_rows] = 1
+    wire_scale = torch.full((8, 1), float("nan"), dtype=torch.float32)
+    wire_scale[:live_rows] = 1
     wire_weights = torch.ones_like(routes, dtype=torch.float32)
     layout = object()
     handle = object()
     calls = []
+    quantized_rows = []
+    inputs = torch.ones(1, 4, dtype=torch.bfloat16)
 
     def get_layout(**kwargs):
         assert kwargs["async_finish"] is False and kwargs["num_experts"] == 16
@@ -110,16 +119,28 @@ def test_fixed_dispatch_ignores_padding_and_preserves_combine_handle(monkeypatch
     def dispatch(**kwargs):
         assert kwargs["async_finish"] is False and kwargs["previous_event"] is layout
         assert kwargs["num_worst_tokens"] == 8 and kwargs["expert_alignment"] == 1
+        if sender_int8:
+            q, scale = kwargs["x"]
+            assert q.dtype == torch.int8 and q.shape == inputs.shape
+            assert scale.dtype == torch.float32 and scale.shape == (1, 1)
+            assert quantized_rows == [1]
+            payload = (wire_q, wire_scale)
+        else:
+            assert kwargs["x"] is inputs and not quantized_rows
+            payload = wire
         calls.append("dispatch")
         event = NS(event=object(), current_stream_wait=lambda: calls.append("wait"))
-        return wire, routes, wire_weights, [], handle, event
+        return payload, routes, wire_weights, [], handle, event
 
     def count(ids, local_experts, expert_map):
         assert calls[-1] == "wait" and local_experts == 2 and expert_map is None
         return torch.stack([(ids == expert).sum(dtype=torch.int32) for expert in range(local_experts)])
 
     def quantize(x, *args, **kwargs):
-        assert torch.isfinite(x).all() and not x[live_rows:].any()
+        quantized_rows.append(x.shape[0])
+        assert torch.isfinite(x).all()
+        if not sender_int8:
+            assert not x[live_rows:].any()
         return x.to(torch.int8), torch.ones(x.size(0), dtype=torch.float32)
 
     monkeypatch.setattr(prepare, "count_expert_num_tokens", count)
@@ -128,13 +149,13 @@ def test_fixed_dispatch_ignores_padding_and_preserves_combine_handle(monkeypatch
     monkeypatch.setattr(prepare, "dbo_current_ubatch_id", lambda: 0)
     owner = prepare.HcuCTHTPrepareAndFinalize(
         NS(get_dispatch_layout=get_layout, dispatch=dispatch), 8, 1, 6,
-        fixed_receive_tokens=16,
+        fixed_receive_tokens=16, fixed_sender_int8=sender_int8,
     )
     monkeypatch.setattr(owner, "_get_dispatch_config", lambda: None)
     quant = NS(quant_dtype=torch.int8, per_act_token_quant=True, block_shape=None)
     with prepare.fixed_ht_batch_capacity(8):
         receive = owner.prepare_async(
-            torch.ones(1, 4, dtype=torch.bfloat16), torch.ones(1, 2),
+            inputs, torch.ones(1, 2),
             torch.tensor([[6, 7]]), 16, None, False, quant,
         )
     assert calls == ["dispatch"] and owner.handles[0] is handle
@@ -144,6 +165,57 @@ def test_fixed_dispatch_ignores_padding_and_preserves_combine_handle(monkeypatch
     assert meta.expert_num_tokens_cpu is None
     assert received_ids is routes and weights is wire_weights
     assert q.dtype == torch.int8 and scale.shape == (8, 1)
+    assert quantized_rows == ([1] if sender_int8 else [8])
+    assert isinstance(meta, prepare.FixedHTInt8ExpertTokens) is sender_int8
+    if sender_int8:
+        assert q is wire_q and scale is wire_scale
+        assert (q[live_rows:] == -101).all() and scale[live_rows:].isnan().all()
+
+
+def test_sender_int8_requires_fixed_receive_and_a_compatible_dispatch():
+    cfg = config()
+    buffer = NS(dispatch=lambda *, x, num_worst_tokens: None)
+    assert runtime._fixed_sender_int8(cfg, 32768, buffer) is False
+    cfg.additional_config[profile_worker.HT_SENDER_INT8_KEY] = True
+    assert runtime._fixed_sender_int8(cfg, 32768, buffer) is True
+    with pytest.raises(ValueError, match="requires fixed-capacity"):
+        runtime._fixed_sender_int8(cfg, None, buffer)
+    with pytest.raises(RuntimeError, match="ABI"):
+        runtime._fixed_sender_int8(cfg, 32768, NS(dispatch=lambda *, x: None))
+    cfg.additional_config[profile_worker.HT_SENDER_INT8_KEY] = 1
+    with pytest.raises(ValueError, match="must be a boolean"):
+        runtime._fixed_sender_int8(cfg, 32768, buffer)
+
+
+def test_sender_int8_leaves_small_dynamic_steps_on_receiver_quant(monkeypatch):
+    source = torch.ones((1, 4), dtype=torch.bfloat16)
+    received = torch.ones((2, 4), dtype=torch.bfloat16)
+    routes = torch.zeros((2, 1), dtype=torch.int64)
+    weights = torch.ones_like(routes, dtype=torch.float32)
+    owner = prepare.HcuCTHTPrepareAndFinalize(
+        NS(), 4, 1, 0, fixed_receive_tokens=8, fixed_sender_int8=True,
+    )
+    meta = object()
+    quantized = []
+
+    def native_prepare(_self, x, *_args, defer_input_quant=False):
+        assert x is source and defer_input_quant
+        return lambda: (received, None, meta, routes, weights)
+
+    def quantize(x, *args, **kwargs):
+        quantized.append(x)
+        return x.to(torch.int8), torch.ones((2, 1), dtype=torch.float32)
+
+    monkeypatch.setattr(prepare.DeepEPHTPrepareAndFinalize, "prepare_async", native_prepare)
+    monkeypatch.setattr(prepare, "moe_kernel_quantize_input", quantize)
+    quant = NS(quant_dtype=torch.int8, per_act_token_quant=True, block_shape=None)
+    with prepare.fixed_ht_batch_capacity(None):
+        q, scales, actual_meta, actual_routes, actual_weights = owner.prepare_async(
+            source, weights[:1], routes[:1], 16, None, False, quant,
+        )()
+    assert len(quantized) == 1 and quantized[0] is received
+    assert q.shape == received.shape and scales.shape == (2, 1)
+    assert actual_meta is meta and actual_routes is routes and actual_weights is weights
 
 
 def test_contiguous_workspace_keeps_room_for_skew_and_alignment():

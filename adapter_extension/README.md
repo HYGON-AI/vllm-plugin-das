@@ -331,6 +331,21 @@ physical expert count. Global runtime EPLB remains disabled.
 Configuration, migration ownership and validation scope are recorded in
 [static EPLB](../docs/validation/v41-static-eplb.md).
 
+### DeepSeek V4.1 W4A8 sender INT8
+
+For eager PCP4/EP4 or PCP8/EP8 with ordinary DeepGEMM and single-node DeepEP
+high throughput, add both boolean keys to the existing `--additional-config`
+JSON:
+
+```json
+{"hcu_dsv41_w4a8_ht_fixed_capacity": true, "hcu_dsv41_w4a8_ht_sender_int8": true}
+```
+
+With sender INT8 enabled, fixed-capacity steps quantize on the sender and send
+INT8 activations and FP32 per-token scales. Scatter checks the received route IDs
+before reading the payload. The sender option defaults to false. Small batches
+and the private dSpark draft continue to use their existing dispatch policies.
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,

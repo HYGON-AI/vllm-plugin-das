@@ -23,6 +23,7 @@ from .ct_w4a8_prepare import (
     DeepEPHTPrepareAndFinalize,
     DeepEPLLPrepareAndFinalize,
     FixedHTExpertTokens,
+    FixedHTInt8ExpertTokens,
     HcuCTHTPrepareAndFinalize,
     HcuCTLLPrepareAndFinalize,
 )
@@ -93,6 +94,20 @@ def _fixed_receive_capacity(config, moe, buffer):
         moe.max_num_tokens, scheduler.max_num_seqs, 1 + speculative_tokens,
         parallel.prefill_context_parallel_size, parallel.pcp_shard_decode_requests,
     )
+
+
+def _fixed_sender_int8(config, capacity, buffer):
+    from ..dsv41.profile_worker import HT_SENDER_INT8_KEY
+
+    extra = getattr(config, "additional_config", None) or {}
+    enabled = extra.get(HT_SENDER_INT8_KEY, False)
+    if type(enabled) is not bool:
+        raise ValueError(f"{HT_SENDER_INT8_KEY} must be a boolean")
+    if enabled:
+        if capacity is None:
+            raise ValueError(f"{HT_SENDER_INT8_KEY} requires fixed-capacity DeepEP HT")
+        _require_abi(buffer.dispatch, ("x", "num_worst_tokens"))
+    return enabled
 
 
 def _isolated_draft_ht_buffer(manager, hidden):
@@ -176,6 +191,7 @@ def make_prepare(moe,descriptor,routing_tables,config=None):
         prepare = HcuCTHTPrepareAndFinalize(
             buffer, native.num_dispatchers(), native.dp_size,
             native.rank_expert_offset, fixed_receive_tokens=capacity,
+            fixed_sender_int8=_fixed_sender_int8(config, capacity, buffer),
         )
         from hcu_vllm_das.hy4_ht_int8 import select_prepare
         return select_prepare(prepare, config, moe)
@@ -204,11 +220,17 @@ def deepgemm_moe_permute(*,aq,aq_scale,topk_ids,local_num_experts,expert_map,exp
     indices = torch.full((aligned,), -1, dtype=torch.int32, device=aq_out.device)
     inverse = torch.empty(topk_ids.shape, dtype=torch.int32, device=aq_out.device)
     starts = torch.empty((local_num_experts,), dtype=torch.int32, device=aq_out.device)
-    ep_scatter(recv_x=aq, recv_x_scale=token_scale, recv_topk=topk_ids,
-        num_recv_tokens_per_expert=counts, expert_start_loc=starts, expert_map=expert_map,
-        output_tensor=aq_out, output_tensor_scale=scale, m_indices=indices,
-        output_index=inverse, align_m=256, block_size=block_size,
-        pack_ue8m0=False, use_psum_layout=False)
+    if isinstance(expert_tokens_meta, FixedHTInt8ExpertTokens):
+        from .ct_w4a8_fixed_int8_scatter import scatter_fixed_int8
+
+        scatter_fixed_int8(aq, token_scale, topk_ids, counts, starts,
+                           aq_out, scale, indices, inverse)
+    else:
+        ep_scatter(recv_x=aq, recv_x_scale=token_scale, recv_topk=topk_ids,
+            num_recv_tokens_per_expert=counts, expert_start_loc=starts, expert_map=expert_map,
+            output_tensor=aq_out, output_tensor_scale=scale, m_indices=indices,
+            output_index=inverse, align_m=256, block_size=block_size,
+            pack_ue8m0=False, use_psum_layout=False)
     return aq_out, scale, indices, inverse, None
 
 
