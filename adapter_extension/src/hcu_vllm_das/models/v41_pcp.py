@@ -241,6 +241,11 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
     def __init__(self, *, vllm_config, prefix=''):
         self._hcu_static_eplb_config = None
         uses_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+        if uses_pcp:
+            from ..dsv41.kv_gather import install as install_kv_gather
+
+            if install_kv_gather():
+                native.logger.info('DSV4.1 ROCm KV gather uses 64-bit page offsets')
         if static_eplb.enabled(vllm_config):
             static_eplb.validate_config(vllm_config)
             self._hcu_static_eplb_config = vllm_config
