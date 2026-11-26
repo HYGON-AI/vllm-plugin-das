@@ -1,5 +1,6 @@
 """Portable actual-source control contracts; native math is qualified separately."""
 import ast
+import importlib.util
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -50,6 +51,7 @@ class Core:
         self.__dict__.update(kwargs)
         self.num_heads = kwargs.get('num_heads', 4)
         self.kv_lora_rank = 512
+        self.q_head_size = 576
         self.qk_rope_head_dim = 64
         self.kv_cache_dtype = kwargs.get('kv_cache_dtype', 'fp8_ds_mla')
         self.index_group = kwargs.get('index_group')
@@ -66,7 +68,7 @@ class Core:
 
 
 @contextmanager
-def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', available=True):
+def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', available=True, e5=False):
     calls = []
     workspace = [Tensor((16, 4, 576))]
     state = {'probes': 0}
@@ -97,10 +99,25 @@ def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', availabl
     for name in ('lightop.kvcache', 'hcu_adapter._base',
                  'vllm.v1.attention.backends.mla.index_group', '_concat_contract.fullgraph_runner'):
         modules[name] = ModuleType(name)
+    modules['_concat_contract'] = ModuleType('_concat_contract')
+    modules['_concat_contract'].__path__ = []
+    modules['_concat_contract.runtime'] = ModuleType('_concat_contract.runtime')
+    modules['_concat_contract.runtime'].is_hcu_platform = lambda: True
+    policy_name = '_concat_contract.flashmla_ops'
+    policy_spec = importlib.util.spec_from_file_location(policy_name, FAMILY / 'flashmla_ops.py')
+    policy = importlib.util.module_from_spec(policy_spec)
+    modules[policy_name] = policy
     if provider != 'absent':
         modules['lightop.kvcache'].fused_concat_and_store_mla_kv_cache = (
             Missing() if provider == 'missing' else native)
     modules['hcu_adapter._base'].Missing = Missing
+    ops = object()
+    if e5:
+        def writer(*args):
+            raise AssertionError('Constructor/copy test must not quantize KV')
+        modules['lightop.kvcache'].fused_quantize_and_store_mla_kv_cache = writer
+        ops = SimpleNamespace(get_sparse_kv_cache_formats=lambda: ('e4m3', 'e5m2'),
+                              with_kvcache=writer, get_metadata=writer)
     modules['vllm.v1.attention.backends.mla.index_group'].HiSparseMLAIndexGroup = HiSparse
     modules['_concat_contract.fullgraph_runner']._qualified_worker_tuple = runner_ns['_qualified_worker_tuple']
     source = ast.parse((FAMILY / 'sparse_backend.py').read_text())
@@ -109,13 +126,14 @@ def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', availabl
     cls = ast.ClassDef(name='FlashSparseImpl', bases=[ast.Name(id='Core', ctx=ast.Load())],
         keywords=[], body=[n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names], decorator_list=[])
     ns = dict(__name__='_concat_contract.sparse_backend', __package__='_concat_contract',
-        Core=Core, torch=torch, is_hcu_platform=lambda: True, get_flashmla_ops=lambda: object(),
+        Core=Core, torch=torch, is_hcu_platform=lambda: True, get_flashmla_ops=lambda: ops,
         fp8_fusions_enabled=lambda: master,
         get_current_vllm_config=lambda: SimpleNamespace(parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1, decode_context_parallel_size=1, tensor_parallel_size=tp)),
         install_hisparse_prewrite_hook=lambda *args: calls.append(('hisparse_hook', args)),
         current_workspace_manager=lambda: SimpleNamespace(get_simultaneous=lambda *specs: tuple(workspace)))
     with patch.dict('sys.modules', modules):
+        policy_spec.loader.exec_module(policy)
         exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), str(FAMILY / 'sparse_backend.py'), 'exec'), ns)
         yield ns['FlashSparseImpl'], workspace, calls, state
 
@@ -125,6 +143,21 @@ def query(t=2, h=4):
 
 
 class QueryConcatTests(unittest.TestCase):
+    def test_e5_codec_preserves_bf16_query_copy_and_hisparse_stays_e4(self):
+        with harness(e5=True) as (Impl, buffers, calls, state):
+            obj = Impl(num_heads=4)
+            self.assertEqual(obj._hcu_fp8_cache_format.name, 'e5m2')
+            metadata = SimpleNamespace(fp8_use_mixed_batch=True)
+            result = obj.forward_mqa(query(), 'cache', metadata, 'layer')
+            self.assertIs(result.owner, buffers[0])
+            self.assertEqual(calls[0][0], 'native')
+            self.assertEqual(calls[0][1][-1], 'fp8_e4m3')  # BF16 MODE0 query copy, not KV codec.
+            self.assertIs(obj.seen[2], metadata)
+        with harness(e5=True) as (Impl, buffers, calls, state):
+            obj = Impl(num_heads=4, index_group=HiSparse())
+            self.assertEqual(obj._hcu_fp8_cache_format.name, 'e4m3')
+            self.assertIsNone(obj._hcu_query_concat_device)
+
     def test_qualified_tuple_uses_same_workspace_and_core_reader(self):
         with harness() as (Impl, buffers, calls, state):
             obj = Impl(num_heads=4)
