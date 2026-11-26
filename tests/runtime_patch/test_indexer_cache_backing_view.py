@@ -201,7 +201,7 @@ def test_native_decode_matches_custom_op_writer_layout(monkeypatch, gfx938, page
     def logits(*args, **kwargs):
         if page_stride is not None:
             assert args[1].data_ptr() == pages.data_ptr()
-            torch.testing.assert_close(args[1].squeeze(-2), pages)
+            torch.testing.assert_close(args[1], pages.unsqueeze(-2))
         calls.append(kwargs)
         return torch.tensor([[1.0, 3.0, 2.0, 0.0, -torch.inf, -torch.inf]])
 
