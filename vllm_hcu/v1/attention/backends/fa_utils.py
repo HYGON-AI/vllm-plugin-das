@@ -71,6 +71,59 @@ def _strided_b16_paged_fwd(parameters: dict[str, Any]):
     return output
 
 
+def _softcap_b16_paged_fwd(parameters: dict[str, Any]):
+    """Honor positive softcap without using the vendor's unsupported paged ABI."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    if parameters.get("q_v") is not None:
+        raise NotImplementedError("HCU paged B16 softcap fallback does not support q_v")
+    if parameters.get("cp_world_size", 1) != 1:
+        raise NotImplementedError(
+            "HCU paged B16 softcap fallback does not support context parallel attention"
+        )
+    if (
+        parameters.get("dropout_p", 0.0) != 0.0
+        or parameters.get("return_softmax_lse", False)
+        or parameters.get("return_attn_probs", False)
+    ):
+        raise NotImplementedError(
+            "HCU paged B16 softcap fallback does not support dropout or returning LSE/probabilities"
+        )
+    window = parameters.get("window_size") or (-1, -1)
+    causal = parameters.get("causal", False)
+    if not causal and window[1] >= 0:
+        raise NotImplementedError(
+            "HCU paged B16 softcap fallback does not support a noncausal right window"
+        )
+    q = parameters["q"].contiguous()
+    output = parameters.get("out")
+    contiguous_output = (
+        output if output is not None and output.is_contiguous()
+        else torch.empty_like(q)
+    )
+    scale = parameters.get("softmax_scale")
+    unified_attention(
+        q=q, k=parameters["k"], v=parameters["v"], out=contiguous_output,
+        cu_seqlens_q=parameters["cu_seqlens_q"].contiguous(),
+        max_seqlen_q=parameters["max_seqlen_q"],
+        seqused_k=parameters["seqused_k"].contiguous(),
+        max_seqlen_k=parameters["max_seqlen_k"],
+        softmax_scale=q.shape[-1] ** -0.5 if scale is None else scale,
+        causal=causal, window_size=window,
+        block_table=parameters["block_table"].contiguous(),
+        softcap=parameters["softcap"],
+        q_descale=parameters.get("q_descale"),
+        k_descale=parameters.get("k_descale"),
+        v_descale=parameters.get("v_descale"),
+        alibi_slopes=parameters.get("alibi_slopes"), sinks=parameters.get("s_aux"),
+    )
+    if output is None:
+        return contiguous_output
+    if contiguous_output is not output:
+        output.copy_(contiguous_output)
+    return output
+
+
 def _with_kv_cache_layout(function: Callable[..., Any], name: str):
     try:
         signature = inspect.signature(function)
@@ -156,9 +209,6 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
                 and isinstance(cu, torch.Tensor)
                 and isinstance(parameters.get("block_table"), torch.Tensor)
                 and isinstance(parameters.get("seqused_k"), torch.Tensor)
-                and parameters.get("q_v") is None
-                and parameters.get("cp_world_size", 1) == 1
-                and not parameters.get("return_attn_probs", False)
                 and (
                     max_q == 1
                     or (
@@ -167,17 +217,26 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
                         and max_q * q.shape[1] <= 64 * key_cache.shape[2]
                     )
                 )
-                and (
-                    not key_cache.is_contiguous()
-                    or not v.is_contiguous()
-                    or not q.is_contiguous()
-                    or (
-                        isinstance(parameters.get("out"), torch.Tensor)
-                        and not parameters["out"].is_contiguous()
-                    )
-                )
             ):
-                return _strided_b16_paged_fwd(parameters)
+                if parameters.get("softcap", 0.0) > 0.0:
+                    # The native paged varlen ABI rejects positive softcap,
+                    # while direct PA silently ignores it. Triton implements it.
+                    return _softcap_b16_paged_fwd(parameters)
+                if (
+                    parameters.get("q_v") is None
+                    and parameters.get("cp_world_size", 1) == 1
+                    and not parameters.get("return_attn_probs", False)
+                    and (
+                        not key_cache.is_contiguous()
+                        or not v.is_contiguous()
+                        or not q.is_contiguous()
+                        or (
+                            isinstance(parameters.get("out"), torch.Tensor)
+                            and not parameters["out"].is_contiguous()
+                        )
+                    )
+                ):
+                    return _strided_b16_paged_fwd(parameters)
         layout = _flash_attn_layout()
         if layout == "bhsd":
             key_cache = args[1] if len(args) > 1 else kwargs.get("k")
