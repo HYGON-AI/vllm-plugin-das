@@ -49,3 +49,12 @@ def test_sparse_and_window_backends_use_the_compact_prefill_builder():
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)
     for backend in ("FlashSparseBackend", "FlashSWABackend"):
         assert issubclass(namespace[backend].get_builder_cls(), compact_builder)
+
+
+def test_compact_prefill_respects_the_explicit_batch_and_absolute_row_limit():
+    lengths = [4096] * 6
+    assert _LEAF.compact_prefill_offsets(lengths, 24576) is None
+    assert _LEAF.compact_prefill_offsets(
+        lengths, 24576, max_batched_tokens=24576
+    ) == list(range(0, 24577, 4096))
+    assert _LEAF.compact_prefill_offsets([24577], 24576, max_batched_tokens=32768) is None

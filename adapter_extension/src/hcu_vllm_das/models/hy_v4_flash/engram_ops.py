@@ -13,14 +13,23 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-def get_engram_cpu_offload(storage) -> bool:
+def get_engram_cpu_offload(storage, *, additional_config=None) -> bool:
+    option = "hyv4_flash_engram_cpu_offload"
+    selected = None
+    if additional_config is not None and option in additional_config:
+        selected = additional_config[option]
+        if type(selected) is not bool:
+            raise ValueError(f"{option} must be a boolean")
     if storage is None:
-        return False
+        return selected is True
     if any(getattr(storage, name, False) for name in (
         "disk_offload", "embedding_across_dp", "dp_shared_memory",
     )):
         raise ValueError("Flash Engram supports TP-local tables, not DP/disk offload")
-    return bool(getattr(storage, "cpu_offload", False))
+    configured = bool(getattr(storage, "cpu_offload", False))
+    if selected is not None and selected != configured:
+        raise ValueError(f"{option} conflicts with engram_config.cpu_offload")
+    return configured
 
 
 @triton.jit
