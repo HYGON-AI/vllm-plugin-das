@@ -230,7 +230,7 @@ def test_ct_w4a8_does_not_inherit_storage_eplb_capability(native_wna16):
     assert storage.supports_eplb
 
 
-def test_hyv4_checkpoint_accounting_excludes_ct_w4a8_runtime_auxiliaries(native_wna16):
+def test_hyv4_checkpoint_accounting_excludes_ct_w4a8_runtime_auxiliaries(native_wna16, monkeypatch):
     from vllm_hcu.models.hy_v4.model import _HYV4CheckpointAccounting
 
     _, method, layer = _native_layer(-1, "aiter")
@@ -247,6 +247,21 @@ def test_hyv4_checkpoint_accounting_excludes_ct_w4a8_runtime_auxiliaries(native_
     for name in ledger.expected:
         ledger.record(name)
     ledger.validate()
+    from vllm_hcu.models.hy_v4 import model as hy_model
+    outer = object.__new__(hy_model.HYV4ForCausalLM)
+    torch.nn.Module.__init__(outer)
+    outer.config = SimpleNamespace(tie_word_embeddings=False)
+    outer.quant_config = None
+    outer.model = model
+    checkpoint_names = set(ledger.expected)
+
+    def load_checkpoint(_loader, _weights):
+        for name in checkpoint_names:
+            model._checkpoint_accounting.record(name)
+        return {"model." + name for name in checkpoint_names}
+
+    monkeypatch.setattr(hy_model._HYV4AutoWeightsLoader, "load_weights", load_checkpoint)
+    assert outer.load_weights(iter([])) == {"model." + name for name in checkpoint_names}
     # Actual checkpoint weights and scales remain mandatory.
     ledger.received.pop("mlp.experts.routed_experts.w13_weight_scale")
     with pytest.raises(RuntimeError, match="Missing HY V4 checkpoint"):

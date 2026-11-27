@@ -299,6 +299,24 @@ def _require_hyv4_static_plan(model):
     return plan
 
 
+def _is_hyv4_checkpoint_parameter(model, name: str, param) -> bool:
+    """Use the same checkpoint boundary for shard and whole-model checks."""
+    if isinstance(param, KVCacheScaleParameter):
+        return False
+    module_name, _, parameter_name = name.rpartition(".")
+    if parameter_name in {
+        "w13_weight_g_idx", "w2_weight_g_idx",
+        "w13_g_idx_sort_indices", "w2_g_idx_sort_indices",
+        "w13_qzeros", "w2_qzeros",
+    }:
+        method = getattr(model.get_submodule(module_name), "quant_method", None)
+        if hasattr(method, "_hcu_ct_w4a8_delegate"):
+            # WNA16 creates activation-order scratch and synthetic offset-binary
+            # zero points; symmetric channel W4A8 supplies neither in checkpoints.
+            return False
+    return True
+
+
 class _HYV4CheckpointAccounting:
     """Track checkpoint slots and retain only unmatched local FP8 pairs.
 
@@ -321,20 +339,8 @@ class _HYV4CheckpointAccounting:
         if num_physical_experts <= 0:
             num_physical_experts = num_experts
         for name, param in model.named_parameters():
-            if isinstance(param, KVCacheScaleParameter):
+            if not _is_hyv4_checkpoint_parameter(model, name, param):
                 continue
-            module_name, _, parameter_name = name.rpartition(".")
-            if parameter_name in {
-                "w13_weight_g_idx", "w2_weight_g_idx",
-                "w13_g_idx_sort_indices", "w2_g_idx_sort_indices",
-                "w13_qzeros", "w2_qzeros",
-            }:
-                method = getattr(model.get_submodule(module_name), "quant_method", None)
-                if hasattr(method, "_hcu_ct_w4a8_delegate"):
-                    # WNA16 creates activation-order scratch and synthetic
-                    # offset-binary zero points for storage. The symmetric
-                    # channel W4A8 checkpoint supplies neither of them.
-                    continue
             parts = name.split(".")
             if "gate_up_proj" in parts or "wk_weights_proj" in parts:
                 slots = {0, 1}
@@ -1197,7 +1203,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, MixtureOfExperts):
         required_params = {
             name
             for name, param in self.named_parameters()
-            if not isinstance(param, KVCacheScaleParameter)
+            if _is_hyv4_checkpoint_parameter(self, name, param)
         }
         missing_params = required_params - loaded_params
         if missing_params:
