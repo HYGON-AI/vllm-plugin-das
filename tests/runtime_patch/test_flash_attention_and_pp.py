@@ -2246,3 +2246,68 @@ def test_hcu_fa_nonpaged_descales_keep_original_shape(monkeypatch):
     scale = torch.tensor(0.5).expand(4, 2)
     fa_utils.flash_attn_varlen_func(k=torch.zeros(8, 2, 8), k_descale=scale)
     assert calls["flash_attn_varlen_func"][0]["k_descale"] is scale
+
+
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("query_len", [1, 3])
+@pytest.mark.parametrize("with_lse", [False, True])
+@pytest.mark.parametrize("scale", [0.0, 0.125])
+def test_strided_b16_decode_uses_native_paged_varlen(
+    monkeypatch, layout, query_len, with_lse, scale,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    physical = torch.zeros(
+        (3, 2, 64, 2, 128) if layout == "NHD" else (3, 2, 2, 64, 128),
+        dtype=torch.bfloat16,
+    )
+    cache = physical if layout == "NHD" else physical.transpose(2, 3)
+    key, value = cache.unbind(1)
+    query = torch.zeros(2 * query_len, 4, 256, dtype=torch.bfloat16)[..., ::2]
+    backing = torch.full_like(query, -7).repeat_interleave(2, dim=-1)
+    output = backing[..., ::2]
+    cu = torch.tensor([0, query_len, 2 * query_len], dtype=torch.int32)
+    seq = torch.tensor([11, 13], dtype=torch.int32)
+    table = torch.tensor([[0], [2]], dtype=torch.int32)
+    sink = torch.ones(4, dtype=torch.bfloat16)
+    slopes = torch.ones(4)
+    native_calls = []
+    lse = torch.tensor([19.0])
+    probabilities = torch.tensor([23.0])
+
+    def native(*args):
+        native_calls.append(args)
+        assert args[0].is_contiguous()
+        assert args[1] is key
+        assert args[2] is value
+        assert args[3].is_contiguous()
+        assert args[3] is not output
+        assert args[4] is cu
+        assert args[6] is seq
+        assert args[8] is table
+        assert args[9] is slopes
+        assert args[10:20] == (
+            query_len, 13, 0.0, scale, False, True, 7, 0, 2.0, False,
+        )
+        assert args[24] is sink
+        args[3].fill_(5)
+        return args[3], None, None, None, None, lse, probabilities, None
+
+    monkeypatch.setattr(fa_utils.flash_attn_2_cuda, "varlen_fwd", native)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("strided K/V must not reach the direct PA ABI")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=query, k=key, v=value, out=output, cu_seqlens_q=cu,
+        max_seqlen_q=query_len, max_seqlen_k=13, seqused_k=seq,
+        block_table=table, softmax_scale=scale, causal=True,
+        window_size=[7, 0], softcap=2.0, alibi_slopes=slopes,
+        s_aux=sink, return_softmax_lse=with_lse,
+    )
+    assert len(native_calls) == 1
+    assert (result[0] if with_lse else result) is output
+    if with_lse:
+        assert result[1] is lse
+        assert result[2] is probabilities
+    torch.testing.assert_close(output, torch.full_like(output, 5))
+    torch.testing.assert_close(backing[..., 1::2], torch.full_like(output, -7))
