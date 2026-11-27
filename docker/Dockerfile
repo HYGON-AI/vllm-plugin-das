@@ -22,11 +22,15 @@ ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
 
 # pip 配置 (nightly 归档按基础镜像的 DTK_VERSION token 拼接) + das-install
-RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
+# DTK_VERSION 可能带构建后缀 (26.04.1 基础镜像是 dtk26041-72cu-0915), 而归档 index
+# 名只有主版本段 (nightly/dtk26041); 直接拼会得到 nightly/dtk26041-72cu-0915/+simple/
+# (404), pip 报 "Could not find a version that satisfies the requirement ..." 后构建失败
+RUN PYPI_DTK_TAG="${DTK_VERSION%%-*}" && \
+    TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     mkdir -p ~/.pip && \
     printf '%s\n' \
     '[global]' \
-    "index-url = ${PYPI_URL}/nightly/${DTK_VERSION}/+simple/" \
+    "index-url = ${PYPI_URL}/nightly/${PYPI_DTK_TAG}/+simple/" \
     "trusted-host = ${TRUSTED_HOST}" \
     > ~/.pip/pip.conf && \
     pip install --ignore-installed --no-cache-dir blinker && \
