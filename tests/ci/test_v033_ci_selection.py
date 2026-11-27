@@ -99,6 +99,15 @@ class SelectionTests(unittest.TestCase):
             self.assertIn('--diff-filter=ACMRTUXB', run.call_args.args[0])
             self.assertNotIn('--no-renames', run.call_args.args[0])
 
+    def test_both_device_tiers_run_public_int8_loading_and_graph_contracts(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import test_files
+        expected = {'tests/vllm033/test_aiter_int8_public_hcu.py',
+                    'tests/vllm033/test_aiter_int8_ct_graph_hcu.py'}
+        for tier in ('device', 'device-gfx938'):
+            with self.subTest(tier=tier):
+                self.assertTrue(expected.issubset(test_files(tier)))
+
     def test_result_gate_rejects_skip_xfail_empty_failure_and_error(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         from run_v033_ci import validate_result, test_files
@@ -112,7 +121,8 @@ class SelectionTests(unittest.TestCase):
         } | {'tests/vllm033/test_slimquant.py',
              'tests/vllm033/test_minimax31_prefill_gpu.py',
              'tests/vllm033/test_minimax31_online_markov.py',
-             'tests/vllm033/test_hy4_replica_distribution_gpu.py'})
+             'tests/vllm033/test_hy4_replica_distribution_gpu.py',
+             'tests/vllm033/test_dsv41_dspark_context_kv.py'})
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / 'junit.xml'
             for text in ['<testsuites/>', '<testsuite><testcase><skipped/></testcase></testsuite>',
@@ -123,6 +133,15 @@ class SelectionTests(unittest.TestCase):
                     validate_result(report)
             report.write_text('<testsuite><testcase name="real"/></testsuite>')
             validate_result(report)
+
+    def test_active_indexpool_contract_runs_only_in_device_tier(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import test_files
+        suites = list((ROOT / 'tests/vllm033').glob('test_hyv4_flash_active_indexpool*.py'))
+        self.assertEqual(len(suites), 1)
+        suite = suites[0].relative_to(ROOT).as_posix()
+        self.assertNotIn(suite, test_files('portable'))
+        self.assertIn(suite, test_files('device'))
 
     def test_workflow_is_release_scoped_and_keeps_cpu_device_separate(self):
         source = (ROOT / '.github/workflows/hcu-pr-ci-v033.yml').read_text()

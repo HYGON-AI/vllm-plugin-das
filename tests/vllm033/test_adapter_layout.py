@@ -21,6 +21,7 @@ NAMES = {
     "ct_w4a8_registration": "features.ct_w4a8.ct_w4a8_registration",
     "v41_fp8_indexer": "features.dsv41.v41_fp8_indexer",
     "dsv41_channel_fp8": "features.dsv41.dsv41_channel_fp8",
+    "dsv41_shared_act_quant": "features.dsv41.shared_act_quant",
     "fp4_indexer": "features.dsv41.fp4_indexer",
     "v41_fp8_indexer_triton": "features.dsv41.v41_fp8_indexer_triton",
     "dsv41_dspark_registration": "features.dsv41.dsv41_dspark_registration",

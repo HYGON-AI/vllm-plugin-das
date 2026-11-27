@@ -129,13 +129,31 @@ def test_expansion_broadcast_and_empty_dispatch():
 
 
 @requires_hcu
-def test_long_pool_writer_and_native_scorer_8192_bound():
-    from vllm.v1.worker.workspace import init_workspace_manager
+@pytest.mark.parametrize("backend", ["emu", "triton"])
+def test_long_pool_writer_and_native_scorer_8192_bound(monkeypatch, backend):
+    from vllm.v1.worker import workspace
     from hcu_adapter.bridges.vllm_paged_mqa import get_paged_mqa_provider
     from hcu_adapter.kernels.mla_attention_emu import fp8_fp4_paged_mqa_logits
     from vllm_hcu.models.hy_v4_flash.nvidia.indexpool_ops import write_pool
 
-    init_workspace_manager(torch.device("cuda:0"))
+    # Explicit source-operator qualification: do not let a default emu config
+    # silently turn the native comparison into emu-versus-itself. No installed
+    # model/automatic platform-dispatch qualification is implied by this test.
+    from hcu_adapter.infra import hcu_config
+    from vllm_hcu.models.hy_v4_flash.nvidia.indexpool_triton import fwht_quantize_triton
+    monkeypatch.setattr(hcu_config, "load", lambda: {"ops": {
+        "vllm_paged_mqa_logits": backend}, "overrides": {}})
+    launches = []
+    if backend == "triton":
+        from vllm.v1.attention.ops import rocm_aiter_mla_sparse as core_mqa
+        actual_launcher = core_mqa.rocm_fp8_paged_mqa_logits_triton
+
+        def traced_launcher(*args, **kwargs):
+            launches.append(True)
+            return actual_launcher(*args, **kwargs)
+
+        monkeypatch.setattr(core_mqa, "rocm_fp8_paged_mqa_logits_triton", traced_launcher)
+    monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(torch.device("cuda:0")))
     torch.manual_seed(8192)
     width, heads = 2048, 32  # ratio4, max_model_len8192
     pages = width // 64
@@ -146,15 +164,18 @@ def test_long_pool_writer_and_native_scorer_8192_bound():
     owners = torch.arange(2, device="cuda").repeat_interleave(width)
     groups = torch.arange(width, device="cuda").repeat(2)
     active = torch.ones(2 * width, device="cuda", dtype=torch.bool)
-    quant, scales = fwht_quantize(torch.randn(2 * width, 128, device="cuda").bfloat16())
+    quant, scales = fwht_quantize_triton(torch.randn(2 * width, 128, device="cuda").bfloat16())
     write_pool(cache, table, owners, groups, active, quant, scales)
-    q, qs = fwht_quantize(torch.randn(2 * heads, 128, device="cuda").bfloat16())
+    q, qs = fwht_quantize_triton(torch.randn(2 * heads, 128, device="cuda").bfloat16())
     q = q.reshape(2, 1, heads, 128)
     weights = torch.randn(2, heads, device="cuda") * qs.reshape(2, heads)
     lengths = torch.tensor([[2047], [1024]], device="cuda", dtype=torch.int32)
     metadata, score = get_paged_mqa_provider()
+    assert score.__name__ == ("triton_paged_mqa_logits" if backend == "triton"
+                               else "fp8_fp4_paged_mqa_logits")
     actual = score((q, None), cache.unsqueeze(2), weights, lengths, table,
                    metadata(lengths, 64, 2), max_model_len=width)
+    assert len(launches) == (1 if backend == "triton" else 0)
     expected = fp8_fp4_paged_mqa_logits((q, None), cache.unsqueeze(2), weights,
                                        lengths, table, None, width)
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)

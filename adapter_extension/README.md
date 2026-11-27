@@ -13,7 +13,7 @@ Version `0.33.0` targets the `v0.33.0` branch. Migration status and current
 evidence are recorded in [v0.33 validation](../docs/validation/vllm033-upgrade.md);
 the v0.32 documents below are historical evidence and do not certify v0.33.
 Separate extensions provide default-OFF RMSNorm, HCU FlashAttention, SlimQuant
-and the explicit INT8 ASM candidate below. Core retains CT scheme selection,
+and the AITER INT8 backend below. Core retains CT scheme selection,
 weight loading, generic quantization and kernel construction.
 
 It also provides an explicit HCU FlashAttention backend selected by
@@ -177,6 +177,37 @@ loading, tokenizer, sparse attention, Graph, drafted/accepted tokens, model
 accuracy or performance. See the [configuration validation boundary](
 ../docs/validation/vllm033-step5-config.md).
 
+## HYV4 Flash configuration metadata
+
+`das_hcu_hyv4_flash_config` provides `hyv4-flash-config`. It registers the two
+distinct `hy_v4_flash` and `hy_v4_flash_vl` config types through public
+`AutoConfig.register()` during Adapter extension activation. The text config
+inherits official Core `HYV4Config`; ordinary HYV4 configs and model registry
+entries retain their official owners. Flash-specific IndexPool, SWA, Engram
+and vision fields use the existing candidate's validation and serialization.
+
+Both names are checked for foreign ownership before publication. A partial
+commit or later ownership drift latches a fatal failure; health checks never
+repair the mapping. Discovery imports no framework. Forked children must
+activate their inherited mapping, and spawned children discover the installed
+entry point. The capability can be required using the existing Adapter
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-config` setting.
+
+On vLLM 0.33.0, the `das_hcu_hyv4_flash_model` entry point prepares the runtime
+when a Flash model configuration is parsed or restored in a worker. It uses
+`spawn` when the worker method is unset. To require the capability explicitly
+before model selection, set `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hyv4-flash-model`.
+The model owns the `HYV4FlashForCausalLM`/`HYV4FlashVLForConditionalGeneration` names;
+the separate optimized HY4 static-EPLB architecture and its entry points remain
+available. Flash quantized/latent parallel admission remains narrower than
+that static path and must not be treated as EPLB qualification.
+
+Activation health certifies registry/config/DFly ownership only. Checkpoint,
+DFly generation, HiSparse admission, changed-input Graph replay and measured
+performance need their own installed-artifact validation. See the
+[model integration and runtime gates](../docs/hy4_flash.md). In particular,
+HiSparse plus DFly or an unqualified Graph path remains unsupported.
+
 ## DSV4.1 HCU decode defaults
 
 Eligible DSpark draft LL receive quantization, INT8 direct GEMM, and Shared
@@ -300,6 +331,21 @@ physical expert count. Global runtime EPLB remains disabled.
 Configuration, migration ownership and validation scope are recorded in
 [static EPLB](../docs/validation/v41-static-eplb.md).
 
+### DeepSeek V4.1 W4A8 sender INT8
+
+For eager PCP4/EP4 or PCP8/EP8 with ordinary DeepGEMM and single-node DeepEP
+high throughput, add both boolean keys to the existing `--additional-config`
+JSON:
+
+```json
+{"hcu_dsv41_w4a8_ht_fixed_capacity": true, "hcu_dsv41_w4a8_ht_sender_int8": true}
+```
+
+With sender INT8 enabled, fixed-capacity steps quantize on the sender and send
+INT8 activations and FP32 per-token scales. Scatter checks the received route IDs
+before reading the payload. The sender option defaults to false. Small batches
+and the private dSpark draft continue to use their existing dispatch policies.
+
 ## Compatibility
 
 - vLLM release line: `>=0.33.0,<0.34.0`; prerelease, postrelease,
@@ -358,14 +404,72 @@ Schema4 additionally verifies that the seven official INT8 oracle symbols
 remain identical across activation, the module is owned by the Core wheel,
 and explicit Triton selection resolves to an official expert.
 
-## Explicit INT8 ASM candidate
+## Shared channel-FP8 AITER MoE interface
 
-Request `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hcu-aiter-int8-moe` and
-`--moe-backend aiter`. This requires the associated Core public
+`hcu_vllm_das.moe.aiter_fp8` exposes `Problem`, `get_config`,
+`prepare_weights`, and `run`. Callers supply actual expert/input/output shapes,
+top-k, compute dtype and activation parameters. `get_config` calls the installed
+public `aiter.moe.get_aiter_moe_config` first, including the `use_shuffle` preference and the
+requested solution type. It records `vendor_query` or `qualified_profile` rather
+than treating a missing tuning row as a hit. An optional `QualifiedProfile`
+must match the exact static problem, dtype, architecture, layout and token bound
+and identify its independent native evidence. The common interface contains no
+HY4 shapes, router scaling or expert-count constants.
+
+```python
+from hcu_vllm_das.moe import aiter_fp8
+
+problem = aiter_fp8.Problem(M, E, N1, N2, K, topk, x.dtype,
+    activation="silu", gated=True, gemm1_limit=limit,
+    architecture=actual_architecture)
+selected = aiter_fp8.get_config(problem, use_shuffle=True,
+    profiles=consumer_qualified_profiles, solution_type="asm")
+# Once, after loading and before capture. Keep only the prepared parameters.
+prepared = aiter_fp8.prepare_weights(w1, w2, s1, s2, selected)
+y = aiter_fp8.run(x, topk_weights, topk_ids, prepared, selected,
+    routed_scaling_factor=1.0)
+```
+
+Returned `need_shuffle` / `need_shuffle_scale` flags determine preparation. Packing uses public `aiter_moe_shfl_weight` and, only if required by the returned
+config, its scale counterpart. Prepared weights retain a layout signature and
+own no duplicate canonical buffers. Later token-count configs must be layout
+compatible; different packed stage IDs refuse instead of repacking during
+capture. Config mutation and replaced/modified prepared buffers refuse. Treat
+inference weights as immutable: they may have no Torch version counter. A reload
+needs canonical buffers, a new prepared owner and recaptured graphs. This API
+does not qualify every model, geometry, dtype or activation supported by AITER;
+each consumer retains native and full-model gates.
+
+HYV4 Flash opts in through `--moe-backend aiter` for serialized channel-FP8
+routed experts. Dense/DFly and auto/triton retain their official Core owners.
+`--hf-overrides '{"flash_aiter_moe_use_shuffle": false}'` selects the raw control;
+the explicit AITER route otherwise prepares shuffled weights. The layout policy
+is frozen at construction; the resolved HF flag participates in Core ModelConfig hash factors. Current admitted
+expert geometries are genuine gfx938 ordinary TP4/TP8, E512/K1536/N384 or192,
+BF16 input, top16 and clamp10. The qualified ASM11007+21000/BM32 profile is used
+only after a vendor lookup miss; no global architecture or FP8 oracle is changed.
+Core keeps CT loading, routing, prepare/finalize and TP reduction. Its router
+already applies3.998, so the vendor receives factor1.0. Startup logs distinguish
+the selected backend, config provenance and raw/shuffled layout. Component
+qualification is not full-model accuracy or performance acceptance.
+
+## AITER INT8 backend
+
+Select `--moe-backend aiter`. On compatible gfx936 and gfx938 hosts the
+independent extension registers automatically; neither
+`HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES` nor
+`HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS` is required to enable it.
+The existing `hcu-aiter-int8-moe` capability can still be required as an optional
+deployment assertion that registration succeeds before model construction.
+Registration requires the associated Core public
 `register_int8_moe_backend` API; stock v0.33 without that API refuses activation.
 The retired `int8_oracle.install()` remains unavailable and no oracle functions,
 already-imported aliases, CT classes or builtin enum members are replaced.
 Builtin auto/triton behavior stays unchanged.
+An unavailable optional provider is reported before registration without
+blocking unrelated backends; failed preparation cannot be retried in that
+process. An explicit deployment requirement remains strict. Any failure once
+public registration is attempted is still process-fatal, without rollback.
 
 The architecture candidate admits exact gfx936 and gfx938 identities, with
 raw symmetric per-channel INT8 expert weights,

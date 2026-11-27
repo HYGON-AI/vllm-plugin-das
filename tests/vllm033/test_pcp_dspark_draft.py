@@ -12,14 +12,16 @@ from vllm.model_executor.layers.fused_moe import config as moe_config
 from vllm.models.deepseek_v41.amd.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from hcu_vllm_das.dsv41.profile_worker import HT_FIXED_CAPACITY_KEY, HT_SENDER_INT8_KEY
 from hcu_vllm_das.models.dsv41_dspark import HcuDSparkDeepseekV41ForCausalLM
-from hcu_vllm_das.pcp_dspark_draft import draft_config, moe_pcp_size
+from hcu_vllm_das.pcp_dspark_draft import draft_config, moe_pcp_size, needs_isolated_ht_buffer
 from hcu_vllm_das.quantization.ct_w4a8 import HcuDSV41CTW4A8Config, validate_topology
 from test_pcp_dspark import config
 
 
-def native_draft_config():
+def native_draft_config(*, target_fixed_ht=False):
     cfg = config()
+    cfg.additional_config[HT_FIXED_CAPACITY_KEY] = target_fixed_ht
     cfg.parallel_config = ParallelConfig(
         tensor_parallel_size=1, data_parallel_size=1, prefill_context_parallel_size=8,
         enable_expert_parallel=True, all2all_backend='deepep_high_throughput',
@@ -63,6 +65,19 @@ def test_real_native_draft_attention_and_moe_have_distinct_pcp_widths():
     assert 'hcu_static_eplb' not in local.additional_config
     assert 'hcu_static_eplb' in cfg.additional_config
     assert actual.ep_size == actual.pcp_size == 8
+
+
+@pytest.mark.parametrize("target_fixed_ht", [False, True])
+def test_draft_remembers_target_ht_mode_without_enabling_fixed_receive(target_fixed_ht):
+    native = native_draft_config(target_fixed_ht=target_fixed_ht)
+    native.additional_config[HT_SENDER_INT8_KEY] = target_fixed_ht
+    local = draft_config(native)
+    assert HT_FIXED_CAPACITY_KEY not in local.additional_config
+    assert HT_SENDER_INT8_KEY not in local.additional_config
+    assert native.additional_config[HT_SENDER_INT8_KEY] is target_fixed_ht
+    assert needs_isolated_ht_buffer(local) is target_fixed_ht
+    assert draft_config(local).additional_config == local.additional_config
+    assert moe_pcp_size(local) == 8
 
 
 def test_owned_model_binds_private_config_and_restores_parent():

@@ -136,7 +136,14 @@ def validate_config(cfg) -> bool:
         errors.append('static EPLB deployment cannot use --enable-ep-weight-filter')
     if p.all2all_backend != 'deepep_high_throughput':
         errors.append('static EPLB is validated only with deepep_high_throughput')
-    if cfg.kernel_config.moe_backend != 'deep_gemm':
+    # MegaMoE consumes Core's physical expert IDs; keep other model families
+    # and quantization formats on their existing DeepGEMM admission.
+    w4a8_mega = (
+        cfg.kernel_config.moe_backend == 'deep_gemm_mega_moe'
+        and cfg.model_config.quantization == 'hcu_dsv41_ct_w4a8'
+        and not is_hy4_static(cfg)
+    )
+    if cfg.kernel_config.moe_backend != 'deep_gemm' and not w4a8_mega:
         errors.append('static EPLB requires the owned DeepGEMM expert path')
     if options.recording and p.enable_dbo:
         errors.append('calibration cannot attribute load across DBO ubatches')
@@ -305,10 +312,12 @@ def _loader_function(loader, experts, name):
 
     from .quantization.ct_w4a8_method import HcuCTW4A8MoEMethod
 
+    from .moe.dsv41_w4a8_megamoe import HcuDSV41W4A8MegaMoEMethod
+
     # Packed CT wraps the native bound loader with its one-time loading guard.
     # Verify the underlying owner, but invoke the wrapper on every replica so
     # a reload after HIPC conversion still raises before touching packed data.
-    if isinstance(experts.quant_method, HcuCTW4A8MoEMethod):
+    if isinstance(experts.quant_method, (HcuCTW4A8MoEMethod, HcuDSV41W4A8MegaMoEMethod)):
         native = inspect.unwrap(loader)
         if (getattr(native, '__self__', None) is experts
                 and getattr(native, '__func__', None) is type(experts).weight_loader):

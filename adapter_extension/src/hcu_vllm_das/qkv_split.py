@@ -10,10 +10,12 @@ from __future__ import annotations
 from importlib import import_module
 import logging
 import os
+from types import MethodType
 
 import torch
 from triton.errors import TritonError
 from vllm.triton_utils import tl, triton
+from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 
 from hcu_adapter.operator_contracts import supports_operator_contract
 
@@ -21,6 +23,7 @@ from hcu_adapter.operator_contracts import supports_operator_contract
 _LOG = logging.getLogger('vllm.' + __name__)
 _qualified_devices = set()
 _declined_devices = set()
+_NATIVE_QKV = DeepseekV4Attention._fused_qnorm_rope_kv_insert
 
 
 def _clear_preflight():
@@ -167,3 +170,50 @@ def _split_qkv(q, kv, cache, slots, positions, cos_sin):
     torch.ops._C.fused_deepseek_v4_kv_rope_insert(
         kv, cache, slots, positions, cos_sin, cache.shape[1], None, False)
     return out
+
+
+def try_attention_split(attention, q, kv, positions, attn_metadata):
+    """Share the verified target schedule with eligible native draft layers."""
+    if (isinstance(attn_metadata, dict) and not attention.use_pcp
+            and not attention.kv_mxfp8 and not attention.accepts_unnormed_unroped_query
+            and attention.n_local_heads == attention.padded_heads == 64):
+        swa = attn_metadata.get(attention.swa_cache_layer.prefix)
+        cache = attention.swa_cache_layer.kv_cache
+        if (swa is not None and swa.block_size in (32, 64)
+                and cache.dtype == torch.uint8 and cache.ndim > 0 and cache.shape[0] > 0
+                and cache.numel() == cache.shape[0] * swa.block_size * 584):
+            cache = cache.view(cache.shape[0], swa.block_size, 584)
+            cos_sin = attention.rotary_emb.cos_sin_cache
+            if supported(q, kv, cache, swa.slot_mapping, positions, cos_sin):
+                return split_qkv(q, kv, cache, swa.slot_mapping, positions, cos_sin)
+    return None
+
+
+def _draft_qkv(self, q, kv, positions, attn_metadata):
+    value = try_attention_split(self, q, kv, positions, attn_metadata)
+    if value is not None:
+        return value
+    return self._hcu_native_qkv(q, kv, positions, attn_metadata)
+
+
+def bind_dspark_qkv(model):
+    """Bind only unmodified native draft instances; context-KV stays native."""
+    from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
+
+    if (not torch.cuda.is_available()
+            or DeepseekV4Attention._fused_qnorm_rope_kv_insert is not _NATIVE_QKV
+            or not qualify_qkv_split(torch.device('cuda', torch.cuda.current_device()))):
+        return 0
+    count = 0
+    for layer in model.layers:
+        attention = layer.attn
+        if type(attention) is not DeepseekV41ROCMAiterMLAAttention:
+            continue
+        method = attention._fused_qnorm_rope_kv_insert
+        if getattr(method, '__func__', None) is _draft_qkv:
+            count += 1
+        elif getattr(method, '__func__', None) is _NATIVE_QKV:
+            attention._hcu_native_qkv = method
+            attention._fused_qnorm_rope_kv_insert = MethodType(_draft_qkv, attention)
+            count += 1
+    return count

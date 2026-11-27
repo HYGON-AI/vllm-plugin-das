@@ -138,9 +138,23 @@ class PublicImageVideoProfileTests(unittest.TestCase):
                 is_neox_style=True,
                 dtype=self.torch.float32,
             )
-        cos, sin = HYV4VisionTransformer._rope_cos_sin(NS(rotary_pos_emb=rope), [grid])
+        # Check the fixed Core cache directly: the child vision implementation
+        # can grow a local cache, so its fallback must not mask a profile overflow.
+        t, h, w = grid
+        indices = self.torch.stack(
+            (self.torch.arange(h).repeat_interleave(w), self.torch.arange(w).repeat(h)),
+            dim=-1,
+        ).repeat(t, 1)
+        cos_table, sin_table = rope.get_cos_sin(max(h, w))
+        expected = cos_table[indices].flatten(1), sin_table[indices].flatten(1)
+        shell = self.torch.nn.Module()
+        shell.rotary_pos_emb = rope
+        shell.register_buffer("_vision_cos_sin_cache", None, persistent=False)
+        cos, sin = HYV4VisionTransformer._rope_cos_sin(shell, [grid])
         self.assertEqual(cos.shape[0], math.prod(grid))
         self.assertEqual(cos.shape, sin.shape)
+        for actual, reference in zip((cos, sin), expected):
+            self.torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
     def check_video_bound(
         self, wrapper, raw, options, budget, expected_grid=None, expected_tokens=None

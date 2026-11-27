@@ -29,8 +29,9 @@ def test_public_ct_small_config_miss_full_forward_and_changed_graph():
 def _run_component(dtype, tokens, small):
     if os.environ.get('HCU_VLLM033_AITER_INT8_LIVE') != '1':
         pytest.skip('set HCU_VLLM033_AITER_INT8_LIVE=1 for public CT forward')
-    env = dict(os.environ, HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES='hcu-aiter-int8-moe',
-        HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS='das_hcu_aiter_int8')
+    env = dict(os.environ)
+    env.pop('HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES', None)
+    env.pop('HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS', None)
     command = [sys.executable, '-P', '-B', __file__, '--component',
         '--dtype', dtype, '--tokens', str(tokens)] + (['--small'] if small else [])
     process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,

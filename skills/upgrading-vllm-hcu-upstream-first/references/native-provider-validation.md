@@ -146,6 +146,20 @@ actual module origins after repairing the environment. On Python 3.12, `-S`
 can retain the base prefix even for a venv executable, so prefix alone is not
 proof of which payload ran.
 
+Bind pip's installation scheme too: on Python3.12, a `-S` venv interpreter
+with only a private `sys.path` can still install into the base environment.
+Use an explicit owned prefix, inspect pip's resolved scheme, then verify
+package/console-script RECORD paths and unchanged shared owners. A `--target`
+layout also needs its actual relocated script paths checked against RECORD.
+
+For real HIP tests, check the actual release-tier file selection and pytest
+marker together. A native suite selected by the portable glob but absent from
+the device marker scan is neither portable coverage nor device coverage. Bind
+to the runner's assigned logical device and report its actual architecture/PCI
+identity; do not require one author's physical mask or bus address. Installed
+tests should resolve their expected root from installed distribution metadata;
+make source-snapshot overrides explicit and keep their evidence separate.
+
 Check conditional vendor exports before attributing a CPU activation failure to
 the Plugin. The inspected FlashAttention package exports its native callables
 only when `torch.cuda.is_available()` is true at import. Empty compute masks

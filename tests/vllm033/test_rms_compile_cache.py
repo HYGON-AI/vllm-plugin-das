@@ -57,15 +57,20 @@ from vllm.compilation.caching import aot_compile_hash_factors
 register_compile_factors(envs)
 config = SimpleNamespace(compute_hash=lambda: 'unchanged-model-config')
 hashes = {{}}
-for master, child in [('0','0'), ('0','1'), ('1','0'), ('1','1'), ('true','yes')]:
+for master, child in [('0','0'), ('0','1'), ('1','0'), ('1','1'), ('true','yes'), ('no','off'), (' 0 ','0'), (' yes ','off')]:
     os.environ['VLLM_HCU_USE_CUSTOM_OPS'] = master
     os.environ['VLLM_HCU_USE_CUSTOM_RMS_NORM'] = child
     hashes[(master, child)] = aot_compile_hash_factors(config)
-assert hashes[('0','0')] == hashes[('0','1')] == hashes[('1','0')]
+assert hashes[('0','0')] == hashes[('0','1')]
+assert hashes[('0','0')] != hashes[('1','0')]
+assert hashes[('1','0')] != hashes[('1','1')]
 assert hashes[('1','1')] == hashes[('true','yes')]
 assert hashes[('0','0')] != hashes[('1','1')]
+assert hashes[('no','off')] == hashes[(' 0 ','0')] == hashes[('0','0')]
+assert hashes[(' yes ','off')] == hashes[('1','0')]
 assert hashes[('0','0')][1] == hashes[('1','1')][1]
-assert envs.compile_factors()['VLLM_HCU_DAS_RMS_NORM_ENABLED'] is True
+assert envs.compile_factors()['VLLM_HCU_DAS_RMS_NORM_ENABLED'] is False
+assert envs.compile_factors()['VLLM_HCU_DAS_FP8_FUSIONS_ENABLED'] is True
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -75,3 +80,28 @@ assert envs.compile_factors()['VLLM_HCU_DAS_RMS_NORM_ENABLED'] is True
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("value,expected", [(None, True), ("1", True), (" YES ", True),
+    ("true", True), ("on", True), ("0", False), ("NO", False), (" off ", False)])
+def test_normal_compile_factor_tracks_fusion_policy(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", value)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_RMS_NORM", "0")
+    envs = SimpleNamespace(environment_variables={}, compile_factors=lambda: {})
+    register_compile_factors(envs)
+    assert envs.environment_variables["VLLM_HCU_DAS_FP8_FUSIONS_ENABLED"]() is expected
+    assert envs.environment_variables["VLLM_HCU_DAS_RMS_NORM_ENABLED"]() is False
+
+
+@pytest.mark.parametrize("factor", ["VLLM_HCU_DAS_RMS_NORM_ENABLED",
+                                  "VLLM_HCU_DAS_FP8_FUSIONS_ENABLED"])
+def test_compile_factor_conflict_does_not_publish_partial_state(factor):
+    other = lambda: False
+    registry = {factor: other}
+    envs = SimpleNamespace(environment_variables=registry, compile_factors=lambda: {})
+    with pytest.raises(RuntimeError, match="another owner"):
+        register_compile_factors(envs)
+    assert registry == {factor: other}

@@ -1,4 +1,4 @@
-"""Explicit independent publication through the public INT8 backend registry."""
+"""Independent publication for Core's explicit ``moe_backend=aiter`` choice."""
 
 import ctypes
 from dataclasses import dataclass
@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 from threading import RLock
 
-from hcu_adapter.extensions import ExtensionCommitError, ExtensionSpec
+from hcu_adapter.extensions import (
+    ExtensionCommitError, ExtensionSpec, is_fatal_extension_error,
+)
 
 from .extension import _require_vllm_033_release_line
 
@@ -21,6 +23,7 @@ _lock = RLock()
 _published = None
 _failure = False
 _publishing = False
+_unavailable = False
 _getenv = ctypes.PyDLL(None).getenv
 _getenv.argtypes = (ctypes.c_char_p,)
 _getenv.restype = ctypes.c_char_p
@@ -164,16 +167,16 @@ def _prepare_identity(native, moe, architecture):
 
 
 def activate(context):
-    global _published, _publishing
+    global _published, _publishing, _unavailable
     _require_vllm_033_release_line(context.vllm_version)
-    if CAPABILITY not in context.requested_capabilities:
-        raise RuntimeError('INT8 ASM requires explicit hcu-aiter-int8-moe capability')
     with _lock:
         if _failure or _publishing:
             _fatal()
         if _published is not None:
             check_health()
             return
+        if _unavailable:
+            raise RuntimeError('INT8 ASM preparation failed; restart the process')
         if "aiter.fused_moe_asm_wna16" in sys.modules:
             raise RuntimeError("INT8 ASM must activate before vendor MoE config consumers; restart with a fresh spawned process")
     from hcu_adapter.bridges.vllm import detect_hcu
@@ -186,7 +189,15 @@ def activate(context):
         if _published is not None:
             check_health()
             return
+        if _unavailable:
+            raise RuntimeError('INT8 ASM preparation failed; restart the process')
+        # Register availability at startup; Core's explicit backend choice is
+        # the opt-in. Its auto/triton priorities do not consume this provider.
+        # Requirements remain an optional deployment assertion, not an enable.
+        required = (CAPABILITY in context.requested_capabilities
+                    or 'das_hcu_aiter_int8' in context.requested_extensions)
         _publishing = True
+        committing = False
         try:
             registry = import_module(REGISTRY)
             if registry.get_int8_moe_backend('aiter') is not None:
@@ -199,12 +210,28 @@ def activate(context):
             native = import_module('aiter')
             moe = import_module('aiter.moe')
             identity, bindings, chip_info, asm_dir = _prepare_identity(native, moe, detection.architecture)
+            # A public registration may mutate before raising. From this point
+            # every failure is process-fatal, including optional discovery.
+            committing = True
             backend = registry.register_int8_moe_backend('aiter', HcuAiterInt8Experts, convert_weights)
             envs.environment_variables[FACTOR] = compile_factor
             _published = _Publication(os.getpid(), backend, identity, bindings, detection.architecture, chip_info, asm_dir)
             check_health()
         except BaseException as error:
-            _fatal(error)
+            if (committing or required or not isinstance(error, Exception)
+                    or is_fatal_extension_error(error)):
+                _fatal(error)
+            # No Core binding was attempted. A missing optional provider must
+            # not break other backends. Refuse retries: preparation may already
+            # have populated vendor caches even though no provider was published.
+            _unavailable = True
+            try:
+                detail = f'{type(error).__name__}: {error}'
+            except BaseException:
+                detail = 'exception details unavailable'
+            if _failure:
+                _fatal(error)  # Exception rendering may re-enter activation.
+            raise RuntimeError(f'cannot prepare optional INT8 ASM provider: {detail}') from error
         finally:
             _publishing = False
 

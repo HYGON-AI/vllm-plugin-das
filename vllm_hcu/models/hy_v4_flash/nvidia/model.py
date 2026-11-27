@@ -28,7 +28,7 @@ from .moe import HYV4FlashFeedForward, HYV4FlashMoE
 
 _EXPERT_WEIGHT = re.compile(
     r"(.*\.experts)\.(?:(\d+)\.)?(gate_proj|up_proj|down_proj|gate_up_proj)"
-    r"(\.weight(?:_scale(?:_inv)?)?|_scale(?:_inv)?)?"
+    r"(\.weight(?:_scale(?:_inv)?|_packed|_shape)?|_scale(?:_inv)?)?"
 )
 
 
@@ -55,11 +55,11 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
         raise ValueError("HYV4 Flash requires bfloat16 compute")
     if not vllm_config.use_v2_model_runner:
         raise ValueError("HYV4 Flash requires the V2 model runner")
-    if (
-        vllm_config.kv_transfer_config is not None
-        or vllm_config.lora_config is not None
-    ):
-        raise ValueError("HYV4 Flash does not support KV transfer or LoRA")
+    if vllm_config.lora_config is not None:
+        raise ValueError("HYV4 Flash does not support LoRA")
+    from vllm_hcu.models.hy_v4_flash.hisparse import validate_flash_hisparse
+
+    validate_flash_hisparse(vllm_config)
     spec = vllm_config.speculative_config
     if spec is not None:
         method = getattr(spec, "method", None)
@@ -81,11 +81,18 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
             raise ValueError(f"{field} must be divisible by tensor_parallel_size")
     quantization = vllm_config.model_config.quantization
     if quantization == "compressed-tensors":
-        from vllm_hcu.models.hy_v4_flash.runtime import _validate_fp8_config
+        from vllm_hcu.models.hy_v4_flash.runtime import validate_flash_quant_config
 
-        _validate_fp8_config(
+        family = validate_flash_quant_config(
             vllm_config.model_config.model_arch_config.quantization_config
         )
+        if family == "channel_w4a8":
+            if not is_hcu_platform() or config.flash_w4a8_backend != "adapter_reference":
+                raise ValueError("Channel W4A8 requires HCU and flash_w4a8_backend=adapter_reference")
+            if (not vllm_config.model_config.enforce_eager
+                    or parallel.enable_expert_parallel):
+                raise ValueError("Channel W4A8 reference currently requires eager TP-only execution")
+
     elif quantization == "fp8":
         fp8_quant = vllm_config.quant_config
         if list(getattr(fp8_quant, "weight_block_size", None) or []) != [128, 128]:
@@ -104,7 +111,7 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
                 "Flash online quantization requires MoE-only fp8_per_block"
             )
     elif quantization is not None:
-        raise ValueError("HYV4 Flash supports only FP8 blockwise quantization")
+        raise ValueError("HYV4 Flash requires supported FP8 or explicit CT channel W4A8 quantization")
 
 
 class HYV4FlashDecoderLayer(HYV4DecoderLayer):
@@ -267,7 +274,12 @@ class HYV4FlashModel(HYV4Model):
                     raise ValueError(f"Unknown Flash expert weight: {name}")
                 parameter = parameters[target]
                 if expert_id is None:
-                    if value.ndim != 3 or value.shape[0] != self.config.num_experts:
+                    expected_ndim = 2 if suffix == "_shape" else 3
+                    if (
+                        value.ndim != expected_ndim
+                        or value.shape[0] != self.config.num_experts
+                        or (suffix == "_shape" and value.shape[-1] != 2)
+                    ):
                         raise ValueError(
                             f"Invalid packed expert shape for {name}: {value.shape}"
                         )
@@ -278,7 +290,12 @@ class HYV4FlashModel(HYV4Model):
                     if not 0 <= index < self.config.num_experts:
                         raise ValueError(f"Expert index out of range: {name}")
                     tensor = value[index] if expert_id is None else value
-                    pieces = tensor.chunk(len(shards), dim=-2)
+                    if suffix == "_shape":
+                        if len(shards) != 1:
+                            raise ValueError("Fused gate/up weight_shape is not supported")
+                        pieces = (tensor,)
+                    else:
+                        pieces = tensor.chunk(len(shards), dim=-2)
                     for shard, piece in zip(shards, pieces):
                         success = parameter.weight_loader(
                             parameter,
@@ -418,10 +435,20 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
                     DefaultModelLoader,
                 )
 
+                # Quantized Core tracking and observed-shard checks can miss
+                # whole learned tensors, including leaves not named "weight".
                 required = {
                     name
                     for name, _ in self.named_parameters()
-                    if name.endswith((".weight", ".w13_weight", ".w2_weight"))
+                    if name.endswith((
+                        ".weight", ".w13_weight", ".w2_weight",
+                        ".w13_weight_packed", ".w2_weight_packed",
+                        ".w13_weight_scale", ".w2_weight_scale",
+                        ".w13_weight_shape", ".w2_weight_shape",
+                        ".expert_bias", ".intra_group_ape", ".bias",
+                        ".unified_pre_gamma", ".hc_scale", ".hc_base",
+                        ".hc_head_base", ".hc_head_scale", ".learnable_sink_param",
+                    )) or ".unified_per_hc_scales." in name
                 }
                 missing = required - self._loaded_weights
                 if missing:

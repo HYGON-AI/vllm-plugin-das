@@ -52,6 +52,8 @@ def allocated(rank, split):
 
 def bare_worker():
     worker = m.OwnerWorker.__new__(m.OwnerWorker)
+    worker._draft_context = False
+    worker._draft_groups = {}
     worker._owner_bootstrap = None
     worker._layout_by_peer = OrderedDict()
     worker._prepared_transfer_regions = {}
@@ -65,6 +67,13 @@ def bare_worker():
     worker.use_mla = True
     worker._physical_blocks_per_logical_kv_block = 1
     return worker
+
+
+def bare_scheduler():
+    scheduler = m.OwnerScheduler.__new__(m.OwnerScheduler)
+    scheduler._draft_context = False
+    scheduler._draft_groups = {}
+    return scheduler
 
 
 def registrations(split=True):
@@ -233,6 +242,8 @@ def test_pcp_bootstrap_elects_only_rank_zero_without_mutating_config(monkeypatch
     cfg.model_config.use_mla = True
     cfg.kv_transfer_config = KVTransferConfig(kv_connector=m.CONNECTOR,
         kv_connector_module_path=m.MODULE, kv_role='kv_producer')
+    plan = DefaultKVCacheConfigBuilder().get_kv_cache_config_from_groups(
+        cfg, hybrid_groups(), 7)
     started = []
     def base_init(worker, private, engine, plan):
         assert private is not cfg and private.kv_transfer_config is not cfg.kv_transfer_config
@@ -244,7 +255,7 @@ def test_pcp_bootstrap_elects_only_rank_zero_without_mutating_config(monkeypatch
     monkeypatch.setattr(m.OwnerBootstrap, 'start', lambda server: started.append(server))
     for rank in range(8):
         monkeypatch.setattr(m, 'get_pcp_group', lambda: NS(rank_in_group=rank))
-        worker = m.OwnerWorker(cfg, 'p', None)
+        worker = m.OwnerWorker(cfg, 'p', plan)
         assert worker.pcp_rank == rank and worker.pcp_size == 8
         assert cfg.kv_transfer_config.kv_connector_extra_config == {}
         worker.shutdown()
@@ -257,13 +268,13 @@ def test_draft_context_is_not_silently_omitted():
     cfg.kv_transfer_config = KVTransferConfig(kv_connector=m.CONNECTOR,
         kv_connector_module_path=m.MODULE, kv_role='kv_consumer')
     cfg.speculative_config = NS(method='dspark', num_speculative_tokens=5)
-    with pytest.raises(ValueError, match='draft context'):
+    with pytest.raises(ValueError, match='requires explicit DSpark context transfer'):
         m.validate_config(cfg)
 
 
 @pytest.mark.parametrize('length', [1, 2, 127, 128, 129, 4096])
 def test_compressor_handoff_stops_before_decoder_recomputed_token(length):
-    scheduler = m.OwnerScheduler.__new__(m.OwnerScheduler)
+    scheduler = bare_scheduler()
     scheduler._has_compressor_state = True
     scheduler._has_mamba = scheduler._bounded_replay = False
     request = NS(kv_transfer_params={'do_remote_decode': True},
@@ -305,7 +316,7 @@ def test_real_zmq_eight_peer_pull_with_cpu_transfer_engine(fail_rank, with_relea
             setattr(decoder, attr, [getattr(r, field) for r in regions])
         decoder.region_shared_groups = [() for _ in regions]
         decoder.region_row_offsets = [-1 for _ in regions]
-        scheduler = m.OwnerScheduler.__new__(m.OwnerScheduler)
+        scheduler = bare_scheduler()
         scheduler.is_kv_producer, scheduler.is_kv_consumer = False, True
         scheduler._has_compressor_state = True
         scheduler._is_hma_required = True
@@ -491,7 +502,7 @@ def test_truncated_prefill_stop_token_still_hands_off_real_state(token):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request, RequestStatus
     from vllm.v1.core.sched.utils import check_stop
-    scheduler = m.OwnerScheduler.__new__(m.OwnerScheduler)
+    scheduler = bare_scheduler()
     scheduler._has_compressor_state = True
     scheduler._has_mamba = scheduler._bounded_replay = False
     scheduler.is_kv_consumer = False
@@ -526,7 +537,7 @@ def test_truncated_prefill_stop_token_still_hands_off_real_state(token):
 ])
 def test_non_handoff_stops_and_aborts_keep_native_cleanup(status_name, truncated):
     from vllm.v1.request import RequestStatus
-    scheduler = m.OwnerScheduler.__new__(m.OwnerScheduler)
+    scheduler = bare_scheduler()
     scheduler._has_compressor_state = True
     scheduler.is_kv_consumer = False
     scheduler._reqs_need_send = {}

@@ -20,9 +20,9 @@ TAG = 'HCU_PUBLIC_INT8_RESULT='
 def test_installed_public_int8_owner_and_changed_input_graph():
     if os.environ.get('HCU_VLLM033_AITER_INT8_LIVE') != '1':
         pytest.skip('set HCU_VLLM033_AITER_INT8_LIVE=1 for the installed HCU contract')
-    env = dict(os.environ, HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES='hcu-aiter-int8-moe',
-               HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS='das_hcu_aiter_int8',
-               PYTHONDONTWRITEBYTECODE='1')
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    env.pop('HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES', None)
+    env.pop('HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS', None)
     # A fresh exec is part of the supported startup contract. Other tests may
     # already have populated vendor caches in this pytest interpreter.
     process = subprocess.Popen([sys.executable, '-P', '-B', __file__, '--component'],

@@ -33,6 +33,8 @@ class HYV4FlashConfig(HYV4Config):
     model_type = "hy_v4_flash"
     base_config_key = "text_config"
 
+    # Functional integer reference lane; not a performance/Graph claim.
+    flash_w4a8_backend: str = "disabled"
     routed_expert_hidden_size: int | None = None
     sandwich_norm: bool = True
     dsa_skip_attn_post_norm: bool = False
@@ -70,6 +72,8 @@ class HYV4FlashConfig(HYV4Config):
 
     def __post_init__(self, **kwargs: Any) -> None:
         kwargs.pop("engram_enable", None)
+        if self.flash_w4a8_backend not in ("disabled", "adapter_reference"):
+            raise ValueError("flash_w4a8_backend must be disabled or adapter_reference")
         if self.layer_types is None:
             self.layer_types = [SPARSE_ATTENTION] * self.num_hidden_layers
         self.layer_types = [

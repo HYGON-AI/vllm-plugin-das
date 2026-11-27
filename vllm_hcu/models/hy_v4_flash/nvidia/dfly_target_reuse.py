@@ -150,10 +150,10 @@ class HYV4DFlyTargetReuse:
     def _set_storage_aliases(self, enabled: bool) -> None:
         """Toggle the KV-sharing alias on the draft layers.
 
-        The alias makes KV cache allocation bind each draft layer to its target
-        layer's storage, but MLA also skips the KV write for sharing layers. The
-        draft must write its query block KV, so the alias is only kept while the
-        KV cache is being allocated and bound.
+        Keep this allocation marker across profiling and final KV-cache
+        initialization: Core rediscovers aliases for each allocation. The
+        reviewed Core033 MLA writes through the draft-owned forward-context
+        slot mapping regardless of this marker, unlike dense Attention.
         """
         for source, dest in self.layer_pairs:
             dest.mla_attn.kv_sharing_target_layer_name = (
@@ -186,7 +186,6 @@ class HYV4DFlyTargetReuse:
                 raise ValueError(
                     "DFly query and target KV must alias the same local layout"
                 )
-        self._set_storage_aliases(False)
 
     def update_indices(
         self,

@@ -102,7 +102,8 @@ def test_only_flash_hcu_constructor_replaces_router(monkeypatch, hcu):
         self.experts = SimpleNamespace(router=old)
     monkeypatch.setattr(module.HYV4MoEFused, "__init__", base_init)
     monkeypatch.setattr(module, "is_hcu_platform", lambda: hcu)
-    config = SimpleNamespace(routed_expert_hidden_size=None, sandwich_norm=False)
+    config = SimpleNamespace(routed_expert_hidden_size=None, sandwich_norm=False,
+                             flash_w4a8_backend="disabled")
     layer = module.HYV4FlashMoE(config, None, "model.layers.1.mlp")
     if hcu: assert isinstance(layer.experts.router, HYV4FlashStableRouter)
     else: assert layer.experts.router is old

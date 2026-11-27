@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 
 from .dspark_capacity import token_capacity
+from .dsv41.profile_worker import HT_FIXED_CAPACITY_KEY, HT_SENDER_INT8_KEY
 from .layer_split_config import KEY as LAYER_SPLIT_KEY
 
 _KEY = '_hcu_dsv41_pcp_dspark_draft'
@@ -35,15 +36,34 @@ def draft_config(cfg):
         raise ValueError('PCP DSpark draft requires eager TP1/DP1 and target PCP/EP HT')
     capacity = token_capacity(cfg)
     result = copy.copy(cfg)
+    # DFlash retains the target kernel config. Apply the requested MoE backend
+    # only to this owned draft, leaving the resident target configuration intact.
+    backend = getattr(spec, 'moe_backend', None)
+    if backend is not None and backend != cfg.kernel_config.moe_backend:
+        result.kernel_config = copy.copy(cfg.kernel_config)
+        result.kernel_config.moe_backend = backend
     result.additional_config = dict(cfg.additional_config or {})
     # The target's calibrated physical slots do not describe draft experts.
     result.additional_config.pop('hcu_static_eplb', None)
     result.additional_config.pop(LAYER_SPLIT_KEY, None)
+    result.additional_config.pop(HT_SENDER_INT8_KEY, None)
+    previous = result.additional_config.get(_KEY)
+    previous_fixed_ht = (
+        previous.get('target_fixed_ht', False) if isinstance(previous, dict) else False
+    )
+    target_fixed_ht = result.additional_config.pop(HT_FIXED_CAPACITY_KEY, previous_fixed_ht)
     result.additional_config[_KEY] = {
         'pcp_size': target.prefill_context_parallel_size,
         'capacity': vars(capacity),
+        'target_fixed_ht': target_fixed_ht is True,
     }
     return result
+
+
+def needs_isolated_ht_buffer(cfg):
+    extra = getattr(cfg, 'additional_config', None) or {}
+    marker = extra.get(_KEY)
+    return isinstance(marker, dict) and marker.get('target_fixed_ht') is True
 
 
 def moe_pcp_size(cfg):

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 
+
 _OWNERS = {}
 
 # These installed facades deliberately expose the Adapter module itself so
@@ -108,3 +109,32 @@ def pytest_collection_finish(session):
 
 def pytest_sessionfinish(session, exitstatus):
     _verify_installed_modules()
+
+
+def shared_fp8_selected_ops(monkeypatch):
+    from hcu_adapter.bridges.vllm_input_quant_lightop import _wrap
+    from vllm.model_executor.layers.quantization import input_quant_fp8 as module
+
+    original = module.QuantFP8.forward_cuda
+    original = getattr(original, "__wrapped__", original)
+    monkeypatch.setattr(module.QuantFP8, "forward_cuda", _wrap(module, original))
+
+    def construct(custom_ops):
+        from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+        from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+        from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+
+        with set_current_vllm_config(VllmConfig(compilation_config=CompilationConfig(
+                mode=0, custom_ops=custom_ops))):
+            quant = module.QuantFP8(False, GroupShape.PER_TOKEN, compile_native=False)
+            act = SiluAndMulWithClamp(10.0, compile_native=False)
+        return quant, act
+
+    return construct
+
+
+
+# The installed-origin probes import this file with python -S. Register the
+# device-test fixture only when pytest is already running.
+if "pytest" in sys.modules:
+    shared_fp8_selected_ops = sys.modules["pytest"].fixture(shared_fp8_selected_ops)

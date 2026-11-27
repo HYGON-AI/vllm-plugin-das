@@ -114,6 +114,13 @@ class HcuDSV41CTW4A8Config(CompressedTensorsConfig):
         if not _schema(s.get('weights'),s.get('input_activations')):
             return super().get_quant_method(layer,prefix)
         if s.get('format')!='pack-quantized': raise ValueError('HCU W4A8 requires pack-quantized weights')
+        if layer.moe_config.moe_backend == "deep_gemm_mega_moe":
+            from .dsv41_channel_fp8 import _field
+            if _field(s["weights"], "actorder") or s.get("output_activations"):
+                raise ValueError("DSV4.1 MegaMoE requires plain channel INT4/token INT8")
+            from ..moe.dsv41_w4a8_megamoe import HcuDSV41W4A8MegaMoEMethod
+            return HcuDSV41W4A8MegaMoEMethod(
+                s["weights"], s["input_activations"], layer.moe_config, prefix)
         cfg=get_current_vllm_config()
         validate_topology(cfg,layer.moe_config)
         from .ct_w4a8_method import HcuCTW4A8MoEMethod
