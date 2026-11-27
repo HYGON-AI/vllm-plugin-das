@@ -145,6 +145,20 @@ def unpruned_indices(positions, width, active=None):
 
 
 def select_groups(logits, upper, budget):
+    # Historical name: fp8_fusions_enabled is the registered default-on master
+    # query only; no FP8-specific child flag controls this FP32 selection path.
+    from hcu_vllm_das.environment import fp8_fusions_enabled
+
+    if budget == 511 and logits.is_cuda and is_hcu_platform() and fp8_fusions_enabled():
+        from hcu_vllm_das.adapter_api import optional_adapter_module
+        from hcu_adapter._base import Missing
+
+        provider = optional_adapter_module('hcu_adapter.kernels.indexer_topk_lightop')
+        native = getattr(provider, 'select_indexpool_groups', None)
+        if not isinstance(native, Missing) and callable(native):
+            selected = native(logits, upper, budget)
+            if selected is not None:
+                return selected
     columns = torch.arange(logits.shape[1], device=logits.device)
     scores = logits.masked_fill(columns[None] >= upper[:, None], -torch.inf)
     count = min(budget, logits.shape[1])

@@ -1,5 +1,6 @@
 """Actual leaf/constructor with explicit control doubles, never GPU numerics."""
 import ast
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace as NS
@@ -109,7 +110,8 @@ def setup(monkeypatch):
 
     def properties(index):
         cuda.property_reads.append(index)
-        return NS(gcnArchName=cuda.architectures[index])
+        return NS(gcnArchName=cuda.architectures[index],
+                  multi_processor_count={0: 80, 2: 64}[index])
     cuda.get_device_properties = properties
 
     class Core:
@@ -138,11 +140,19 @@ def setup(monkeypatch):
     swa = ModuleType(package+'.swa'); swa.FlashWindowIndexer = WindowProducer
     monkeypatch.setitem(sys.modules, package, parent)
     monkeypatch.setitem(sys.modules, package+'.swa', swa)
+    runner_name = package + '.fullgraph_runner'
+    spec = spec_from_file_location(runner_name, source.with_name('fullgraph_runner.py'))
+    runner = module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    monkeypatch.setitem(sys.modules, runner_name, runner)
 
     def pad(t, values):
         assert values[:3] == (0,0,0)
         return Tensor((*t.shape[:-2], t.shape[-2]+values[3], t.shape[-1]), t.dtype, t.device, t)
-    namespace = {'__package__':package, 'CoreSinkImpl':Core, 'torch':NS(cuda=cuda,device=Device,bfloat16='bfloat16',uint8='uint8',int32='int32'), 'F':NS(pad=pad), 'get_current_vllm_config':lambda:NS(parallel_config=NS(prefill_context_parallel_size=1,decode_context_parallel_size=1)), 'get_flashmla_ops':lambda:provider, 'is_hcu_platform':lambda:True}
+    # Keep these original H64/window-width contracts on the rollback path.
+    parallel = NS(tensor_parallel_size=4, prefill_context_parallel_size=1,
+                  decode_context_parallel_size=1)
+    namespace = {'fp8_fusions_enabled':lambda:False, '__package__':package, 'CoreSinkImpl':Core, 'torch':NS(cuda=cuda,device=Device,bfloat16='bfloat16',uint8='uint8',int32='int32'), 'F':NS(pad=pad), 'get_current_vllm_config':lambda:NS(parallel_config=parallel), 'get_flashmla_ops':lambda:provider, 'is_hcu_platform':lambda:True}
     module = ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),node],type_ignores=[])
     exec(compile(ast.fix_missing_locations(module),str(source)+'::<actual-class-control-test>','exec'),namespace)
     cls = namespace['FlashSparseImpl']

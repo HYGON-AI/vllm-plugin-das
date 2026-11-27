@@ -49,6 +49,7 @@ from vllm.models.hy_v4.nvidia.moe import HYV4FeedForward
 from vllm.models.hy_v4.nvidia.hc import HYV4HCLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from .attention import HYV4FlashAttention
 from .configs import SPARSE_ATTENTION
@@ -62,6 +63,18 @@ def _slice_sink_for_tp(weight, *, num_heads, tp_size, tp_rank):
     local_heads = num_heads // tp_size
     return weight.narrow(0, tp_rank * local_heads, local_heads).contiguous()
 
+
+def _sink_weight_for_loader(param, weight, *, num_heads, tp_size, tp_rank):
+    local_weight = _slice_sink_for_tp(
+        weight, num_heads=num_heads, tp_size=tp_size, tp_rank=tp_rank,
+    )
+    # Modern Core owns global-to-local sharding and padded-head initialization.
+    # Older raw-copy loaders still require the validated TP-local checkpoint view.
+    global_loader = getattr(weight_utils, "load_attention_sink", None)
+    if (global_loader is not None
+            and getattr(param, "weight_loader", None) is global_loader):
+        return weight
+    return local_weight
 
 
 from .dfly_rotary import HYV4DFlyRotaryEmbedding
@@ -695,10 +708,9 @@ class HYV4DFlyForCausalLM(nn.Module):
                             f"got {weight.dtype}"
                         )
                     if name.endswith(".learnable_sink_param"):
-                        # The old target loader handles sink sharding itself;
-                        # AutoWeightsLoader needs the same TP-local input.
-                        weight = _slice_sink_for_tp(
-                            weight, num_heads=self.config.num_attention_heads,
+                        weight = _sink_weight_for_loader(
+                            self.model.get_parameter(name), weight,
+                            num_heads=self.config.num_attention_heads,
                             tp_size=get_tensor_model_parallel_world_size(),
                             tp_rank=get_tensor_model_parallel_rank(),
                         )

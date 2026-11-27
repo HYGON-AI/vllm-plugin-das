@@ -8,12 +8,34 @@ _pid = None
 _failure = None
 _runner_cls = None
 _runner_methods = None
+_MIDDLE_SCORING_BOUND = 16384
+
+
+def _qualified_worker_tuple(tp, arch, compute_units):
+    """Keep worker-bank admission scoped to qualified platform/TP pairs."""
+    return ((tp, arch, compute_units) in (
+        (4, "gfx938", 64), (8, "gfx936", 80),
+    ))
+
+
+def _require_qualified_graph_worker(tp, device):
+    """Check the actual worker after weights reside on its HCU device."""
+    import torch
+
+    properties = torch.cuda.get_device_properties(device)
+    if not _qualified_worker_tuple(
+            tp, str(getattr(properties, "gcnArchName", "")).split(":")[0],
+            getattr(properties, "multi_processor_count", None)):
+        raise NotImplementedError(
+            "Flash W4A8 Graph worker requires gfx938/64CU TP4 or gfx936/80CU TP8")
 
 
 def is_qualified_config(cfg, *, breakable):
     """Configuration predicate only; platform/version ownership is separate."""
     if breakable:
         return False
+    # Core owns communicator selection and fallback. Either boolean policy
+    # uses the same ordered capture/replay and independent scoring-bank pools.
     try:
         model, parallel = cfg.model_config, cfg.parallel_config
         compilation, spec, cache = (
@@ -24,12 +46,12 @@ def is_qualified_config(cfg, *, breakable):
                 or model.hf_text_config.model_type != "hy_v4_flash"
                 or compilation.mode.name != "VLLM_COMPILE"
                 or compilation.cudagraph_mode.name != "FULL_AND_PIECEWISE"
-                or parallel.tensor_parallel_size != 4
+                or parallel.tensor_parallel_size not in (4, 8)
                 or any(getattr(parallel, field) != 1 for field in (
                     "data_parallel_size", "pipeline_parallel_size",
                     "prefill_context_parallel_size", "decode_context_parallel_size"))
                 or parallel.enable_dbo or parallel.enable_eplb
-                or parallel.disable_custom_all_reduce is not True
+                or type(parallel.disable_custom_all_reduce) is not bool
                 or cfg.lora_config is not None or cfg.kv_transfer_config is not None
                 or spec is None or spec.method != "dfly"
                 or spec.num_speculative_tokens != 5
@@ -42,6 +64,34 @@ def is_qualified_config(cfg, *, breakable):
         )
     except AttributeError:
         return False
+
+
+def middle_scoring_enabled(cfg, device):
+    """Startup-only admission; the shared W4 Graph predicate stays unchanged."""
+    if not is_qualified_config(cfg, breakable=False):
+        return False
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    from hcu_vllm_das.environment import fp8_fusions_enabled
+    if is_breakable_cudagraph_enabled() or not fp8_fusions_enabled():
+        return False
+    from .quantization import validate_flash_quant_config, validate_flash_quant_parallelism
+    try:
+        if validate_flash_quant_config(cfg.quant_config.config) != "channel_w4a8":
+            return False
+        validate_flash_quant_parallelism(cfg)
+    except (AttributeError, TypeError, ValueError, NotImplementedError):
+        return False
+    from .runtime import is_hcu_platform
+    if not is_hcu_platform():
+        return False
+    import torch
+    if torch.version.hip is None:
+        return False
+    properties = torch.cuda.get_device_properties(device)
+    return _qualified_worker_tuple(
+        cfg.parallel_config.tensor_parallel_size,
+        str(getattr(properties, "gcnArchName", "")).split(":")[0],
+        getattr(properties, "multi_processor_count", None))
 
 
 def _fatal(message):
@@ -88,9 +138,18 @@ def matches(cfg):
     check_health()
     from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
     from .runtime import is_hcu_platform
-    return is_hcu_platform() and is_qualified_config(
+    if not is_hcu_platform() or not is_qualified_config(
         cfg, breakable=is_breakable_cudagraph_enabled()
-    )
+    ):
+        return False
+    import torch
+    if torch.version.hip is None:
+        return False
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return _qualified_worker_tuple(
+        cfg.parallel_config.tensor_parallel_size,
+        str(getattr(properties, "gcnArchName", "")).split(":")[0],
+        getattr(properties, "multi_processor_count", None))
 
 
 def runner_class():
@@ -101,7 +160,9 @@ def runner_class():
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner
         from vllm.platforms import current_platform
         from .compressed_indexer import FlashCompressedIndexer
-        from .fullgraph_banks import FlashFullGraphBanks, derive_short_bound
+        from .fullgraph_banks import (
+            FlashFullGraphBanks, derive_short_bound, indexer_capacity_covers,
+        )
 
         class FlashBankModelRunner(GPUModelRunner):
             def initialize_kv_cache(self, *args, **kwargs):
@@ -115,9 +176,9 @@ def runner_class():
                 owners = tuple(module for module in self.model.modules()
                                if isinstance(module, FlashCompressedIndexer))
                 bound = derive_short_bound(owners)
-                if (bound is None or bound >= self.max_model_len
-                        or any(owner.max_model_len != self.max_model_len
-                               for owner in owners)):
+                if (bound is None
+                        or not indexer_capacity_covers(owners, self.max_model_len)
+                        or bound >= self.max_model_len):
                     return
                 short = ModelCudaGraphManager(
                     self.vllm_config, self.device, wide.cudagraph_mode,
@@ -126,9 +187,28 @@ def runner_class():
                     varlen_decode=wide.varlen_decode,
                     ubatch_runner=None,
                 )
+                if not hasattr(self, "_hcu_middle_scoring_enabled"):
+                    # Freeze the policy across throwaway profiling and real
+                    # initialization; capture/replay must not resolve config.
+                    self._hcu_middle_scoring_enabled = (
+                        bound < _MIDDLE_SCORING_BOUND < self.max_model_len
+                        and middle_scoring_enabled(self.vllm_config, self.device)
+                    )
+                scoring_banks = ()
+                if (self._hcu_middle_scoring_enabled
+                        and bound < _MIDDLE_SCORING_BOUND < self.max_model_len):
+                    middle = ModelCudaGraphManager(
+                        self.vllm_config, self.device, wide.cudagraph_mode,
+                        decode_query_len=self.decode_query_len,
+                        lora_capture_cases=wide.lora_capture_cases,
+                        varlen_decode=wide.varlen_decode,
+                        ubatch_runner=None,
+                    )
+                    scoring_banks = ((_MIDDLE_SCORING_BOUND, middle),)
                 self.cudagraph_manager = FlashFullGraphBanks(
                     wide, short, owners, bound, CUDAGraphMode.FULL,
                     short_pool_factory=current_platform.graph_pool_handle,
+                    scoring_banks=scoring_banks,
                 )
 
             def gather_batch_req_state(self, scheduler_output, dummy_run):
@@ -139,10 +219,14 @@ def runner_class():
                 if isinstance(manager, FlashFullGraphBanks):
                     manager.use_wide_bank()
                     if not dummy_run and state is not None:
-                        manager.set_request_limits(
-                            self.req_states.max_seq_len[state.idx_mapping_np],
-                            self.decode_query_len,
-                        )
+                        try:
+                            mapping = state.idx_mapping_np
+                            if mapping is None:
+                                return state, uniform
+                            limits = self.req_states.max_seq_len[mapping]
+                        except (AttributeError, TypeError, IndexError, KeyError):
+                            return state, uniform
+                        manager.set_request_limits(limits, self.decode_query_len)
                 return state, uniform
 
         _runner_cls = FlashBankModelRunner

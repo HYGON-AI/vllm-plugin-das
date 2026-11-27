@@ -66,6 +66,11 @@ def fixture(monkeypatch, *, layout='raw'):
                              quant_type=qt.per_Token, w4a8='w4a8')
     monkeypatch.setattr(module, '_vendor_api', lambda: vendor)
     monkeypatch.setattr(module, '_device_supported', lambda value: True)
+    # The CPU fixture models a qualified TP4 worker. Keep the actual paired
+    # admission function active; only its external device-properties query
+    # is doubled, just like the native numerical leaf in this fixture.
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device:
+                        SimpleNamespace(gcnArchName='gfx938', multi_processor_count=64))
     monkeypatch.setattr(torch.cuda, 'is_current_stream_capturing', lambda: False)
     return module, method, layer, calls, vendor
 

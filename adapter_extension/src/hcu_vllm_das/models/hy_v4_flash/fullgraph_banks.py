@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Request-budget admission and ownership for paired Core FULL graph banks.
+"""Request-budget admission and ownership for Core FULL graph banks.
 
 This module imports no framework. Core remains responsible for descriptors,
 capture algorithms, PIECEWISE graphs and output storage.
@@ -27,22 +27,54 @@ def derive_short_bound(indexers):
     return min(limits) if limits else None
 
 
-def budget_fits_short(limits, lookahead, bound):
-    """Only CPU integer budgets are admitted; tensor conversion is forbidden."""
-    lookahead, bound = _integer(lookahead), _integer(bound)
-    if lookahead is None or lookahead < 0 or bound is None or bound <= 0:
+def indexer_capacity_covers(indexers, max_model_len):
+    """Allow Core auto-fit within one unchanged indexer constructor capacity."""
+    effective = _integer(max_model_len)
+    capacities = {
+        _integer(getattr(owner, "max_model_len", None)) for owner in indexers
+    }
+    if effective is None or len(capacities) != 1 or None in capacities:
         return False
+    capacity = capacities.pop()
+    return 0 < effective <= capacity
+
+
+def required_bound(limits, lookahead):
+    """Only CPU integer budgets are admitted; tensor conversion is forbidden."""
+    lookahead = _integer(lookahead)
+    if lookahead is None or lookahead < 0:
+        return None
     largest = 0
     try:
         values = iter(limits)
     except TypeError:
-        return False
+        return None
     for value in values:
         value = _integer(value)
         if value is None or value <= 0:
-            return False
+            return None
         largest = max(largest, value)
-    return largest > 0 and largest + lookahead <= bound
+    return largest + lookahead if largest > 0 else None
+
+
+def budget_fits_short(limits, lookahead, bound):
+    bound = _integer(bound)
+    required = required_bound(limits, lookahead)
+    return bound is not None and bound > 0 and required is not None and required <= bound
+
+
+def scoring_max_seq_len(indexer, default):
+    """A scoring capacity never grants the short bank's unpruned semantics."""
+    value = getattr(indexer, "_hcu_fullgraph_scoring_bound", None)
+    if value is None:
+        return default
+    bound = _integer(value)
+    limit = _integer(getattr(indexer, "max_model_len", None))
+    if bound is None or limit is None or not 0 < bound <= limit:
+        raise ValueError("Flash scoring graph bound exceeds the indexer capacity")
+    if getattr(indexer, "_hcu_fullgraph_capture_bound", None) is not None:
+        raise RuntimeError("Flash short and scoring capture owners conflict")
+    return bound
 
 
 @contextmanager
@@ -50,7 +82,8 @@ def _capture_bound(indexers, bound):
     changed = []
     try:
         for owner in indexers:
-            if getattr(owner, "_hcu_fullgraph_capture_bound", None) is not None:
+            if (getattr(owner, "_hcu_fullgraph_capture_bound", None) is not None
+                    or getattr(owner, "_hcu_fullgraph_scoring_bound", None) is not None):
                 raise RuntimeError("Flash indexer already has a capture-bound owner")
             owner._hcu_fullgraph_capture_bound = bound
             changed.append(owner)
@@ -60,37 +93,82 @@ def _capture_bound(indexers, bound):
             owner._hcu_fullgraph_capture_bound = None
 
 
+@contextmanager
+def _capture_scoring_bound(indexers, bound):
+    changed = []
+    try:
+        for owner in indexers:
+            if (getattr(owner, "_hcu_fullgraph_capture_bound", None) is not None
+                    or getattr(owner, "_hcu_fullgraph_scoring_bound", None) is not None):
+                raise RuntimeError("Flash indexer already has a capture-bound owner")
+            value, limit = _integer(bound), _integer(getattr(owner, "max_model_len", None))
+            if value is None or limit is None or not 0 < value <= limit:
+                raise ValueError("Flash scoring graph bound exceeds the indexer capacity")
+            owner._hcu_fullgraph_scoring_bound = value
+            changed.append(owner)
+        yield
+    finally:
+        for owner in changed:
+            owner._hcu_fullgraph_scoring_bound = None
+
+
 class FlashFullGraphBanks:
-    def __init__(self, wide, short, indexers, bound, full_mode, *, short_pool_factory):
+    def __init__(self, wide, short, indexers, bound, full_mode, *, short_pool_factory,
+                 scoring_banks=()):
+        if wide is short:
+            raise ValueError("Flash graph banks require distinct manager owners")
         self._wide, self._short = wide, short
         self._indexers = tuple(indexers)
         limit = derive_short_bound(self._indexers)
         if limit is None or _integer(bound) is None or not 0 < bound <= limit:
             raise ValueError("Flash short graph bound exceeds the indexer contract")
         self._bound, self._full_mode = int(bound), full_mode
+        self._scoring_banks = tuple(scoring_banks)
+        previous = self._bound
+        managers = [wide, short]
+        model_limits = {int(owner.max_model_len) for owner in self._indexers}
+        if self._scoring_banks and len(model_limits) != 1:
+            raise ValueError("Flash scoring banks require one model limit")
+        model_limit = min(model_limits)
+        normalized = []
+        for value, manager in self._scoring_banks:
+            value = _integer(value)
+            if (value is None or not previous < value < model_limit
+                    or manager is None or any(manager is old for old in managers)):
+                raise ValueError("Flash scoring banks require ordered distinct capacities and owners")
+            normalized.append((value, manager))
+            previous = value
+            managers.append(manager)
+        self._scoring_banks = tuple(normalized)
+        self._private_managers = (short, *(manager for _, manager in self._scoring_banks))
         self._short_pool_factory = short_pool_factory
         # These banks replay in request-dependent order. Sharing the allocator
         # pool can alias live output storage with the other bank's temporaries.
-        self._renew_short_pool()
-        if (list(wide._capture_descs.get(full_mode, ()))
-                != list(short._capture_descs.get(full_mode, ()))):
-            raise ValueError("Flash graph banks require identical FULL descriptors")
+        for manager in self._private_managers:
+            if (list(wide._capture_descs.get(full_mode, ()))
+                    != list(manager._capture_descs.get(full_mode, ()))):
+                raise ValueError("Flash graph banks require identical FULL descriptors")
+        self._renew_private_pools()
         # The original manager captures model-owned PIECEWISE wrappers once.
-        short._capture_descs = {
-            full_mode: list(short._capture_descs.get(full_mode, ()))
-        }
-        self._allow_short = False
+        for manager in self._private_managers:
+            manager._capture_descs = {
+                full_mode: list(manager._capture_descs.get(full_mode, ()))
+            }
+        self._request_bound = None
         self._selected = None
         self._failed = False
 
     def __getattr__(self, name):
         return getattr(self._wide, name)
 
-    def _renew_short_pool(self):
-        pool = self._short_pool_factory()
-        if pool is None or pool == self._wide.pool or pool == self._short.pool:
-            raise ValueError("Flash short bank requires a fresh private graph pool")
-        self._short.pool = pool
+    def _renew_private_pools(self):
+        occupied = [self._wide.pool, *(manager.pool for manager in self._private_managers)]
+        for manager in self._private_managers:
+            pool = self._short_pool_factory()
+            if pool is None or pool in occupied:
+                raise ValueError("Flash bank requires a fresh private graph pool")
+            manager.pool = pool
+            occupied.append(pool)
 
     def _healthy(self):
         if self._failed:
@@ -103,7 +181,7 @@ class FlashFullGraphBanks:
     @pool.setter
     def pool(self, value):
         self._healthy()
-        if value == self._short.pool:
+        if any(value == manager.pool for manager in self._private_managers):
             raise ValueError("Flash graph banks must keep separate graph pools")
         self._wide.pool = value
 
@@ -116,9 +194,10 @@ class FlashFullGraphBanks:
         self._healthy()
         self._wide._max_full_descs_to_capture = value
         # Core extrapolates one bank from its first two samples. Measure the
-        # complete short bank instead; its bytes stay in capture_model's real
+        # complete bounded banks instead; their bytes stay in capture_model's real
         # measured delta and must not be subtracted or extrapolated again.
-        self._short._max_full_descs_to_capture = None
+        for manager in self._private_managers:
+            manager._max_full_descs_to_capture = None
 
     @property
     def _capture_mem_samples(self):
@@ -128,7 +207,8 @@ class FlashFullGraphBanks:
     def _capture_mem_samples(self, value):
         self._healthy()
         self._wide._capture_mem_samples = value
-        self._short._capture_mem_samples = None
+        for manager in self._private_managers:
+            manager._capture_mem_samples = None
 
     @property
     def _capture_descs(self):
@@ -140,24 +220,29 @@ class FlashFullGraphBanks:
             return result
         result[self._full_mode] = [
             *self._wide._capture_descs.get(self._full_mode, ()),
-            *self._short._capture_descs.get(self._full_mode, ()),
+            *(desc for manager in self._private_managers
+              for desc in manager._capture_descs.get(self._full_mode, ())),
         ]
         return result
 
     def needs_capture(self):
         self._healthy()
-        return self._wide.needs_capture() or self._short.needs_capture()
+        return any(manager.needs_capture() for manager in (self._wide, *self._private_managers))
 
     def capture(self, *args, **kwargs):
         self._healthy()
         self.use_wide_bank()
         try:
-            if any(getattr(owner, "_hcu_fullgraph_capture_bound", None) is not None
+            if any((getattr(owner, "_hcu_fullgraph_capture_bound", None) is not None
+                    or getattr(owner, "_hcu_fullgraph_scoring_bound", None) is not None)
                    for owner in self._indexers):
                 raise RuntimeError("Flash indexer capture-bound owner changed")
             self._wide.capture(*args, **kwargs)
             with _capture_bound(self._indexers, self._bound):
                 self._short.capture(*args, **kwargs)
+            for bound, manager in self._scoring_banks:
+                with _capture_scoring_bound(self._indexers, bound):
+                    manager.capture(*args, **kwargs)
         except BaseException:
             # Partial capture may hold graph-pool/KV references. Never repair
             # that state by falling back to one of the partially built banks.
@@ -166,20 +251,23 @@ class FlashFullGraphBanks:
 
     def set_request_limits(self, limits, lookahead):
         self._healthy()
-        self._allow_short = budget_fits_short(limits, lookahead, self._bound)
+        self._request_bound = required_bound(limits, lookahead)
+        self._selected = None
 
     def use_wide_bank(self):
         self._healthy()
-        self._allow_short = False
+        self._request_bound = None
         self._selected = None
 
     def dispatch(self, *args, **kwargs):
         self._healthy()
         descriptor = self._wide.dispatch(*args, **kwargs)
-        self._selected = (
-            self._short if self._allow_short and descriptor.cg_mode == self._full_mode
-            else self._wide
-        )
+        self._selected = self._wide
+        if descriptor.cg_mode == self._full_mode and self._request_bound is not None:
+            for bound, manager in ((self._bound, self._short), *self._scoring_banks):
+                if self._request_bound <= bound:
+                    self._selected = manager
+                    break
         return descriptor
 
     def run_fullgraph(self, descriptor):
@@ -201,10 +289,11 @@ class FlashFullGraphBanks:
         self.use_wide_bank()
         try:
             self._wide.release_graphs()
-            self._short.release_graphs()
+            for manager in self._private_managers:
+                manager.release_graphs()
             # A released private pool can have allocator use_count zero. Never
             # reuse its handle when the public release/capture lifecycle repeats.
-            self._renew_short_pool()
+            self._renew_private_pools()
         except BaseException:
             self._failed = True
             raise

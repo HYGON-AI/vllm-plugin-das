@@ -27,7 +27,8 @@ def ct_to_aiter_packed(value):
 def _device_supported(value):
     if value.device.type != 'cuda':
         return False
-    return torch.cuda.get_device_properties(value.device).gcnArchName.split(':')[0] == 'gfx938'
+    arch = torch.cuda.get_device_properties(value.device).gcnArchName.split(':')[0]
+    return arch in ('gfx938', 'gfx936')
 
 
 def _vendor_api():
@@ -110,7 +111,12 @@ class HYV4FlashAiterW4A8Method(HYV4FlashChannelW4A8Method):
         if self.moe.moe_backend != 'aiter':
             raise ValueError('Flash AITER W4A8 requires explicit moe_backend=aiter')
         if not _device_supported(layer.w13_weight_packed):
-            raise NotImplementedError('Flash AITER W4A8 is qualified only for gfx938')
+            raise NotImplementedError('Flash AITER W4A8 requires gfx938 or gfx936')
+        if self._graph_admitted:
+            from .fullgraph_runner import _require_qualified_graph_worker
+
+            _require_qualified_graph_worker(
+                self.moe.tp_size, layer.w13_weight_packed.device)
         super().process_weights_after_loading(layer)
         self._weights_processed = False
         api = _vendor_api()
@@ -180,7 +186,7 @@ class HYV4FlashAiterW4A8Method(HYV4FlashChannelW4A8Method):
         ):
             raise RuntimeError('AITER W4A8 raw offload parameter schema/device changed')
         if x.dtype != torch.bfloat16 or not _device_supported(x):
-            raise ValueError('AITER W4A8 requires gfx938 BF16 activations')
+            raise ValueError('AITER W4A8 requires gfx938 or gfx936 BF16 activations')
         if (x.ndim != 2 or x.shape[1] != self.hidden or x.shape[0] > self.moe.max_num_tokens
                 or topk_ids.shape != topk_weights.shape or topk_ids.ndim != 2
                 or topk_ids.shape != (x.shape[0], self.moe.experts_per_token)
