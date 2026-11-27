@@ -49,6 +49,28 @@ def test_custom_format_accounts_for_both_roles_without_core_dspark_allowlist(mon
         loader.get_external_weight_memory(SimpleNamespace(speculative_config=spec))
 
 
+@pytest.mark.parametrize("settings", [
+    {"decode_dynamic_eplb": True},
+    {"decode_eplb": {"window": 16, "interval": 96}},
+])
+def test_dynamic_eplb_fails_before_initializing_ipc(monkeypatch, settings):
+    from vllm.config import LoadConfig
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("unsupported EPLB reached IPC initialization")
+
+    monkeypatch.setattr(ipc.IpcModelLoader, "__init__", unexpected)
+    config = LoadConfig(
+        load_format=ipc.LOAD_FORMAT,
+        model_loader_extra_config={
+            "decode_ready_manifest": "/tmp/unused-ready.json",
+            **settings,
+        },
+    )
+    with pytest.raises(ValueError, match="use a frozen expert placement"):
+        ipc.DecodeIpcLoader(config)
+
+
 def test_weight_identity_checks_actual_import_resolution(monkeypatch,tmp_path):
     actual=tmp_path/'installed.py';actual.write_text('installed = True\n')
     expected=hashlib.sha256(actual.read_bytes()).hexdigest()

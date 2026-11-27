@@ -128,19 +128,17 @@ class DecodeIpcLoader(IpcModelLoader):
         from vllm.config import replace
         extra = dict(load_config.model_loader_extra_config or {})
         self.manifest_path = extra.pop("decode_ready_manifest", None)
-        self.dynamic_eplb = extra.pop("decode_dynamic_eplb", False)
-        if type(self.dynamic_eplb) is not bool:
+        dynamic_eplb = extra.pop("decode_dynamic_eplb", False)
+        if type(dynamic_eplb) is not bool:
             raise ValueError("decode_dynamic_eplb must be a boolean")
         eplb = extra.pop("decode_eplb", {})
-        if not isinstance(eplb, dict) or set(eplb) - {"window", "interval"}:
-            raise ValueError("decode_eplb accepts only window and interval")
-        if eplb and not self.dynamic_eplb:
-            raise ValueError("decode_eplb options require decode_dynamic_eplb")
-        self.eplb_window = eplb.get("window", 16)
-        self.eplb_interval = eplb.get("interval", 96)
-        if (type(self.eplb_window) is not int or type(self.eplb_interval) is not int
-                or not 1 <= self.eplb_window <= self.eplb_interval):
-            raise ValueError("decode_eplb requires integers with 1 <= window <= interval")
+        if not isinstance(eplb, dict):
+            raise ValueError("decode_eplb must be an object")
+        if dynamic_eplb or eplb:
+            raise ValueError(
+                "dynamic decode EPLB has no synchronized VERIFY step lifecycle; "
+                "use a frozen expert placement"
+            )
         super().__init__(replace(load_config, model_loader_extra_config=extra))
         if self.fallback or self.mode != "zero_copy" or self.socket_path or not self.manifest_path:
             raise ValueError("decode IPC requires zero_copy, fallback=false, role sockets and ready manifest")
@@ -162,11 +160,6 @@ class DecodeIpcLoader(IpcModelLoader):
         if placement is not None:
             from .minimax31_decode import verify_permuted_model
             verify_permuted_model(model, placement, self.decode_partition.dp_rank, checkpoint=False)
-        if self.dynamic_eplb:
-            if placement is None or self.is_draft:
-                raise ValueError("dynamic decode EPLB requires a permuted target")
-            from .minimax31_decode_eplb import attach_decode_eplb
-            attach_decode_eplb(model, window=self.eplb_window, interval=self.eplb_interval)
         return model
 
     def _request_state(self, cache_key, *, is_reload=False):

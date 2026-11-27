@@ -89,7 +89,7 @@ def verify8_replay_options():
     )
 
 
-def load_models(root,*,verify_transpose=False,load_draft=True,dynamic_eplb=False):
+def load_models(root,*,verify_transpose=False,load_draft=True):
     import torch
     rank=int(os.environ['LOCAL_RANK'])
     local_device=device_index();torch.cuda.set_device(local_device)
@@ -106,12 +106,6 @@ def load_models(root,*,verify_transpose=False,load_draft=True,dynamic_eplb=False
     extra={'socket_dir':socket_dir,'mode':'zero_copy','fallback':False,
            'decode_ready_manifest':str(root/('dual_ready_v2.json' if load_draft else 'target_ready_v1.json'))}
     options, verify_row_major = _replay_decode_config()
-    if dynamic_eplb:
-        extra['decode_dynamic_eplb'] = True
-        extra['decode_eplb'] = {
-            'window': int(os.environ.get('HCU_MINIMAX31_DECODE_EPLB_WINDOW', '16')),
-            'interval': int(os.environ.get('HCU_MINIMAX31_DECODE_EPLB_INTERVAL', '96')),
-        }
     argv=['--model',str(root/'config_target_v1'),'--trust-remote-code',
           '--quantization','slimquant_w4a8','--tensor-parallel-size','1',
           '--pipeline-parallel-size','1','--data-parallel-size','8',

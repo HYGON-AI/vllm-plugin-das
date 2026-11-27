@@ -4,8 +4,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _map_experts(Ids, Table, Mapped, Enabled, Counts, SIZE: tl.constexpr,
+@triton.jit(do_not_specialize=["SIZE"])
+def _map_experts(Ids, Table, Mapped, Enabled, Counts, SIZE,
                  BLOCK: tl.constexpr, RECORD: tl.constexpr):
     offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     active = offset < SIZE

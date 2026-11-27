@@ -111,6 +111,7 @@ class SelectionTests(unittest.TestCase):
             p.relative_to(ROOT).as_posix() for p in (ROOT / 'tests/vllm033').glob('*_hcu.py')
         } | {'tests/vllm033/test_slimquant.py',
              'tests/vllm033/test_minimax31_prefill_gpu.py',
+             'tests/vllm033/test_minimax31_online_markov.py',
              'tests/vllm033/test_hy4_replica_distribution_gpu.py'})
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / 'junit.xml'

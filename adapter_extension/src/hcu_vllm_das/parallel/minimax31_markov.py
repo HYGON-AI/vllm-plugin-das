@@ -161,8 +161,10 @@ def after_minimax31_markov_load(context):
 
     @wraps(original)
     def sample_logits(logits, idx_map, sample_pos, step):
-        if speculator.draft_logits is not None or not isinstance(
-            speculator.model, DSparkMiniMaxDraftModel
+        if (
+            speculator.draft_logits is not None
+            or speculator._draft_topk is not None
+            or not isinstance(speculator.model, DSparkMiniMaxDraftModel)
         ):
             return original(logits, idx_map, sample_pos, step)
         speculator._maybe_predict_acceptance(logits, idx_map, speculator._step_cols[step])

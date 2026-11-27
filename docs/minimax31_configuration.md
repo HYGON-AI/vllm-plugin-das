@@ -67,8 +67,9 @@ the decision, and the executor startup log reports the startup options.
 | `shared_w8a8_fused` | `false`. Candidate shared-expert projection path. VERIFY GEMM row-major writeback is an independent replay argument. |
 | `lightop_moe_tuned` | `false`. Candidate masked activation grid. |
 
-Dynamic EPLB remains explicit in `model_loader_extra_config.decode_dynamic_eplb`.
-When enabled, `decode_eplb` accepts `window` and `interval` (16 and 96 by default).
+Decode supports frozen expert placement. The IPC loader rejects
+`model_loader_extra_config.decode_dynamic_eplb=true` before loading weights until
+all EP ranks can advance EPLB together at the real VERIFY boundary.
 The frozen second replay remains controlled by its saved placement.
 
 Replay launchers can translate legacy switches for historical A/B runs.

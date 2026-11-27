@@ -79,6 +79,29 @@ def _load_greedy_policy(spec):
     markov.after_minimax31_markov_load(context)
 
 
+def test_topk_fallback_delegates_to_native_sampler(monkeypatch):
+    spec = DSparkSpeculator.__new__(DSparkSpeculator)
+    spec.model = DSparkMiniMaxDraftModel.__new__(DSparkMiniMaxDraftModel)
+    spec.draft_logits = None
+    spec._draft_topk = 8
+    logits = torch.tensor([[float("nan"), 10.0, 9.0]])
+    idx_map = torch.tensor([0])
+    sample_pos = torch.tensor([42])
+    selected = torch.tensor([2])
+
+    def native(self, actual_logits, actual_indices, actual_positions, step):
+        assert self is spec
+        assert actual_logits is logits
+        assert actual_indices is idx_map
+        assert actual_positions is sample_pos
+        assert step == 1
+        return selected
+
+    monkeypatch.setattr(DSparkSpeculator, "_sample_logits", native)
+    _load_greedy_policy(spec)
+    assert spec._sample_logits(logits, idx_map, sample_pos, 1) is selected
+
+
 def _capture(call):
     call()
     torch.cuda.synchronize()

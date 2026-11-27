@@ -251,13 +251,13 @@ def _verify_mla_prefix_stage1(
             score_mask = n_mask[None, :]
             if SLIDING_WINDOW_SIZE > 0:
                 # kv_indptr describes the clipped prefix, exactly as in extend.
-                # Query i sees prefix key n iff prefix_len + i <= n + window.
+                # The window includes the query token itself.
                 row_l = tl.reshape(
                     tl.broadcast_to(offs_l[None, :], (BLOCK_H, L_EXT)), (R,)
                 )
                 score_mask = score_mask & (
                     cur_batch_seq_len + row_l[:, None]
-                    <= offs_n[None, :] + SLIDING_WINDOW_SIZE
+                    < offs_n[None, :] + SLIDING_WINDOW_SIZE
                 )
             qk = tl.where(score_mask, qk, float("-inf"))
 
@@ -482,7 +482,7 @@ def _verify_mla_combine_stage2(
     else:
         vis = both_valid
     if SLIDING_WINDOW_SIZE > 0:
-        vis = vis & (offs_l[:, None] <= offs_l[None, :] + SLIDING_WINDOW_SIZE)
+        vis = vis & (offs_l[:, None] < offs_l[None, :] + SLIDING_WINDOW_SIZE)
     qk = tl.where(vis, qk, float("-inf"))
     m_d = tl.max(qk, 1)
     pd = tl.exp(qk - m_d[:, None])
