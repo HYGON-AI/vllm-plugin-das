@@ -197,13 +197,13 @@ def _try_load_hyv4_fp8_projection(
     params_dict: dict[str, torch.nn.Parameter],
     loaded_params: set[str],
 ) -> bool:
-    """Pair only the unquantized indexer shards and FP32 router projections."""
+    """Dequantize FP8/INT8 checkpoints for BF16 indexer and FP32 router shards."""
     match = _HYV4_FP8_LOCAL_PROJECTION.fullmatch(name)
     if match is None:
         return False
     part = "weight" if match["part"] == "weight" else "scale"
     if part == "weight" and tensor.dtype not in (
-        torch.float8_e4m3fn, torch.float8_e4m3fnuz,
+        torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.int8,
     ):
         return False
     projection = match["projection"]
