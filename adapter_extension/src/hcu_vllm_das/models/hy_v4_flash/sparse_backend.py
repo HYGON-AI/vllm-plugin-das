@@ -44,9 +44,6 @@ class FlashSparseImpl(CoreSinkImpl):
         self._hcu_small_head_counts = (8, 16)
         self._hcu_query_concat_device = None
         self._hcu_query_concat_op = None
-        self._hcu_hisparse_active = False
-        arch = None
-        qualified_worker = False
         if self._hcu_ops is not None and torch.cuda.is_available():
             device = torch.cuda.current_device()
             properties = torch.cuda.get_device_properties(device)
@@ -80,35 +77,6 @@ class FlashSparseImpl(CoreSinkImpl):
                 if (callable(fused_concat_and_store_mla_kv_cache)
                         and not isinstance(fused_concat_and_store_mla_kv_cache, Missing)):
                     self._hcu_query_concat_op = fused_concat_and_store_mla_kv_cache
-        from .flashmla_ops import select_fp8_ds_mla_format
-
-        eligible = (
-            arch == "gfx936" and qualified_worker
-            and not self._hcu_hisparse_active
-            and getattr(self, "num_heads", None) in (4, 8)
-            and getattr(self, "q_head_size", None) == 576
-            and getattr(self, "kv_lora_rank", None) == 512
-            and getattr(self, "kv_cache_dtype", None) == "fp8_ds_mla"
-        )
-        writer = None
-        if eligible:
-            try:
-                from lightop.kvcache import fused_quantize_and_store_mla_kv_cache
-
-                writer = fused_quantize_and_store_mla_kv_cache
-            except ImportError:
-                # Missing optional writer cannot admit E5. The existing E4
-                # writer path keeps its own loud availability check on use.
-                pass
-        self._hcu_fp8_cache_format = select_fp8_ds_mla_format(
-            arch, eligible=eligible, ops=self._hcu_ops, writer=writer)
-        import logging
-
-        logging.getLogger(__name__).info(
-            "Flash fp8_ds_mla codec=%s reason=%s native_formats=%s",
-            self._hcu_fp8_cache_format.name, self._hcu_fp8_cache_format.reason,
-            self._hcu_fp8_cache_format.reader_formats,
-        )
 
     def _install_hisparse_hook(self):
         # Core prepares the handle and selects write_target BEFORE calling our
@@ -118,7 +86,6 @@ class FlashSparseImpl(CoreSinkImpl):
         from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 
         if isinstance(self.index_group, HiSparseMLAIndexGroup):
-            self._hcu_hisparse_active = True
             # Keep the separately qualified HiSparse reader ABI unchanged.
             self._hcu_small_head_device = None
             self._hcu_query_concat_device = None
@@ -250,8 +217,7 @@ class FlashSparseImpl(CoreSinkImpl):
                 from .fp8_ds_mla_cache import write_fp8_ds_mla_cache
 
                 return write_fp8_ds_mla_cache(
-                    kv_c_normed, k_pe, kv_cache, slot_mapping,
-                    codec=getattr(self, "_hcu_fp8_cache_format", None))
+                    kv_c_normed, k_pe, kv_cache, slot_mapping)
             return writer(*args)
         binding, metadata = call
         binding.validate_batch(
@@ -304,16 +270,8 @@ class FlashSparseImpl(CoreSinkImpl):
         return output
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
-        codec = getattr(self, "_hcu_fp8_cache_format", None)
-        e5 = codec is not None and codec.name == "e5m2"
-        if e5 and not getattr(attn_metadata, "fp8_use_mixed_batch", False):
-            # Core's separate prefill gather has no codec selector. Refuse
-            # before it can interpret E5 bytes with the legacy E4 upconverter.
-            raise NotImplementedError("E5 sparse656 requires ordinary mixed FP8 attention")
         call = self._checked_hisparse_call(layer)
         if call is not None:
-            if e5:
-                raise NotImplementedError("HiSparse is not qualified for E5 sparse656")
             binding, metadata = call
             if metadata is not attn_metadata:
                 raise HiSparseBindingError("HiSparse attention metadata owner changed")
@@ -345,9 +303,6 @@ class FlashSparseImpl(CoreSinkImpl):
         actual_num_heads: int | None = None,
         out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        codec = getattr(self, "_hcu_fp8_cache_format", None)
-        if codec is not None and codec.name == "e5m2":
-            raise NotImplementedError("E5 sparse656 cannot use the BF16 prefill gather path")
         if self._hcu_ops is None:
             return super()._bf16_flash_mla_kernel(
                 q, kv_c_and_k_pe_cache, topk_indices,
@@ -413,11 +368,6 @@ class FlashSparseImpl(CoreSinkImpl):
         # The public sparse API takes the real query head count. Qualification
         # covers the admitted gfx938/TP4 and gfx936/TP8 BF16 Q576 worker pairs;
         # other layouts retain Core's padding. No device/env probe during replay.
-        codec = getattr(self, "_hcu_fp8_cache_format", None)
-        # DFly's 2048 target entries plus six query positions are rounded to
-        # 2176. Preserve the complete draft union and the E5 real-head path;
-        # the separately qualified legacy E4 domain stays unchanged.
-        e5 = codec is not None and codec.name == "e5m2"
         return (
             self._hcu_small_head_device is not None
             and q.device == self._hcu_small_head_device
@@ -431,8 +381,7 @@ class FlashSparseImpl(CoreSinkImpl):
             and cache.is_contiguous()
             and indices.ndim == 3
             and indices.shape[:2] == q.shape[:2]
-            and (indices.shape[-1] in (512, 2048)
-                 or (e5 and indices.shape[-1] == 2176))
+            and indices.shape[-1] in (512, 2048)
             and indices.dtype == torch.int32 and indices.device == q.device
             and indices.stride(-1) == 1
         )
@@ -448,24 +397,6 @@ class FlashSparseImpl(CoreSinkImpl):
             return super()._fp8_flash_mla_kernel(
                 q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
             )
-        codec = getattr(self, "_hcu_fp8_cache_format", None)
-        e5 = codec is not None and codec.name == "e5m2"
-        format_kwargs = {} if codec is None else codec.reader_kwargs
-        if e5 and not (
-            q.ndim == 4 and q.shape[0] == 1 and q.shape[2] in (4, 8)
-            and q.shape[3] == 576 and q.dtype == torch.bfloat16
-            and q.device == self._hcu_window_device
-            and kv_c_and_k_pe_cache.device == q.device
-            and kv_c_and_k_pe_cache.dtype == torch.uint8
-            and kv_c_and_k_pe_cache.ndim == 3
-            and kv_c_and_k_pe_cache.shape[1:] == (64, 656)
-            and kv_c_and_k_pe_cache.stride(-1) == 1
-            and topk_indices.device == q.device and topk_indices.dtype == torch.int32
-            and topk_indices.ndim == 3 and topk_indices.shape[:2] == q.shape[:2]
-            and topk_indices.shape[-1] in (512, 2048, 2176)
-            and topk_indices.stride(-1) == 1
-        ):
-            raise ValueError("E5 sparse656 requires the qualified ordinary H4/H8 layout")
         use_window_prefix = self._use_window_fp8_prefix(
             q, kv_c_and_k_pe_cache, topk_indices
         )
@@ -484,7 +415,7 @@ class FlashSparseImpl(CoreSinkImpl):
             q = F.pad(q, (0, 0, 0, padded - heads))
         # IndexGroup paths may deliberately omit kernel metadata. A fresh
         # vendor scheduler is valid for sparse decode (no dummy tables needed).
-        if kernel_metadata is None or use_small_heads or e5:
+        if kernel_metadata is None or use_small_heads:
             # Core may already have initialized its shared scheduler for H64
             # or a different top-k width. Never mutate/reuse it for real heads.
             scheduler, _ = self._hcu_ops.get_metadata()
@@ -498,7 +429,7 @@ class FlashSparseImpl(CoreSinkImpl):
             # populate only the first 512 columns; preserve the shared 2048
             # source and its scheduler for compressed attention.
             topk_indices = topk_indices[..., :512]
-            if kernel_metadata is not None and not use_small_heads and not e5:
+            if kernel_metadata is not None and not use_small_heads:
                 scheduler, _ = self._hcu_ops.get_metadata()
         result, lse = self._hcu_ops.with_kvcache(
             q=q,
@@ -511,7 +442,6 @@ class FlashSparseImpl(CoreSinkImpl):
             is_fp8_kvcache=True,
             indices=topk_indices.clone(),
             attn_sink=sinks,
-            **format_kwargs,
         )
         return result[:, :, :heads], lse[:, :heads]
 

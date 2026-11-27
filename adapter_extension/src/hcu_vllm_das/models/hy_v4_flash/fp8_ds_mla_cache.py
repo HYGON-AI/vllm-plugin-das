@@ -46,7 +46,7 @@ def _scatter_656(Scratch, Slots, Cache,
     tl.store(Cache + offset + col, byte, valid & (col < 656))
 
 
-def write_fp8_ds_mla_cache(k_nope, k_rope, cache, slots, *, eps=1e-6, codec=None):
+def write_fp8_ds_mla_cache(k_nope, k_rope, cache, slots, *, eps=1e-6):
     """Write FN512 + four FP32 scales + BF16 RoPE64 to original paged KV.
 
     The first len(slots) input rows are consumed; a longer source prefix is valid.
@@ -61,13 +61,6 @@ def write_fp8_ds_mla_cache(k_nope, k_rope, cache, slots, *, eps=1e-6, codec=None
         return
     if eps <= 0:
         raise ValueError('eps must be positive')
-    writer_dtype = 'fp8_e4m3'
-    if codec is not None:
-        from .flashmla_ops import FlashMLAKVCacheFormat
-
-        if not isinstance(codec, FlashMLAKVCacheFormat):
-            raise TypeError('Flash KV writer requires an immutable format descriptor')
-        writer_dtype = codec.writer_dtype
     from lightop.kvcache import fused_quantize_and_store_mla_kv_cache
     from hcu_adapter._base import Missing
     if (isinstance(fused_quantize_and_store_mla_kv_cache, Missing)
@@ -76,7 +69,7 @@ def write_fp8_ds_mla_cache(k_nope, k_rope, cache, slots, *, eps=1e-6, codec=None
     scratch = torch.empty((n, 1, 656), dtype=torch.uint8, device=k_nope.device)
     local_slots = torch.arange(n, dtype=torch.int64, device=k_nope.device)
     fused_quantize_and_store_mla_kv_cache(
-        k_nope[:n], k_rope[:n], scratch, local_slots, writer_dtype, eps)
+        k_nope[:n], k_rope[:n], scratch, local_slots, 'fp8_e4m3', eps)
     _scatter_656[(n,)](
         scratch, slots, cache, cache.shape[1], cache.stride(0), cache.stride(1),
         cache.shape[0] * cache.shape[1], 1024, num_warps=4)

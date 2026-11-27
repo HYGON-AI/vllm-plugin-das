@@ -151,23 +151,10 @@ class WorkerQualificationTests(unittest.TestCase):
                     kv_cache_dtype='fp8_ds_mla',
                     num_heads=4 if arch == 'gfx936' else 8,
                     _install_hisparse_hook=lambda: None)
-                package = ModuleType('hy4_worker_fixture')
-                package.__path__ = []
-                runtime = ModuleType('hy4_worker_fixture.runtime')
-                runtime.is_hcu_platform = lambda: True
-                policy_name = 'hy4_worker_fixture.flashmla_ops'
-                spec = importlib.util.spec_from_file_location(
-                    policy_name, SOURCE / 'flashmla_ops.py')
-                policy = importlib.util.module_from_spec(spec)
                 with patch.dict(sys.modules, {
-                    'hy4_worker_fixture': package,
-                    'hy4_worker_fixture.runtime': runtime,
-                    policy_name: policy,
+                    'hy4_worker_fixture': ModuleType('hy4_worker_fixture'),
                     'hy4_worker_fixture.fullgraph_runner': (
                         runner if arch == 'gfx936' else None)}):
-                    # Load the actual immutable policy, preserving every old
-                    # architecture/TP assertion and the no-extra-gate probes.
-                    spec.loader.exec_module(policy)
                     namespace['__init__'](owner)
                 if expected is None:
                     self.assertIsNone(owner._hcu_small_head_device)

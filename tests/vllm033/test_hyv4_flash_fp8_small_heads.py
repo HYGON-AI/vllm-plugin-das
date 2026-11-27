@@ -176,27 +176,16 @@ class SmallHeadContracts(unittest.TestCase):
             gate_name, self.source.with_name("fullgraph_runner.py"))
         gate = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(gate)
-        # Constructor selection executes the real pure format policy. Only its
-        # host discovery dependency is doubled; no codec decision is mocked.
-        runtime = ModuleType(package + ".runtime")
-        runtime.is_hcu_platform = lambda: True
-        policy_name = package + ".flashmla_ops"
-        policy_spec = importlib.util.spec_from_file_location(
-            policy_name, self.source.with_name("flashmla_ops.py"))
-        policy = importlib.util.module_from_spec(policy_spec)
         group = ModuleType("vllm.v1.attention.backends.mla.index_group")
         group.HiSparseMLAIndexGroup = HiSparseGroup
         self.modules = patch.dict(sys.modules, {
             package: parent, package + ".swa": swa, gate_name: gate,
-            package + ".runtime": runtime, policy_name: policy,
             "vllm.v1.attention.backends.mla.index_group": group,
         })
         self.modules.start()
         self.addCleanup(self.modules.stop)
-        policy_spec.loader.exec_module(policy)
         self.namespace = {
-            "__package__": package, "__name__": package + ".sparse_backend",
-            "CoreSinkImpl": Core,
+            "__package__": package, "CoreSinkImpl": Core,
             "torch": NS(cuda=self.cuda, device=Device, bfloat16="bfloat16",
                         uint8="uint8", int32="int32"),
             "F": NS(pad=pad), "fp8_fusions_enabled": master_policy,
