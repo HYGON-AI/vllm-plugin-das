@@ -290,12 +290,34 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
 
         from ..dspark_ll import install_model_entry_reset
         install_model_entry_reset(self, vllm_config, 384)
+        self._hcu_int8_lm_head = False
+        from ..quantization.ct_w4a8 import HcuDSV41CTW4A8Config
+
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, HcuDSV41CTW4A8Config):
+            from ..w4a8_projections import bind_vocab_head, bind_wo_a
+
+            bind_wo_a(self.language_model.model.layers)
+            self._hcu_int8_lm_head = bind_vocab_head(
+                self.language_model.lm_head, quant_config, "language_model.lm_head",
+            )
+            if uses_pcp and self._hcu_int8_lm_head:
+                from ..dsv41.pcp_compressor import install as install_pcp_compressor
+
+                if install_pcp_compressor():
+                    native.logger.info("DSV4.1 HCU PCP compressor pointer compatibility enabled")
 
     def load_weights(self, weights):
         cfg = getattr(self, '_hcu_static_eplb_config', None)
         if cfg is not None:
             # Bind before native checkpoint loaders read logical expert IDs.
             static_eplb.bind_placement(self, cfg)
+        if getattr(self, "_hcu_int8_lm_head", False):
+            weights = (
+                ("language_model.lm_head.weight_scale" if name == "head.weight_scale" else name,
+                 value)
+                for name, value in weights
+            )
         return super().load_weights(weights)
 
     def process_weights_after_loading(self):

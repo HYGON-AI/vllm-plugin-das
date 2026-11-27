@@ -71,17 +71,29 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
         # HcuV41Fp4DecoderLayer activation binding never visits them. Reuse the
         # same guarded consumer contract with the actual construction config;
         # keep CT INT8, heterogeneous/mega MoE and unsupported topology native.
-        if _owned_quant_kind(constructor_config) == "channel_fp8":
+        quant_kind = _owned_quant_kind(constructor_config)
+        if quant_kind == "channel_fp8":
             from ..moe.shared_act_quant import bind_dspark_shared_experts_fp8
 
             bind_dspark_shared_experts_fp8(constructor_config, self.model)
             from ..qkv_split import bind_dspark_qkv
 
             bind_dspark_qkv(self.model)
+        self._hcu_int8_markov = False
+        if quant_kind == "ct_w4a8":
+            from ..w4a8_projections import bind_vocab_head, bind_wo_a
+
+            bind_wo_a(self.model.layers)
+            self._hcu_int8_markov = bind_vocab_head(
+                self.model.markov_head.markov_w2, constructor_config.quant_config,
+                "model.markov_head.markov_w2",
+            )
+            if self._hcu_int8_markov and getattr(self.config, "dspark_draft_topk", None):
+                raise ValueError("DSV4.1 INT8 Markov Head requires full-vocabulary drafting")
         if native_ll:
             from hcu_vllm_das.dspark_ll import install_model_entry_reset
             install_model_entry_reset(self, vllm_config, 128)
-        self._hcu_markov_pointwise = native_ll
+        self._hcu_markov_pointwise = native_ll and not self._hcu_int8_markov
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
