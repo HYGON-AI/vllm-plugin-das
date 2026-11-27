@@ -1,0 +1,187 @@
+--- stage1.cu
++++ stage1.cu
+@@ -10,6 +10,7 @@
+ 
+ #include <cstdint>
+ #include <limits>
++#include <type_traits>
+ 
+ #include <hip/hip_runtime.h>
+ 
+@@ -30,6 +31,7 @@
+ 
+ constexpr int kDecodeFp8TilesM = kFp8DecodeBlockM / kMmaM;
+ 
++template<bool Full>
+ __device__ __forceinline__ void compute_decode_group(
+     const union_vec16_fp8 (&q_reg)[kDecodeFp8TilesM][2],
+     int slot_addr,
+@@ -73,7 +75,7 @@
+         const uint32_t bnd = bnd_reg[m];
+         const uint32_t lim =
+             bnd < static_cast<uint32_t>(kv_len) ? bnd : static_cast<uint32_t>(kv_len);
+-        if (col0 + kGroupTokens <= static_cast<int>(lim)) {
++        if (Full || col0 + kGroupTokens <= static_cast<int>(lim)) {
+             #pragma unroll
+             for (int n = 0; n < 2; ++n) {
+                 #pragma unroll
+@@ -96,6 +98,7 @@
+     }
+ }
+ 
++template<int Mode>
+ __global__ void __launch_bounds__(kNumThreads, 2)
+ msa128_stage1_page_max_decode_fp8(
+     const uint8_t* A_data, const uint8_t* B_data, float* D_data,
+@@ -134,6 +137,7 @@
+ 
+     uint32_t bounds[TilesM];
+     uint32_t max_boundary = 0;
++    uint32_t min_boundary = kv_len;
+     #pragma unroll
+     for (int m = 0; m < TilesM; ++m) {
+         const int row = m * kMmaM + lane % kMmaM;
+@@ -150,17 +154,22 @@
+         }
+         bounds[m] = boundary < static_cast<uint32_t>(kv_len) ? boundary : kv_len;
+         max_boundary = max_boundary > bounds[m] ? max_boundary : bounds[m];
++        if constexpr (Mode != 0 && Mode != 2) min_boundary = min(min_boundary, bounds[m]);
+     }
+     // k_end need not be monotonic: use all rows, not just the last Q row.
+     #pragma unroll
+     for (int delta = 8; delta > 0; delta >>= 1) {
+         const uint32_t other = __shfl_xor(max_boundary, delta, kWarpSize);
+         max_boundary = max_boundary > other ? max_boundary : other;
++        if constexpr (Mode != 0 && Mode != 2) {
++            min_boundary = min(min_boundary, __shfl_xor(min_boundary, delta, kWarpSize));
++        }
+     }
+     const int max_ke = static_cast<int>(max_boundary);
+     const int visible_pages = (max_ke + kPageSize - 1) / kPageSize;
+-    const int page_begin = page_group * kFp8DecodePages;
+-    const int page_limit = page_begin + kFp8DecodePages;
++    constexpr int page_group_size = Mode == 4 ? 8 : (Mode == 5 ? 32 : kFp8DecodePages);
++    const int page_begin = page_group * page_group_size;
++    const int page_limit = page_begin + page_group_size;
+     const int page_end = page_limit < visible_pages ? page_limit : visible_pages;
+     if (page_begin >= page_end) return;
+ 
+@@ -209,23 +218,42 @@
+         float head_max[TilesM];
+         #pragma unroll
+         for (int m = 0; m < TilesM; ++m) head_max[m] = -std::numeric_limits<float>::infinity();
+-        #pragma unroll 1
+-        for (int chunk = 0; chunk < page_valid; chunk += kGroupTokens) {
+-            if (page_base + chunk >= max_ke) break;
+-            const int left = page_valid - chunk;
+-            const int valid = left < kGroupTokens ? left : kGroupTokens;
+-            #pragma unroll
+-            for (int half = 0; half < 2; ++half) {
+-                vec4_uint srsrc;
+-                srsrc[2] = row_stride;
+-                srsrc[3] = (static_cast<uint32_t>(kGroupTokens - valid) << 8) + kKRearrangeBit;
+-                *(uint64_t*)&srsrc = VA_LIMIT_BITS(reinterpret_cast<uint64_t>(
+-                    page_ptr + static_cast<int64_t>(chunk) * row_stride + half * 64));
+-                const int offset = __builtin_amdgcn_readfirstlane(wave_off + half * kSlotBytes);
+-                inline_matrix_load_64x32_b8_lds_rearrange<0, 1>(smem, srsrc, offset, 0);
+-            }
+-            flash::wait_buffer_data_arrived<false>(0);
+-            compute_decode_group(q_reg, lds_addr, head_max, bounds, page_base + chunk, kv_len, lane);
++        if (Mode != 0 && Mode != 2 && page_base + kPageSize <= static_cast<int>(min_boundary)) {
++            #pragma unroll 1
++            for (int chunk = 0; chunk < kPageSize; chunk += kGroupTokens) {
++                constexpr int valid = kGroupTokens;
++                #pragma unroll
++                for (int half = 0; half < 2; ++half) {
++                    vec4_uint srsrc;
++                    srsrc[2] = row_stride;
++                    srsrc[3] = (static_cast<uint32_t>(kGroupTokens - valid) << 8) + kKRearrangeBit;
++                    *(uint64_t*)&srsrc = VA_LIMIT_BITS(reinterpret_cast<uint64_t>(
++                        page_ptr + static_cast<int64_t>(chunk) * row_stride + half * 64));
++                    const int offset = __builtin_amdgcn_readfirstlane(wave_off + half * kSlotBytes);
++                    inline_matrix_load_64x32_b8_lds_rearrange<0, 1>(smem, srsrc, offset, 0);
++                }
++                flash::wait_buffer_data_arrived<false>(0);
++                compute_decode_group<true>(q_reg, lds_addr, head_max, bounds, page_base + chunk, kv_len, lane);
++            }
++        } else {
++            #pragma unroll 1
++            for (int chunk = 0; chunk < page_valid; chunk += kGroupTokens) {
++                if (page_base + chunk >= max_ke) break;
++                const int left = page_valid - chunk;
++                const int valid = left < kGroupTokens ? left : kGroupTokens;
++                #pragma unroll
++                for (int half = 0; half < 2; ++half) {
++                    vec4_uint srsrc;
++                    srsrc[2] = row_stride;
++                    srsrc[3] = (static_cast<uint32_t>(kGroupTokens - valid) << 8) + kKRearrangeBit;
++                    *(uint64_t*)&srsrc = VA_LIMIT_BITS(reinterpret_cast<uint64_t>(
++                        page_ptr + static_cast<int64_t>(chunk) * row_stride + half * 64));
++                    const int offset = __builtin_amdgcn_readfirstlane(wave_off + half * kSlotBytes);
++                    inline_matrix_load_64x32_b8_lds_rearrange<0, 1>(smem, srsrc, offset, 0);
++                }
++                flash::wait_buffer_data_arrived<false>(0);
++                compute_decode_group<false>(q_reg, lds_addr, head_max, bounds, page_base + chunk, kv_len, lane);
++            }
+         }
+         #pragma unroll
+         for (int m = 0; m < TilesM; ++m) {
+@@ -237,8 +265,15 @@
+             if (lane < kMmaM && token < tile_q_count) {
+                 const int hq = hkv * qph + row % qph;
+                 if (mx != -std::numeric_limits<float>::infinity()) mx *= scale;
+-                D_data[(static_cast<int64_t>(hq) * max_k_tiles + page) * total_q +
+-                       q_off + q_row0 + token] = mx;
++                const int q = q_off + q_row0 + token;
++                if constexpr (Mode == 3) {
++                    const auto quartet = static_cast<int64_t>(hq) * (total_q / 4) + q / 4;
++                    D_data[(quartet * max_k_tiles + page) * 4 + q % 4] = mx;
++                } else if constexpr (Mode == 2) {
++                    D_data[(static_cast<int64_t>(hq) * total_q + q) * max_k_tiles + page] = mx;
++                } else {
++                    D_data[(static_cast<int64_t>(hq) * max_k_tiles + page) * total_q + q] = mx;
++                }
+             }
+         }
+     }
+@@ -246,6 +281,7 @@
+ 
+ #else  // !__gfx938__: stub so the fatbinary links; the host never launches fp8 elsewhere.
+ 
++template<int Mode>
+ __global__ void __launch_bounds__(kNumThreads, 2)
+ msa128_stage1_page_max_decode_fp8(
+     const uint8_t*, const uint8_t*, float*, const uint32_t*, const int*, const int*,
+@@ -256,7 +292,7 @@
+ 
+ }  // namespace
+ 
+-void launch_msa128_stage1_decode_fp8_gfx938(
++void launch_verify8_stage1_decode_fp8_gfx938(
+     const uint8_t* q_ptr,
+     const uint8_t* k_ptr,
+     float* d_ptr,
+@@ -273,11 +309,19 @@
+     int contig_k_row_stride,
+     int total_q,
+     int max_k_tiles,
+-    hipStream_t stream) {
++    hipStream_t stream, int mode) {
+     if (total_work <= 0 || total_q <= 0) return;
+     const dim3 grid(static_cast<unsigned>(total_work), 1, static_cast<unsigned>(Hkv));
+     const dim3 block(kNumThreads);
+-    msa128_stage1_page_max_decode_fp8<<<grid, block, 0, stream>>>(
+-        q_ptr, k_ptr, d_ptr, ke_ptr, page_ids, meta, work_prefix, q_scale, k_scale, B, Hq,
+-        Hkv, contig_k_row_stride, total_q, max_k_tiles);
++    auto launch = [&](auto variant) {
++        msa128_stage1_page_max_decode_fp8<decltype(variant)::value><<<grid, block, 0, stream>>>(
++            q_ptr, k_ptr, d_ptr, ke_ptr, page_ids, meta, work_prefix, q_scale, k_scale, B, Hq,
++            Hkv, contig_k_row_stride, total_q, max_k_tiles);
++    };
++    if (mode == 1) launch(std::integral_constant<int, 1>{});
++    else if (mode == 2) launch(std::integral_constant<int, 2>{});
++    else if (mode == 3) launch(std::integral_constant<int, 3>{});
++    else if (mode == 4) launch(std::integral_constant<int, 4>{});
++    else if (mode == 5) launch(std::integral_constant<int, 5>{});
++    else launch(std::integral_constant<int, 0>{});
+ }

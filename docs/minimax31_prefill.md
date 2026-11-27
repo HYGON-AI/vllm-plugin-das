@@ -144,3 +144,16 @@ RECORD-owned installed origin from an unrelated directory with isolated Python
 paths and repository-root imports blocked. The portable source lane uses
 import-only Torch/Triton stand-ins; a separate installed-wheel probe imports the
 real runtime dependencies. Relocation preserves the kernel implementation bytes.
+
+## DeepEP early-combine merge scope
+
+Native Prefill early-combine is excluded from the MiniMax 3.1 integration.
+The experiment in `d1ec968` added `prepare_intranode_combine` to the native
+DeepEP extension and used it in an eight-rank component A/B with synthetic
+expert compute. That experiment was based on reference source `5e424c0`.
+The source matching the deployed DeepEP wheel (`g44d179`) is unavailable to
+this integration, and the wheel lacks the required native entry point.
+The experiment has no full-model benchmark result.
+
+The merged C4 shared-expert down projection overlap uses the existing
+combine interface in the deployed wheel.

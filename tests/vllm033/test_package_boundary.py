@@ -19,6 +19,7 @@ EXPECTED_ENTRY_POINTS = {
     "hcu_adapter.extensions": {
         "minimax31_slimquant": "hcu_vllm_das.quantization.minimax31_activation:extension_spec",
         "minimax31_pcp_ep": "hcu_vllm_das.parallel.minimax31_pcp_activation:extension_spec",
+        "minimax31_decode": "hcu_vllm_das.parallel.minimax31_decode_activation:extension_spec",
         "das_hcu": "hcu_vllm_das.extension:extension_spec",
         "das_hcu_flash": "hcu_vllm_das.flash_activation:extension_spec",
         "das_hcu_slimquant": "hcu_vllm_das.slimquant_activation:extension_spec",
@@ -129,6 +130,8 @@ def test_built_wheel_contains_only_the_new_plugin_namespace(tmp_path: Path) -> N
         names = set(archive.namelist())
         prefill_kernel = "hcu_vllm_das/parallel/minimax31_prefill_triton.py"
         assert prefill_kernel in names
+        assert "triton_tmp_dir/minimax31_decode_remap.py" in names
+        assert "triton_tmp_dir/minimax31_dspark_attention.py" in names
         installed = tmp_path / "installed"
         archive.extractall(installed)
         metadata_name = next(

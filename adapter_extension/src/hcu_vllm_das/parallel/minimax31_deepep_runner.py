@@ -5,9 +5,13 @@ accepts received hidden, FP32 route weights, local INT32 expert IDs and returns
 per-received-token weighted local-expert sums. Never invoke without first
 validating this wheel's received ID representation on all eight GPUs.
 """
-import torch
-import threading
+from functools import lru_cache
 import json
+import threading
+
+import torch
+
+from .minimax31_prefill import enabled as prefill_optimized
 
 
 def dispatch_routed(hidden, logits, select_experts, expert_fn, buffer,
@@ -130,6 +134,13 @@ def _get_aligned_moe(layer, hidden):
     return _aligned_moe, weights
 
 
+@lru_cache(maxsize=None)
+def _supports_shared_down(device):
+    gpu = torch.cuda.get_device_properties(device)
+    return (getattr(gpu, "gcnArchName", "").split(":", 1)[0] == "gfx938"
+            and gpu.multi_processor_count == 64)
+
+
 class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
     """Synchronous rank-local routing with existing modular expert math.
 
@@ -167,7 +178,7 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
             finally:
                 _buffer_inflight.release()
 
-    def _launch_long_shared(self, shared_input):
+    def _launch_long_shared(self, shared_input, *, defer_down=False):
         shared = self._shared_experts
         if (shared is None or shared.enable_dbo or shared._stream is None
                 or shared._disable_shared_experts_overlap
@@ -194,10 +205,20 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
         shared._input_ready_event[0].record(main)
         # The input was allocated on the caller's stream and is read asynchronously.
         shared_input.record_stream(shared._stream)
+        intermediate = None
         with torch.cuda.stream(shared._stream):
             shared._input_ready_event[0].wait(shared._stream)
             try:
-                shared._output[0] = shared._layer(shared_input)
+                if defer_down:
+                    from vllm.models.minimax_m3.amd.model import swiglu_oai_split
+
+                    gate_up, _ = layer.gate_up_proj(shared_input)
+                    intermediate = swiglu_oai_split(
+                        gate_up, alpha=layer.swiglu_alpha,
+                        beta=layer.swiglu_beta, limit=layer.swiglu_limit,
+                    )
+                else:
+                    shared._output[0] = layer(shared_input)
             finally:
                 # Join even if a partially enqueued shared forward raises.
                 try:
@@ -206,7 +227,20 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
                 except BaseException:
                     self._hcu_shared_poisoned = True
                     raise
-        return True
+        return intermediate if defer_down else True
+
+    def _launch_shared_down(self, intermediate):
+        shared = self._shared_experts
+        shared._stream.wait_stream(self._hcu_shared_main_stream)
+        with torch.cuda.stream(shared._stream):
+            try:
+                shared._output[0], _ = shared._layer.down_proj(intermediate)
+            finally:
+                try:
+                    shared._output_ready_event[0].record(shared._stream)
+                except BaseException:
+                    self._hcu_shared_poisoned = True
+                    raise
 
     def _forward_locked(self, hidden_states, router_logits, shared_experts_input, input_ids=None):
         group = self._pcp_ep_group()
@@ -215,10 +249,24 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
         self.routed_experts._ensure_moe_quant_config_init()
         # Match stock lifecycle: short queries may choose the auxiliary stream.
         shared_overlapping = False
+        shared_intermediate = None
         if (self._shared_experts is not None
                 and shared_experts_input is not None
                 and shared_experts_input.shape[0] >= 2048):
-            shared_overlapping = self._launch_long_shared(shared_experts_input)
+            defer_down = (
+                shared_experts_input.shape[0] == 6144
+                and self.routed_experts.quant_method.quant_config.routed_backend == "deepgemm_hipc_v1"
+                and not torch.cuda.is_current_stream_capturing()
+                and prefill_optimized()
+                and _supports_shared_down(shared_experts_input.device)
+            )
+            if defer_down:
+                intermediate = self._launch_long_shared(shared_experts_input, defer_down=True)
+                if intermediate is not False:
+                    shared_intermediate = intermediate
+                    shared_overlapping = True
+            else:
+                shared_overlapping = self._launch_long_shared(shared_experts_input)
         if not shared_overlapping:
             if self._shared_experts is not None:
                 shared_overlapping = self._shared_experts.maybe_forward_async(shared_experts_input)
@@ -264,9 +312,12 @@ class MiniMax31DeepEpRunner(MiniMax31PcpEpMoERunner):
             # Static PCP padding is represented by physical ID -1. Router
             # weights on these rows are not necessarily zero; restore the same
             # invalid-route contract as dispatch_routed before the strict guard.
+            executor_options = {"expert_weights": packed}
+            if shared_intermediate is not None:
+                executor_options["before_combine"] = lambda: self._launch_shared_down(shared_intermediate)
             result = executor(hidden_states, ids.to(torch.int64).contiguous(),
                               weights.masked_fill(ids < 0, 0).contiguous(),
-                              expert_weights=packed)
+                              **executor_options)
         else:
             result = dispatch_routed(hidden_states, router_logits, select, experts,
                                      _get_deepep_buffer(get_ep_group(), hidden_states),

@@ -48,9 +48,35 @@ implementation/configuration requires a new honest identity and, for IPC, a
 fresh producer; do not edit old hashes. Candidate status and incomplete full
 checkpoint quality evidence remain unchanged.
 
-The MSA provider's existing `MSA128_FP8_PREFILL_KERNEL` / `MSA128_FP8_PREFILL_SLOTS`
-are external binary interfaces; this Plugin neither defines nor reads them.
-Their settings must match the supplied provider and build identity.
+### MiniMax performance defaults
+
+The existing Prefill policy selects the C4 shared-down overlap at 6,144
+local rows on gfx938/64 CU, in eager execution, for the HIPC/hipBLASLt TP1 shared
+MLP and its available auxiliary stream. Set `ops.vllm_minimax_prefill: stock`
+or use `HCU_DISABLE_OPS=vllm_minimax_prefill` before starting a fresh worker
+for a stock comparison.
+
+The explicitly selected DP8/EP8 Decode extension accepts the following keys
+under `--additional-config` `minimax31_decode`. Worker construction freezes
+the decision, and the executor startup log reports the startup options.
+
+| Key | Default and scope |
+|---|---|
+| `shared_expert_schedule` | `auto` selects dispatch/combine overlap on gfx938/64 CU for the stock shared MLP at 64, 80, 96, 128 or 144 local rows. Other inputs use the stock lifecycle. Use `stock` to compare, or `dual_window` / `combine` / `aux` for a controlled replay. |
+| `hipc_verify_tuned` | `true` with the existing gfx938/64 CU, M128, geometry and provider-config guards. |
+| `shared_w8a8_fused` | `false`. Candidate shared-expert projection path. VERIFY GEMM row-major writeback is an independent replay argument. |
+| `lightop_moe_tuned` | `false`. Candidate masked activation grid. |
+
+Decode supports frozen expert placement. The IPC loader rejects
+`model_loader_extra_config.decode_dynamic_eplb=true` before loading weights until
+all EP ranks can advance EPLB together at the real VERIFY boundary.
+The frozen second replay remains controlled by its saved placement.
+
+Replay launchers can translate legacy switches for historical A/B runs.
+Markov fusion, Verify8 QK/quantization and MSA implementations, HiSparse
+layout and tuning, and artifact receipts remain explicit replay inputs.
+The isolated Prefill experiments pass provider-specific MSA settings via the
+native provider's existing environment interface and restore them after use.
 
 ## Review verification
 

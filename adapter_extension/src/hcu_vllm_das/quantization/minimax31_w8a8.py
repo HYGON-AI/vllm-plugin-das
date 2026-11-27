@@ -60,9 +60,37 @@ class MiniMax31HipBlasLtInt8Kernel(TritonInt8ScaledMMLinearKernel):
         # Retain the stock vLLM quantizer, including its rounding and zero-row
         # semantics; only the scaled INT8 matrix multiplication changes.
         q,qs,zp=ops.scaled_int8_quant(flat,None,None,symmetric=True)
-        if (q.shape!=(m,k) or q.dtype!=torch.int8 or not q.is_contiguous()
-                or qs.shape!=(m,1) or qs.dtype!=torch.float32 or not qs.is_contiguous()
-                or zp is not None):
+        if zp is not None:
+            raise RuntimeError("unexpected vLLM dynamic symmetric INT8 quant zero point")
+        out = self._apply_quantized(w, ws, q, qs, x.dtype, bias,
+                                    quantizer="vllm.scaled_int8_quant")
+        return out.view(*x.shape[:-1], n)
+
+    def supports_prequantized_qkv(self, layer, device):
+        w, ws, ins, izp, azp = self._get_layer_params(layer)
+        return (
+            ins is None and izp is None and azp is None
+            and w.shape == (6144, 9856) and w.stride() == (1, 6144)
+            and w.dtype == torch.int8 and w.device == device
+            and ws.shape == (9856, 1) and ws.dtype == torch.float32
+            and ws.device == device and ws.is_contiguous()
+        )
+
+    def apply_prequantized_qkv(self, layer, q, qs):
+        if (q.ndim != 2 or q.shape[0] not in (64, 128)
+                or not self.supports_prequantized_qkv(layer, q.device)):
+            raise ValueError("unsupported MiniMax VERIFY prequantized QKV")
+        w, ws, _, _, _ = self._get_layer_params(layer)
+        return self._apply_quantized(
+            w, ws, q, qs, torch.bfloat16, None, quantizer="gemma_rmsnorm_int8",
+        )
+
+    def _apply_quantized(self, w, ws, q, qs, dtype, bias, *, quantizer):
+        k, n = w.shape
+        m = q.shape[0]
+        if (q.shape != (m, k) or q.dtype != torch.int8 or not q.is_contiguous()
+                or q.device != w.device or qs.device != q.device or qs.shape != (m, 1)
+                or qs.dtype != torch.float32 or not qs.is_contiguous()):
             raise RuntimeError("unexpected vLLM dynamic symmetric INT8 quant ABI")
         # Existing processed weight is KN stride(1,K). Its transpose is the
         # original contiguous NK storage, a view with no copy/repack.
@@ -70,17 +98,17 @@ class MiniMax31HipBlasLtInt8Kernel(TritonInt8ScaledMMLinearKernel):
         if not b.is_contiguous() or b.data_ptr()!=w.data_ptr():
             raise RuntimeError("hipBLASLt weight view unexpectedly copied")
         from lightop._lmslim_native.quantize.quant_ops import hipblaslt_w8a8_channelwise_gemm
-        ok,out=hipblaslt_w8a8_channelwise_gemm(q,b,qs,ws,m,n,k,"NT",x.dtype,bias)
+        ok,out=hipblaslt_w8a8_channelwise_gemm(q,b,qs,ws,m,n,k,"NT",dtype,bias)
         # Target native channelwise API retains a batch=1 dimension.
         # Accept only its exact 2D/one-batch contiguous forms, never transpose.
         if (not ok or out.shape not in ((m,n),(1,m,n)) or not out.is_contiguous()
-                or out.dtype!=x.dtype or out.device!=x.device):
+                or out.dtype!=dtype or out.device!=q.device):
             raise RuntimeError("unexpected hipBLASLt W8A8 return ABI: "+str(
                 (ok,out.shape,out.dtype,out.device,out.stride())))
         out=out.view(m,n)
         self._log("native",api="torch.ops.lmslim.hipblaslt_gemm_channelwise",
                   source="lightop._lmslim_native.quantize.quant_ops",
                   m=m,n=n,k=k,weight_stride=list(w.stride()),zero_copy_weight_view=True,
-                  quantizer="vllm.scaled_int8_quant",bias=bias is not None,
+                  quantizer=quantizer,bias=bias is not None,
                   tuning_override=os.environ.get("HIPBLASLT_TUNING_OVERRIDE_FILE"))
-        return out.view(*x.shape[:-1],n)
+        return out

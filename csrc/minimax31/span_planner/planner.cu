@@ -1,0 +1,29 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <hip/hip_runtime.h>
+#include "plan_spans.h"
+
+void plan_spans(const at::Tensor& reqs,const at::Tensor& real,const at::Tensor& topk,
+ const at::Tensor& ends,const at::Tensor& host,const at::Tensor& device,const at::Tensor& tags,
+ const at::Tensor& hot,const at::Tensor& slots,const at::Tensor& ms,const at::Tensor& md,
+ const at::Tensor& mc,const at::Tensor& vs,const at::Tensor& vd,const at::Tensor& vc) {
+ c10::cuda::CUDAGuard guard(reqs.device());
+ TORCH_CHECK(reqs.is_cuda() && reqs.scalar_type()==at::kLong && reqs.is_contiguous(),"reqs int64 CUDA contiguous");
+ TORCH_CHECK(topk.scalar_type()==at::kInt && topk.dim()==3 && topk.size(0)==4 && topk.size(1)==reqs.numel()*8 && topk.size(2)==16,"TopK [4,B*8,16]");
+ TORCH_CHECK(host.dim()==2 && device.dim()==2 && slots.dim()==2 && slots.size(1)<=2048,"unsupported page-map extent");
+ TORCH_CHECK(device.size(1)-128==30720,"headwise replay requires 240 pages/head");
+ TORCH_CHECK(hot.is_contiguous() && hot.sizes() == at::IntArrayRef({reqs.numel(), 8, 4, 64}),
+             "expected contiguous [B,8,4,64] page spans");
+ auto stream=at::cuda::getCurrentCUDAStream();
+ hipLaunchKernelGGL((sglang::minimax_verify::plan_spans_kernel<true>),dim3(reqs.numel()*4),dim3(128),
+  2*slots.stride(0)*sizeof(int),stream,
+  reqs.data_ptr<int64_t>(),real.data_ptr<int>(),topk.data_ptr<int>(),ends.data_ptr<int>(),
+  host.data_ptr<int64_t>(),device.data_ptr<int64_t>(),tags.data_ptr<int64_t>(),hot.data_ptr<int>(),
+  slots.data_ptr<int>(),ms.data_ptr<int64_t>(),md.data_ptr<int>(),mc.data_ptr<int>(),
+  vs.data_ptr<int64_t>(),vd.data_ptr<int>(),vc.data_ptr<int>(),
+  (int)host.size(0),(int)host.stride(0),(int)device.stride(0),(int)slots.stride(0),
+  (int)topk.stride(0),(int)topk.stride(1),(int)topk.stride(2),(int)device.size(1)-128);
+ TORCH_CHECK(hipGetLastError()==hipSuccess,"headwise planner launch failed");
+}
+

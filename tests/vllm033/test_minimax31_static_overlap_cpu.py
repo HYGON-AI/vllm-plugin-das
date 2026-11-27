@@ -24,6 +24,7 @@ def test_static_completion_is_inside_lock_after_shared_join(monkeypatch):
 @pytest.mark.parametrize('rows,overlap',[(8,False),(2047,False),(2048,True),(4096,True),(6144,True),(8192,True)])
 def test_prefill_sizes_keep_136_physical_slots_and_join(monkeypatch,rows,overlap,backend):
     events=[]
+    monkeypatch.setattr(runner, "prefill_optimized", lambda: False)
     monkeypatch.setattr(torch.cuda,'is_current_stream_capturing',lambda:False)
     def aligned(layer, hidden):
         assert layer.global_num_experts == 136

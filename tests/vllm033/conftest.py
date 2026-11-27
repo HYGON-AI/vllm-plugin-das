@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import sys
 
-import pytest
 
 
 _OWNERS = {}
@@ -112,7 +111,6 @@ def pytest_sessionfinish(session, exitstatus):
     _verify_installed_modules()
 
 
-@pytest.fixture
 def shared_fp8_selected_ops(monkeypatch):
     from hcu_adapter.bridges.vllm_input_quant_lightop import _wrap
     from vllm.model_executor.layers.quantization import input_quant_fp8 as module
@@ -133,3 +131,10 @@ def shared_fp8_selected_ops(monkeypatch):
         return quant, act
 
     return construct
+
+
+
+# The installed-origin probes import this file with python -S. Register the
+# device-test fixture only when pytest is already running.
+if "pytest" in sys.modules:
+    shared_fp8_selected_ops = sys.modules["pytest"].fixture(shared_fp8_selected_ops)
