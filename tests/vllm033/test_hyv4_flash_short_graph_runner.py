@@ -48,17 +48,28 @@ def test_current_configuration_and_text_only_multimodal_shell(api):
     assert not api.is_qualified_config(cfg, breakable=False)
 
 
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize("disable_custom_all_reduce", [True, False])
+def test_supported_tp_and_all_reduce_policy(api, tp_size, disable_custom_all_reduce):
+    cfg = configuration()
+    cfg.parallel_config.tensor_parallel_size = tp_size
+    cfg.parallel_config.disable_custom_all_reduce = disable_custom_all_reduce
+
+    assert api.is_qualified_config(cfg, breakable=False)
+
+
 @pytest.mark.parametrize("owner,field,value", [
     ("model_config", "enforce_eager", True),
     ("model_config", "enable_prompt_embeds", True),
-    ("parallel_config", "tensor_parallel_size", 8),
+    ("parallel_config", "tensor_parallel_size", 2),
     ("parallel_config", "data_parallel_size", 2),
     ("parallel_config", "pipeline_parallel_size", 2),
     ("parallel_config", "prefill_context_parallel_size", 2),
     ("parallel_config", "decode_context_parallel_size", 2),
     ("parallel_config", "enable_dbo", True),
     ("parallel_config", "enable_eplb", True),
-    ("parallel_config", "disable_custom_all_reduce", False),
+    ("parallel_config", "disable_custom_all_reduce", None),
+    ("parallel_config", "disable_custom_all_reduce", 0),
     ("speculative_config", "method", "mtp"),
     ("speculative_config", "num_speculative_tokens", 6),
     ("cache_config", "cache_dtype", "auto"),
