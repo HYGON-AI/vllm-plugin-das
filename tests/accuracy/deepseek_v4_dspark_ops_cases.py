@@ -313,18 +313,29 @@ def test_auto_w4a8_qwen_padding_matches_ht_and_ll_reference() -> None:
         hidden,
         physical_intermediate // 2,
     )
-    m_indices = torch.zeros(tokens, device=device, dtype=torch.int32)
+    # The default contiguous HIPC kernel requires 128-row expert segments.
+    # Keep the 32 logical rows for the reference and LL path, and use -1
+    # for the HT dispatch padding, as in the production expert path.
+    ht_tokens = 128
+    m_indices = torch.full(
+        (ht_tokens,), -1, device=device, dtype=torch.int32
+    )
+    m_indices[:tokens] = 0
     ht_output = torch.empty(
-        (tokens, 2 * physical_intermediate),
+        (ht_tokens, 2 * physical_intermediate),
         device=device,
         dtype=torch.bfloat16,
     )
     m_grouped_w4a8_gemm_nt_contiguous_hipc(
-        (activation, activation_scale),
+        (
+            functional.pad(activation, (0, 0, 0, ht_tokens - tokens)),
+            functional.pad(activation_scale, (0, 0, 0, ht_tokens - tokens)),
+        ),
         (auto.ht_experts._deepgemm_w13, layer.w13_weight_scale),
         ht_output,
         m_indices,
     )
+    ht_output = ht_output[:tokens]
     ll_output = torch.full(
         (num_experts, tokens, 2 * physical_intermediate),
         torch.nan,
