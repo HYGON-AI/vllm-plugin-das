@@ -2399,6 +2399,44 @@ def test_positive_softcap_does_not_reach_direct_pa_with_contiguous_inputs(
     assert result is out and calls == [2.0]
 
 
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("query_len", [1, 3])
+def test_strided_d256_decode_uses_stride_aware_triton(monkeypatch, layout, query_len):
+    from vllm.v1.attention.ops import triton_unified_attention
+
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    physical = torch.zeros(
+        (3, 2, 64, 2, 256) if layout == "NHD" else (3, 2, 2, 64, 256),
+        dtype=torch.bfloat16,
+    )
+    key, value = (physical if layout == "NHD" else physical.transpose(2, 3)).unbind(1)
+    query = torch.zeros(2 * query_len, 4, 256, dtype=torch.bfloat16)
+    backing = torch.zeros(2 * query_len, 4, 512, dtype=torch.bfloat16)
+    output = backing[..., ::2]
+    calls = []
+
+    def triton(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["k"] is key and kwargs["v"] is value
+        assert kwargs["softcap"] == 0.0
+        kwargs["out"].fill_(7)
+
+    monkeypatch.setattr(triton_unified_attention, "unified_attention", triton)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("D256 strided cache must not reach the contiguous PA ABI")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=query, k=key, v=value, out=output,
+        cu_seqlens_q=torch.tensor([0, query_len, 2 * query_len]),
+        max_seqlen_q=query_len, max_seqlen_k=13, seqused_k=torch.tensor([11, 13]),
+        block_table=torch.tensor([[0], [2]]), causal=True,
+    )
+    assert result is output and len(calls) == 1
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+    assert torch.count_nonzero(backing[..., 1::2]) == 0
+
+
 @pytest.mark.parametrize("options,message", [
     ({"dropout_p": 0.1}, "dropout"),
     ({"return_softmax_lse": True}, "LSE"),

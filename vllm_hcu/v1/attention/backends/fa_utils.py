@@ -72,7 +72,7 @@ def _strided_b16_paged_fwd(parameters: dict[str, Any]):
 
 
 def _softcap_b16_paged_fwd(parameters: dict[str, Any]):
-    """Honor positive softcap without using the vendor's unsupported paged ABI."""
+    """Stride-aware Triton path for softcap and D256 paged attention."""
     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
     if parameters.get("q_v") is not None:
@@ -115,7 +115,7 @@ def _softcap_b16_paged_fwd(parameters: dict[str, Any]):
         softmax_scale=q.shape[-1] ** -0.5 if scale is None else scale,
         causal=causal, window_size=window,
         block_table=parameters["block_table"].contiguous(),
-        softcap=parameters["softcap"],
+        softcap=parameters.get("softcap", 0.0),
         q_descale=parameters.get("q_descale"),
         k_descale=parameters.get("k_descale"),
         v_descale=parameters.get("v_descale"),
@@ -194,7 +194,7 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
             isinstance(key_cache, torch.Tensor)
             and key_cache.ndim == 4
             and key_cache.shape[1] == 64
-            and key_cache.shape[-1] == 128
+            and key_cache.shape[-1] in (128, 256)
             and key_cache.dtype in (torch.bfloat16, torch.float16)
         ):
             bound = signature.bind_partial(*args, **kwargs)
@@ -209,7 +209,8 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
             if (
                 isinstance(q, torch.Tensor) and q.ndim == 3
                 and isinstance(v, torch.Tensor) and v.shape == key_cache.shape
-                and q.shape[-1] == 128 and q.dtype == key_cache.dtype == v.dtype
+                and q.shape[-1] == key_cache.shape[-1]
+                and q.dtype == key_cache.dtype == v.dtype
                 and isinstance(cu, torch.Tensor)
                 and isinstance(parameters.get("block_table"), torch.Tensor)
                 and isinstance(parameters.get("seqused_k"), torch.Tensor)
@@ -240,6 +241,10 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
                         )
                     )
                 ):
+                    if key_cache.shape[-1] == 256:
+                        # Qwen3.5 uses D256. Its strided cache cannot enter PA,
+                        # and the native prefix fallback is qualified for D128.
+                        return _softcap_b16_paged_fwd(parameters)
                     return _strided_b16_paged_fwd(parameters)
         layout = _flash_attn_layout()
         if layout == "bhsd":
