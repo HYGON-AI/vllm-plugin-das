@@ -343,15 +343,22 @@ def _native_layer(group_size, backend, **moe_overrides):
 
 
 @pytest.mark.parametrize("architecture", ["HYV4ForCausalLM", "HYV4MTPModel"])
+@pytest.mark.parametrize("architecture_source", ["pretagged", "factory_context"])
 @pytest.mark.parametrize("backend,dp_size,pcp_size,low_latency", [
     ("deepep_low_latency", 8, 1, True),
     ("deepep_high_throughput", 8, 1, False),
     ("deepep_high_throughput", 1, 8, False),
 ])
 def test_hyv4_ct_deepep_keeps_native_loader_and_modular_kernel(
-    monkeypatch, native_wna16, architecture, backend, dp_size, pcp_size, low_latency,
+    monkeypatch, native_wna16, architecture, architecture_source,
+    backend, dp_size, pcp_size, low_latency,
 ):
     from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from vllm import config as vllm_config
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading, initialize_layerwise_reload,
+        finalize_layerwise_reload,
+    )
     from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
     from vllm_hcu.model_executor.layers.fused_moe.experts import dpsk_v4_deep_gemm_moe
     from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_wna16
@@ -391,8 +398,21 @@ def test_hyv4_ct_deepep_keeps_native_loader_and_modular_kernel(
         all2all_backend=backend, use_deepep_auto_kernels=False,
         use_deepep_ll_kernels=low_latency, use_deepep_ht_kernels=not low_latency,
         enable_eplb=False)
-    _, method, layer = _native_layer(-1, "deep_gemm",
-        moe_parallel_config=parallel, _hcu_model_architectures=(architecture,))
+    current = (
+        SimpleNamespace(model_config=SimpleNamespace(architectures=[architecture]))
+        if architecture_source == "factory_context" else None
+    )
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config_or_none", lambda: current)
+    descriptors = {"moe_parallel_config": parallel}
+    if architecture_source == "pretagged":
+        descriptors["_hcu_model_architectures"] = (architecture,)
+    _, method, layer = _native_layer(-1, "deep_gemm", **descriptors)
+    if architecture_source == "factory_context":
+        # The factory tags the original config only after the quant method
+        # has cloned it. Initial post-load still has the current-config scope.
+        assert not hasattr(layer.moe_config, "_hcu_model_architectures")
+        layer.moe_config._hcu_model_architectures = (architecture,)
+        record_metadata_for_reloading(layer)
     # The delegate's admission marker must not mutate the shared MoE descriptor.
     assert not hasattr(layer.moe_config, "_hcu_ct_w4a8")
     assert type(method) is native_wna16.CompressedTensorsWNA16MoEMethod
@@ -404,6 +424,9 @@ def test_hyv4_ct_deepep_keeps_native_loader_and_modular_kernel(
         getattr(layer, prefix + "_weight_packed").data.copy_(
             pack_to_int32(q, 4).transpose(1, 2).contiguous())
         getattr(layer, prefix + "_weight_scale").data.fill_(2.)
+    checkpoint = {
+        name: value.detach().clone() for name, value in layer.named_parameters()
+    }
     method.process_weights_after_loading(layer)
     assert len(calls) == 1 and calls[0]["use_low_latency"] is low_latency
     assert calls[0]["routing_tables"] is tables
@@ -413,6 +436,24 @@ def test_hyv4_ct_deepep_keeps_native_loader_and_modular_kernel(
     x = torch.ones(3, 32, dtype=torch.bfloat16)
     torch.testing.assert_close(method.apply(layer, x, torch.ones(3, 1),
         torch.zeros(3, 1, dtype=torch.int32)), x + 3)
+    if architecture_source == "factory_context":
+        # Reload runs after that scope has ended. Exercise the retained real
+        # CT method, delegate routing, and native restore lifecycle again.
+        current = None
+        initialize_layerwise_reload(layer)
+        for name, value in checkpoint.items():
+            param = getattr(layer, name)
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                param.data.copy_(value)
+            else:
+                loader(param, value)
+        finalize_layerwise_reload(layer, None)
+        assert len(calls) == 2
+        assert method._hcu_ct_w4a8_delegate.moe._hcu_model_architectures == (architecture,)
+        assert layer.quant_method is method and method.supports_internal_mk
+        torch.testing.assert_close(method.apply(layer, x, torch.ones(3, 1),
+            torch.zeros(3, 1, dtype=torch.int32)), x + 3)
 
 
 @pytest.mark.parametrize("group_size", [None, -1])

@@ -255,16 +255,18 @@ def make_hcu_w4a8_method(weight_quant, input_quant, moe, layer_name=None):
 
         # Admit only CT HYV4 fixed DeepEP routes. Keep this marker off
         # the shared descriptor so ordinary SlimQuant routing is unchanged.
+        architectures = tuple(_slimquant_w4a8_deepep_architectures(moe))
         delegate_moe = copy(moe)
         delegate_moe._hcu_ct_w4a8 = True
+        # The factory tags the original config after this copy is made.
+        # Retain its resolved identity for post-load/reload outside the scope.
+        delegate_moe._hcu_model_architectures = architectures
         if (
             getattr(parallel, "all2all_backend", None) not in (
                 "deepep_low_latency", "deepep_high_throughput",
             )
             or getattr(parallel, "use_deepep_auto_kernels", False)
-            or {"HYV4ForCausalLM", "HYV4MTPModel"}.isdisjoint(
-                _slimquant_w4a8_deepep_architectures(delegate_moe)
-            )
+            or {"HYV4ForCausalLM", "HYV4MTPModel"}.isdisjoint(architectures)
             or slimquant_w4a8_fixed_deepep_use_low_latency(delegate_moe) is None
         ):
             raise NotImplementedError(
