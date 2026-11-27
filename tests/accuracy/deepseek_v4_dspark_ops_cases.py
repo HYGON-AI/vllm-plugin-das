@@ -146,7 +146,10 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
         requires_grad=False,
     )
     auto = object.__new__(experts_module.DeepEPAutoW4A8Experts)
-    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=checkpoint_scale))
+    quant_config = SimpleNamespace(
+        _w1=SimpleNamespace(scale=checkpoint_scale),
+        _w2=SimpleNamespace(scale=layer.w2_weight_scale),
+    )
     auto.quant_config = quant_config
     auto._fixed_use_low_latency = None
     auto._use_low_latency_snapshot = False
@@ -280,7 +283,10 @@ def test_auto_w4a8_qwen_padding_matches_ht_and_ll_reference() -> None:
         ),
         requires_grad=False,
     )
-    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=checkpoint_scale))
+    quant_config = SimpleNamespace(
+        _w1=SimpleNamespace(scale=checkpoint_scale),
+        _w2=SimpleNamespace(scale=layer.w2_weight_scale),
+    )
     auto = object.__new__(experts_module.DeepEPAutoW4A8Experts)
     auto.quant_config = quant_config
     auto._fixed_use_low_latency = None
