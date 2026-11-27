@@ -4308,7 +4308,9 @@ def _slimquant_w4a8_auto_experts(fixed_use_low_latency: bool | None):
     )
 
     experts = object.__new__(module.DeepEPAutoW4A8Experts)
-    quant_config = SimpleNamespace(_w1=SimpleNamespace(scale=None))
+    quant_config = SimpleNamespace(
+        _w1=SimpleNamespace(scale=None), _w2=SimpleNamespace(scale=None),
+    )
     experts.quant_config = quant_config
     experts._fixed_use_low_latency = fixed_use_low_latency
     experts._use_low_latency_snapshot = False
@@ -4746,6 +4748,53 @@ def test_slimquant_w4a8_auto_rejects_incompatible_marker_before_repacking(
 
     assert len(pack_calls) == 2
 
+
+@pytest.mark.parametrize("role", [False, True], ids=["fixed_HT", "fixed_LL"])
+def test_slimquant_w4a8_kernel_scale_tracks_native_reload_owner(monkeypatch, role):
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        _copy_and_restore_kernel_tensors, get_layerwise_info,
+    )
+    from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+
+    def configure(experts, layer):
+        config = FusedMoEQuantConfig.make(
+            torch.int8, w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale, per_act_token_quant=True,
+            per_out_ch_quant=False, weight_dtype="int4",
+        )
+        experts.quant_config = config
+        for child in {experts.ht_experts, experts.ll_experts}:
+            child.quant_config = config
+        return config
+
+    _install_in_place_w4a8_packers(monkeypatch)
+    layer = _slimquant_w4a8_auto_layer()
+    experts = _slimquant_w4a8_auto_experts(role)
+    configure(experts, layer)
+    experts.process_weights_after_loading(layer)
+    kernel_parameters = dict(layer.named_parameters(recurse=False))
+    original_scale = layer.w2_weight_scale
+    for name, param in kernel_parameters.items():
+        setattr(layer, name, torch.nn.Parameter(
+            torch.full_like(param, 3 if "scale" in name else 5), requires_grad=False,
+        ))
+    info = get_layerwise_info(layer)
+    info.kernel_tensors = (kernel_parameters, {})
+    replacement = _slimquant_w4a8_auto_experts(role)
+    config = configure(replacement, layer)
+    replacement.process_weights_after_loading(layer)
+    _copy_and_restore_kernel_tensors(layer, LayerReloadingInfo(
+        restore_metadata=({}, {}), restore_device=torch.device("cpu"),
+        kernel_tensors=(kernel_parameters, {}),
+    ))
+    assert layer.w2_weight_scale is original_scale
+    assert config.w2_scale.data_ptr() == original_scale.data_ptr()
+    torch.testing.assert_close(config.w2_scale, torch.full_like(original_scale, 3))
+    with torch.no_grad():
+        original_scale.fill_(7)
+    for owner in (replacement, replacement.ht_experts, replacement.ll_experts):
+        torch.testing.assert_close(owner.quant_config.w2_scale, original_scale)
 
 @pytest.mark.parametrize("failure_mode", ["raise", "wrong_rank"])
 def test_slimquant_w4a8_auto_pack_failure_leaves_fail_closed_marker(

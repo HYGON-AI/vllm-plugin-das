@@ -21,6 +21,7 @@ from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
     aiter_asm_boltops_int8_quant_context,
 )
 from tests.accuracy.deepseek_v4_dspark_ops_cases import (
+    test_auto_w4a8_qwen_padding_matches_ht_and_ll_reference,
     test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert,
     test_contiguous_channel_fp8_deepgemm_matches_dequantized_reference,
     test_contiguous_channel_int8_deepgemm_matches_dequantized_reference,

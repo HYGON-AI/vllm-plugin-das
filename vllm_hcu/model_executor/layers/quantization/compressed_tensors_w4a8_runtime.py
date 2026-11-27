@@ -244,13 +244,35 @@ def make_hcu_w4a8_method(weight_quant, input_quant, moe, layer_name=None):
     parallel = getattr(moe, "moe_parallel_config", None)
     if getattr(parallel, "enable_eplb", False):
         raise NotImplementedError("HCU CT W4A8 does not support EPLB")
+    delegate_moe = moe
     if getattr(parallel, "all2all_backend", None) in (
         "deepep_auto", "deepep_high_throughput", "deepep_low_latency",
     ) or getattr(parallel, "use_deepep_auto_kernels", False):
-        raise NotImplementedError(
-            "HCU CT W4A8 does not support DeepEP; use the AITER expert path "
-            "with allgather_reducescatter for DP+EP"
+        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+            _slimquant_w4a8_deepep_architectures,
+            slimquant_w4a8_fixed_deepep_use_low_latency,
         )
+
+        # Admit only CT HYV4 fixed DeepEP routes. Keep this marker off
+        # the shared descriptor so ordinary SlimQuant routing is unchanged.
+        architectures = tuple(_slimquant_w4a8_deepep_architectures(moe))
+        delegate_moe = copy(moe)
+        delegate_moe._hcu_ct_w4a8 = True
+        # The factory tags the original config after this copy is made.
+        # Retain its resolved identity for post-load/reload outside the scope.
+        delegate_moe._hcu_model_architectures = architectures
+        if (
+            getattr(parallel, "all2all_backend", None) not in (
+                "deepep_low_latency", "deepep_high_throughput",
+            )
+            or getattr(parallel, "use_deepep_auto_kernels", False)
+            or {"HYV4ForCausalLM", "HYV4MTPModel"}.isdisjoint(architectures)
+            or slimquant_w4a8_fixed_deepep_use_low_latency(delegate_moe) is None
+        ):
+            raise NotImplementedError(
+                "HCU CT W4A8 DeepEP supports only HYV4 fixed HT/LL; "
+                "use the AITER expert path with allgather_reducescatter otherwise"
+            )
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
         CompressedTensorsWNA16MoEMethod,
     )
@@ -268,9 +290,28 @@ def make_hcu_w4a8_method(weight_quant, input_quant, moe, layer_name=None):
     # Preserve the loader's exact class identity: RoutedExperts uses it to
     # transpose CT checkpoint tensors and provide intermediate_size_full.
     # None is used only to construct storage; it does not disable A8 execution.
-    method = CompressedTensorsWNA16MoEMethod(weight_quant, None, moe, layer_name)
+    storage_weight = weight_quant
+    storage_moe = moe
+    if delegate_moe is not moe:
+        # DeepGEMM is an execution backend, absent from the native WNA16
+        # oracle. Select only its N-first checkpoint storage here, using the
+        # same group/channel descriptor boundary as the AITER storage adapter.
+        storage_weight = copy(weight_quant)
+        storage_moe = copy(moe)
+        storage_parallel = copy(parallel)
+        object.__setattr__(storage_weight, "strategy", "group")
+        object.__setattr__(storage_moe, "moe_backend", "triton")
+        # Fixed LL advertises batched activations, which the storage-only
+        # Triton oracle rejects. It never executes; keep its format standard
+        # without mutating the real DeepEP execution descriptor.
+        object.__setattr__(storage_parallel, "all2all_backend", "allgather_reducescatter")
+        object.__setattr__(storage_moe, "moe_parallel_config", storage_parallel)
+    method = CompressedTensorsWNA16MoEMethod(storage_weight, None, storage_moe, layer_name)
+    method.weight_quant = weight_quant
+    method.strategy = weight_quant.strategy
+    method.moe = moe
     method.input_quant = input_quant
-    method._hcu_ct_w4a8_delegate = SlimQuantW4A8Int8AiterMoEMethod(None, moe)
+    method._hcu_ct_w4a8_delegate = SlimQuantW4A8Int8AiterMoEMethod(None, delegate_moe)
     method.supports_int8_allgatherv_input = False
     method._hcu_ct_w4a8_create_weights = method.create_weights
     method.create_weights = MethodType(_create_weights, method)

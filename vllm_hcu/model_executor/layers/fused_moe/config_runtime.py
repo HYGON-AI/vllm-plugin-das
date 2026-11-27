@@ -142,7 +142,9 @@ def use_all2all_kernels(parallel_config: object) -> bool:
             or parallel_config.is_sequence_parallel
             or (
                 getattr(parallel_config, "pcp_size", 1) > 1
-                and getattr(parallel_config, "all2all_backend", None) == "deepep_auto"
+                and getattr(parallel_config, "all2all_backend", None) in (
+                    "deepep_auto", "deepep_high_throughput",
+                )
             )
         )
         and parallel_config.use_ep
