@@ -153,6 +153,10 @@ def test_hcu_qwen3_dspark_vendor_kernel_replays_in_cuda_graph(
     # graph capture and replay, against the same backing values.
     reference_kwargs = {
         **common,
+        # The vendor's direct PA ABI requires dense K/V. Keep the original
+        # interleaved views on the plugin path to exercise its stride adapter.
+        "k": k.contiguous(),
+        "v": v.contiguous(),
         "q_descale": scalar_descales[0],
         "k_descale": scalar_descales[1],
         "v_descale": scalar_descales[2],
@@ -184,6 +188,73 @@ def test_hcu_qwen3_dspark_vendor_kernel_replays_in_cuda_graph(
     torch.testing.assert_close(
         actual_out, replay_reference, rtol=1e-2, atol=1e-2
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("query_len", [1, 3])
+@pytest.mark.parametrize("softcap", [0.0, 2.0])
+def test_hcu_d256_strided_decode_matches_reference_and_graph(
+    monkeypatch, dtype, layout, query_len, softcap,
+):
+    from vllm_hcu.v1.attention.backends import fa_utils
+
+    device = _hcu_device()
+    monkeypatch.setattr(fa_utils, "get_kv_cache_layout", lambda: layout)
+    torch.manual_seed(543)
+    physical = torch.randn(
+        (4, 2, 64, 2, 256) if layout == "NHD" else (4, 2, 2, 64, 256),
+        device=device, dtype=dtype,
+    )
+    key, value = (physical if layout == "NHD" else physical.transpose(2, 3)).unbind(1)
+    query = torch.randn(2 * query_len, 4, 512, device=device, dtype=dtype)[..., ::2]
+    backing = torch.full_like(query, -7).repeat_interleave(2, dim=-1)
+    output = backing[..., ::2]
+    cu = torch.tensor([0, query_len, 2 * query_len], device=device, dtype=torch.int32)
+    seq = torch.tensor([65, 81], device=device, dtype=torch.int32)
+    table = torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.int32)
+    window = (7, 0) if softcap else (-1, -1)
+
+    def reference():
+        results = []
+        for batch, length in enumerate((65, 81)):
+            k = key[2 * batch:2 * batch + 2].reshape(128, 2, 256)[:length]
+            v = value[2 * batch:2 * batch + 2].reshape(128, 2, 256)[:length]
+            k = k.repeat_interleave(2, dim=1).float()
+            v = v.repeat_interleave(2, dim=1).float()
+            q = query[batch * query_len:(batch + 1) * query_len].float()
+            scores = torch.einsum("thd,shd->hts", q, k) / 16
+            if softcap:
+                scores = softcap * torch.tanh(scores / softcap)
+            positions = torch.arange(length, device=device)[None, :]
+            end = length - query_len + torch.arange(query_len, device=device)[:, None]
+            mask = positions <= end
+            if window[0] >= 0:
+                mask &= positions >= end - window[0]
+            scores.masked_fill_(~mask[None], float("-inf"))
+            results.append(torch.einsum("hts,shd->thd", scores.softmax(-1), v))
+        return torch.cat(results)
+
+    def run():
+        return fa_utils.varlen_fwd_unified(
+            q=query, k=key, v=value, out=output, cu_seqlens_q=cu,
+            seqused_k=seq, block_table=table, max_seqlen_q=query_len,
+            max_seqlen_k=81, causal=True, window_size=window, softcap=softcap,
+        )
+
+    assert run() is output
+    torch.testing.assert_close(output.float(), reference(), atol=0.015, rtol=0.03)
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    query.mul_(0.5)
+    value.add_(0.25)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(output.float(), reference(), atol=0.015, rtol=0.03)
+    torch.testing.assert_close(backing[..., 1::2], torch.full_like(output, -7))
 
 
 def test_concat_and_cache_mla_e5m2_matches_reference_and_graph() -> None:

@@ -21,6 +21,18 @@ from vllm_hcu.model_executor.layers.quantization import (
 _QWEN = "Qwen4ExpForConditionalGeneration"
 
 
+@pytest.mark.parametrize("backend,expected", [
+    ("deepep_auto", True), ("deepep_high_throughput", True),
+    ("deepep_low_latency", False), ("allgather_reducescatter", False),
+])
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_pcp_deepep_collectives_are_not_replaced_by_runner_gathers(backend, expected, use_ep):
+    from vllm_hcu.model_executor.layers.fused_moe import config_runtime
+    parallel = SimpleNamespace(dp_size=1, pcp_size=8, use_ep=use_ep,
+                               is_sequence_parallel=False, all2all_backend=backend)
+    assert config_runtime.use_all2all_kernels(parallel) is (expected and use_ep)
+
+
 def _moe(
     backend: str,
     architecture: str = _QWEN,
@@ -79,6 +91,35 @@ def test_fixed_deepep_role_for_qwen4exp(
     assert deepep_runtime.slimquant_w4a8_fixed_deepep_use_low_latency(moe) is expected
     # A supported fixed layout is not a deepep_auto route.
     assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is False
+
+
+@pytest.mark.hcu
+@pytest.mark.parametrize("architecture", ["HYV4ForCausalLM", "HYV4MTPModel"])
+@pytest.mark.parametrize("backend,dp_size,pcp_size,expected", [
+    ("deepep_low_latency", 8, 1, True),
+    ("deepep_high_throughput", 8, 1, False),
+    ("deepep_high_throughput", 1, 8, False),
+])
+def test_hyv4_ct_fixed_deepep_role(
+    hcu_runtime, architecture, backend, dp_size, pcp_size, expected,
+):
+    moe = _moe(backend, architecture, dp_size=dp_size,
+               _hcu_ct_w4a8=True)
+    moe.moe_parallel_config.pcp_size = pcp_size
+    assert deepep_runtime.slimquant_w4a8_fixed_deepep_use_low_latency(moe) is expected
+    assert deepep_runtime.slimquant_w4a8_uses_deepep_auto(moe) is False
+
+
+@pytest.mark.hcu
+@pytest.mark.parametrize("architecture", ["HYV4ForCausalLM", "HYV4MTPModel"])
+@pytest.mark.parametrize("backend,ct", [
+    ("deepep_low_latency", False), ("deepep_high_throughput", False),
+])
+def test_hyv4_fixed_role_does_not_expand_other_quantization_or_ht(
+    hcu_runtime, architecture, backend, ct,
+):
+    moe = _moe(backend, architecture, _hcu_ct_w4a8=ct)
+    assert deepep_runtime.slimquant_w4a8_fixed_deepep_use_low_latency(moe) is None
 
 
 @pytest.mark.hcu
