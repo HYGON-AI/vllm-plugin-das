@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 import os
@@ -11,7 +12,7 @@ from types import ModuleType
 from typing import Any
 
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
+from vllm_hcu.patch.config import HY4_MEGAMOE_BACKEND, HcuFeatureConfig, get_hcu_config, set_hcu_config
 
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 from .patch_compilation_config import bind_hcu_config
@@ -154,7 +155,7 @@ def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
 
 
 def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
-    """Admit standalone W4A8 PCP16 and the static image producer."""
+    """Validate standalone and producer HYV4-VL PCP16 configurations."""
     parallel = vllm_config.parallel_config
     model = vllm_config.model_config
     feature = get_hcu_config(vllm_config)
@@ -188,6 +189,15 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
                 "DeepEP HT, DeepGEMM and compressed-tensors W4A8 without EPLB."
             )
         return
+    quant_format = raw_quantization.get("format") if isinstance(raw_quantization, dict) else None
+    standalone_fp8 = (
+        quant_format == "float-quantized" and vllm_config.kv_transfer_config is None
+    )
+    w4a8_producer = (
+        quant_format == "pack-quantized"
+        and vllm_config.kv_transfer_config is not None
+        and vllm_config.speculative_config is None
+    )
     expected = {
         "pipeline_parallel_size": 1,
         "tensor_parallel_size": 1,
@@ -206,12 +216,9 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
         or getattr(getattr(model, "hf_config", None), "model_type", None)
         != "hy_v4_vl"
         or getattr(model, "quantization", None) != "compressed-tensors"
-        or not isinstance(raw_quantization, dict)
-        or raw_quantization.get("format") != "pack-quantized"
+        or not (standalone_fp8 or w4a8_producer)
         or getattr(getattr(vllm_config, "kernel_config", None), "moe_backend", None)
         != "deep_gemm"
-        or vllm_config.speculative_config is not None
-        or vllm_config.kv_transfer_config is None
         or not feature.expert_map_path
         or feature.expert_map_record_path
         or feature.eplb_disable_rearrange
@@ -222,34 +229,59 @@ def _require_hyv4_vl_pcp_contract(vllm_config: object) -> None:
         )
     ):
         raise ValueError(
-            "HYV4-VL PCP requires no MTP, PP1/TP1/PCP16/DP1/DCP1/EP16, "
-            "fixed DeepEP HT/DeepGEMM, compressed-tensors static W4A8 EPLB "
-            "R0 (or experimental R16), and a Mooncake producer."
+            "HYV4-VL static EPLB requires PP1/TP1/PCP16/DP1/DCP1/EP16, "
+            "DeepEP HT/DeepGEMM, compressed-tensors and an offline map with "
+            "R0 or experimental R16. Use standalone channel FP8 or a W4A8 Mooncake producer without MTP."
         )
 
 
 def validate_hyv4_vl_pcp_quantization(vllm_config: object, model: object) -> None:
     """Check native-resolved expert methods before allocating the VL tower.
 
-    The raw packed-format check is only an early filter. Native compressed-tensors
+    The raw checkpoint format check is only an early filter. Native compressed-tensors
     resolution owns targets, ignored modules and mixed groups; inspect every
     resulting expert method rather than reproducing that parser here.
     """
     model_config = getattr(vllm_config, "model_config", None)
     parallel = getattr(vllm_config, "parallel_config", None)
-    if (
-        getattr(model_config, "architectures", None)
-        != ["HYV4VLForConditionalGeneration"]
-        or getattr(parallel, "prefill_context_parallel_size", 1) <= 1
-    ):
+    if getattr(model_config, "architectures", None) != ["HYV4VLForConditionalGeneration"]:
+        return
+    pcp = getattr(parallel, "prefill_context_parallel_size", 1) > 1
+    mega = get_hcu_config(vllm_config).hy4_fp8_megamoe
+    if not (pcp or mega):
         return
 
+    route = "HYV4-VL MegaMoE" if mega else "HYV4-VL PCP"
+    required = "channel FP8" if mega else "static W4A8 or channel FP8"
     try:
         layers = tuple(getattr(model, "moe_layers", ()))
     except TypeError as exc:
-        raise ValueError("HYV4-VL PCP requires resolved static W4A8 MoE layers") from exc
+        raise ValueError(f"{route} requires resolved {required} MoE layers") from exc
     if not layers:
-        raise ValueError("HYV4-VL PCP requires resolved static W4A8 MoE layers")
+        raise ValueError(f"{route} requires resolved {required} MoE layers")
+
+    raw_quantization = getattr(getattr(model_config, "hf_config", None), "quantization_config", None)
+    if mega or (isinstance(raw_quantization, dict) and raw_quantization.get("format") == "float-quantized"):
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import (
+            CompressedTensorsW8A8Fp8MoEMethod,
+        )
+
+        for index, layer in enumerate(layers):
+            method = getattr(getattr(layer, "routed_experts", None), "quant_method", None)
+            if not (
+                isinstance(method, CompressedTensorsW8A8Fp8MoEMethod)
+                and method.weight_quant.strategy == "channel"
+                and method.input_quant.strategy == "token"
+                and method.input_quant.dynamic
+                and method.fp8_backend.value == "HCU_DEEPGEMM"
+                and (not pcp or method.supports_eplb)
+            ):
+                raise ValueError(
+                    f"{route} MoE layer {index} requires channel FP8 weights, "
+                    "dynamic per-token FP8 activations and HCU DeepGEMM"
+                    + (" with EPLB" if pcp else "")
+                )
+        return
 
     from vllm_hcu.model_executor.layers.quantization.compressed_tensors_w4a8_moe import (
         HCU_COMPRESSED_W4A8_METHOD_MARKER,
@@ -481,6 +513,23 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
         f"MooncakeConnector; got connector={connector!r}, "
         f"architectures={architectures!r}."
     )
+
+
+def _resolve_hy4_megamoe_backend(config):
+    kernel = getattr(config, "kernel_config", None)
+    if getattr(kernel, "moe_backend", None) != HY4_MEGAMOE_BACKEND:
+        return
+    arch = getattr(config.model_config, "architectures", None)
+    quant = getattr(getattr(config.model_config, "hf_config", None), "quantization_config", None)
+    text_w4 = (arch == ["HYV4ForCausalLM"] and config.model_config.quantization == "compressed-tensors"
+               and isinstance(quant, dict) and quant.get("format") == "pack-quantized")
+    if not text_w4 and arch != ["HYV4VLForConditionalGeneration"]:
+        return
+    config.kernel_config = copy.copy(kernel)
+    config.kernel_config.moe_backend = "deep_gemm"
+    config.additional_config = dict(config.additional_config or {})
+    set_hcu_config(config, moe_backend="deep_gemm", hy4_fp8_megamoe=not text_w4,
+                   hy4_w4a8_megamoe=text_w4)
 
 
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
@@ -726,6 +775,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(post_init)
     def hcu_post_init(self):
+        _resolve_hy4_megamoe_backend(self)
         _apply_kimi_k3_source_compilation_defaults(self)
         return post_init(self)
 

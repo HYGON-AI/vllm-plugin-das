@@ -53,6 +53,8 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "enable_custom_sp": False,
                 "enable_multi_layers_mtp": False,
                 "deepep_auto": False,
+                "hy4_fp8_megamoe": False,
+                "hy4_w4a8_megamoe": False,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
                 "expert_map_path": None,
