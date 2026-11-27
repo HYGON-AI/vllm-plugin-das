@@ -323,6 +323,18 @@ class _HYV4CheckpointAccounting:
         for name, param in model.named_parameters():
             if isinstance(param, KVCacheScaleParameter):
                 continue
+            module_name, _, parameter_name = name.rpartition(".")
+            if parameter_name in {
+                "w13_weight_g_idx", "w2_weight_g_idx",
+                "w13_g_idx_sort_indices", "w2_g_idx_sort_indices",
+                "w13_qzeros", "w2_qzeros",
+            }:
+                method = getattr(model.get_submodule(module_name), "quant_method", None)
+                if hasattr(method, "_hcu_ct_w4a8_delegate"):
+                    # WNA16 creates activation-order scratch and synthetic
+                    # offset-binary zero points for storage. The symmetric
+                    # channel W4A8 checkpoint supplies neither of them.
+                    continue
             parts = name.split(".")
             if "gate_up_proj" in parts or "wk_weights_proj" in parts:
                 slots = {0, 1}
