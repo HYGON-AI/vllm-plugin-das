@@ -2434,3 +2434,57 @@ def test_positive_softcap_rejects_unsupported_options_before_vendor_dispatch(
             max_seqlen_k=13, seqused_k=torch.tensor([13]),
             block_table=torch.tensor([[0]]), causal=True, softcap=2.0, **options,
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("query_len", [1, 3])
+@pytest.mark.parametrize("causal,window,allowed", [
+    (False, (0, -1), False),
+    (False, (3, -1), False),
+    (False, (-1, 0), False),
+    (False, (-1, 3), False),
+    (False, (0, 0), False),
+    (False, (3, 3), False),
+    (False, (2, 5), False),
+    (False, (-1, -1), True),
+    (True, (0, -1), True),
+    (True, (3, 0), True),
+])
+def test_paged_softcap_window_admission_preserves_mask_semantics(
+    monkeypatch, dtype, query_len, causal, window, allowed,
+):
+    from vllm.v1.attention.ops import triton_unified_attention
+
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    q = torch.zeros(query_len, 4, 128, dtype=dtype)
+    k = torch.zeros(1, 64, 2, 128, dtype=dtype)
+    out = torch.empty_like(q)
+    calls = []
+
+    def triton(**kwargs):
+        assert allowed, "unsupported window reached a kernel with different mask semantics"
+        assert kwargs["window_size"] == window
+        assert kwargs["causal"] == causal
+        calls.append(True)
+        kwargs["out"].fill_(7)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("positive softcap must not reach the vendor direct PA path")
+
+    monkeypatch.setattr(triton_unified_attention, "unified_attention", triton)
+    wrapped = fa_utils._with_kv_cache_layout(vendor, "probe")
+    kwargs = dict(
+        q=q, k=k, v=k, out=out,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len, max_seqlen_k=13,
+        seqused_k=torch.tensor([13], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        causal=causal, window_size=window, softcap=2.0,
+    )
+    if allowed:
+        assert wrapped(**kwargs) is out
+        assert calls == [True]
+    else:
+        with pytest.raises(NotImplementedError, match="noncausal.*window"):
+            wrapped(**kwargs)
+        assert not calls

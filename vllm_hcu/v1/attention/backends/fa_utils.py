@@ -91,9 +91,13 @@ def _softcap_b16_paged_fwd(parameters: dict[str, Any]):
         )
     window = parameters.get("window_size") or (-1, -1)
     causal = parameters.get("causal", False)
-    if not causal and window[1] >= 0:
+    # Triton derives a symmetric noncausal window from the left bound; it
+    # cannot preserve independently specified one-sided FlashAttention bounds.
+    # Keep noncausal admission global-only until windowed cases are qualified.
+    if not causal and (window[0] >= 0 or window[1] >= 0):
         raise NotImplementedError(
-            "HCU paged B16 softcap fallback does not support a noncausal right window"
+            "HCU paged B16 softcap fallback only supports a global noncausal window; "
+            "finite left/right windows are unsupported"
         )
     q = parameters["q"].contiguous()
     output = parameters.get("out")
