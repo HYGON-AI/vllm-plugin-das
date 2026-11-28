@@ -116,6 +116,12 @@ Require `HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES=hy4-ct-w4a8` for HY4 validation.
 This is a source candidate: offline-R16 model binding, native ABI, checkpoint
 accuracy and performance remain open in the ledger.
 
+Standard `hy_v4_vl` checkpoints use the paired Core VL wrapper and their original
+INT4/INT8 recipes. Native checkpoint DFly is selected separately with the
+`hy4-dfly` capability and `--speculative-config '{"method":"dfly"}'`.
+See [standard HY4 VL and DFly](../docs/hy4_vl_dfly.md) for the required Core
+backport, DP16 topology and validation scope.
+
 The owned HY4 CT/static backbone can opt into native iHC launch tuning with
 `VLLM_HCU_USE_CUSTOM_OPS=1 HCU_VLLM_HY4_IHC_LAUNCH=1`. It uses the original
 Core kernels with stage-1/stage-2 warps 4/4 on gfx938, BF16, hidden size 6144,

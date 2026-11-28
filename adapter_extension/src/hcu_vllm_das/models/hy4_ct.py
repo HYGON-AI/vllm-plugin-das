@@ -23,6 +23,9 @@ class HcuHY4CTLaunchBackbone(HcuHY4CTBackbone):
 
 
 def make_ct_backbone(*, vllm_config, prefix=''):
+    if getattr(vllm_config.speculative_config, "method", None) == "dfly":
+        from .hy_v4_flash.dfly_compat import validate_dfly_runtime
+        validate_dfly_runtime(vllm_config)
     hy4_dp_metadata.prepare(vllm_config)
     cls = HcuHY4CTLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4CTBackbone
     return fused_routing.attach(

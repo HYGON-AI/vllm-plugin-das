@@ -8,7 +8,17 @@ NAME = 'hcu_hy4_ct_w4a8'
 
 def is_hy4(config):
     # Core renames the same checkpoint when building its native MTP draft.
-    return getattr(config, 'model_type', None) in ('hy_v4', 'hy_v4_mtp')
+    kind = getattr(config, 'model_type', None)
+    if kind in ('hy_v4', 'hy_v4_mtp'):
+        return True
+    if kind == 'hy_v4_dfly':
+        return getattr(config, 'dfly_target_model_type', None) == 'hy_v4'
+    # ModelConfig retains the VL outer config while constructing both towers.
+    # Admit only a standard HY4 text tower; Core still selects each layer's
+    # original checkpoint scheme, including unquantized vision parameters.
+    return (kind == 'hy_v4_vl'
+            and getattr(getattr(config, 'text_config', None), 'model_type', None)
+            == 'hy_v4')
 
 
 def accepts_checkpoint(quant, user_quant, hf_config):

@@ -30,6 +30,7 @@ das_hcu_hyv4_flash_config = "hcu_vllm_das.hyv4_flash_config_activation:extension
 das_hcu_hyv4_flash_model = "hcu_vllm_das.hyv4_flash_model_activation:extension_spec"
 das_hcu_hy4_frontend = "hcu_vllm_das.hy4_frontend:extension_spec"
 das_hcu_hy4_ct_w4a8 = "hcu_vllm_das.hy4_quant_activation:extension_spec"
+das_hcu_hy4_dfly = "hcu_vllm_das.hy4_dfly_activation:extension_spec"
 das_hcu_hy4_static = "hcu_vllm_das.hy4_static_activation:extension_spec"
 minimax31_slimquant = "hcu_vllm_das.quantization.minimax31_activation:extension_spec"
 minimax31_pcp_ep = "hcu_vllm_das.parallel.minimax31_pcp_activation:extension_spec"

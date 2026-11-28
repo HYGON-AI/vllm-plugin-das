@@ -167,15 +167,20 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         parallel = self.target_parallel_config
         if target is None or parallel is None:
             raise ValueError("DFly requires target model and parallel configuration")
-        if target.hf_text_config.model_type != "hy_v4_flash":
-            raise ValueError("HCU DFly requires a HYV4 Flash target")
+        family = target.hf_text_config.model_type
+        if family not in ("hy_v4_flash", "hy_v4"):
+            raise ValueError("HCU DFly requires a standard HYV4 or HYV4 Flash target")
         if target.dtype != torch.bfloat16:
             raise ValueError("DFly requires bfloat16 compute")
-        for name in ("data_parallel_size", "pipeline_parallel_size",
-                     "prefill_context_parallel_size", "decode_context_parallel_size"):
-            if getattr(parallel, name) != 1:
-                raise ValueError(f"HCU v0.33 DFly requires {name}=1")
-        if target.supports_multimodal_inputs:
+        if family == "hy_v4":
+            from .dfly_topology import validate_standard_dfly_parallel
+            validate_standard_dfly_parallel(parallel, enforce_eager=target.enforce_eager)
+        else:
+            for name in ("data_parallel_size", "pipeline_parallel_size",
+                         "prefill_context_parallel_size", "decode_context_parallel_size"):
+                if getattr(parallel, name) != 1:
+                    raise ValueError(f"HCU v0.33 DFly requires {name}=1")
+        if family == "hy_v4_flash" and target.supports_multimodal_inputs:
             raise NotImplementedError("First qualify HCU DFly with image/video limits set to zero")
         # None inherits the target policy; an explicitly eager draft is still
         # useful with target graphs. Never force target graphs off for DFly.
@@ -196,6 +201,9 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         if self.kv_cache_dtype not in (None, "auto", "bfloat16", "fp8_ds_mla"):
             raise ValueError("DFly requires BF16 or fp8_ds_mla KV cache")
         n = self.num_speculative_tokens
+        if family == "hy_v4":
+            from vllm.models.hy_v4.dfly_config import resolve_dfly_width
+            n = resolve_dfly_width(target.hf_config, n)
         if n is None:
             block = getattr(target.hf_config, "dfly_block_size", None)
             if type(block) is not int or not 2 <= block <= 17:
@@ -208,11 +216,20 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
             raise ValueError("DFly draft weights must come from the target checkpoint")
         if self.quantization not in (None, target.quantization):
             raise ValueError("DFly must preserve checkpoint quantization")
-        if target.quantization not in (None, "fp8", "compressed-tensors"):
+        if target.quantization not in (None, "fp8", "compressed-tensors", "hcu_hy4_ct_w4a8"):
             raise ValueError("Unsupported HCU DFly target quantization")
-        if target.quantization is not None:
-            validate_flash_quant_config(target.model_arch_config.quantization_config)
-        derived = derive_flash_dfly_config(target.hf_config)
+        if family == "hy_v4_flash":
+            if target.quantization is not None:
+                validate_flash_quant_config(target.model_arch_config.quantization_config)
+            derived = derive_flash_dfly_config(target.hf_config)
+        else:
+            from vllm.models.hy_v4.dfly_config import derive_standard_dfly_config
+            if target.quantization is not None:
+                from ...quantization.hy4_ct_policy import accepts_checkpoint
+                if not accepts_checkpoint(target.model_arch_config.quantization_config,
+                                          target.quantization, target.hf_config):
+                    raise ValueError("Standard DFly requires the admitted HY4 CT checkpoint recipe")
+            derived = derive_standard_dfly_config(target.hf_config)
         for size in (derived.num_attention_heads, derived.dfly_intermediate_size,
                      derived.hidden_correction_intermediate_size):
             if size is not None and size % parallel.tensor_parallel_size:
@@ -251,6 +268,9 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         )
         self.draft_parallel_config = self.create_draft_parallel_config(
             parallel, parallel.tensor_parallel_size, self.draft_model_config)
+        if family == "hy_v4" and parallel.data_parallel_size > 1:
+            from .dfly_topology import make_rank_local_draft_parallel
+            self.draft_parallel_config = make_rank_local_draft_parallel(parallel)
 
     def use_eagle(self) -> bool:
         # In v0.33 this public predicate means "consumes target hidden states".
