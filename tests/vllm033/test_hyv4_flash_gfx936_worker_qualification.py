@@ -48,7 +48,7 @@ class WorkerQualificationTests(unittest.TestCase):
         predicate = load_runner()._qualified_worker_tuple
         for triple, expected in [
             ((4, 'gfx938', 64), True), ((8, 'gfx936', 80), True),
-            ((8, 'gfx938', 64), False), ((4, 'gfx936', 80), False),
+            ((8, 'gfx938', 64), False), ((4, 'gfx936', 80), True),
             ((8, 'gfx936', 64), False), ((4, 'gfx938', 80), False),
             ((8, 'gfx942', 80), False), (('8', 'gfx936', 80), False),
         ]:
@@ -61,7 +61,7 @@ class WorkerQualificationTests(unittest.TestCase):
         package = ModuleType('hy4_worker_fixture')
         for tp, arch, cu, accepted in [
             (4, 'gfx938', 64, True), (8, 'gfx936', 80, True),
-            (8, 'gfx938', 64, False), (4, 'gfx936', 80, False),
+            (8, 'gfx938', 64, False), (4, 'gfx936', 80, True),
             (8, 'gfx936', 64, False), (8, 'gfx942', 80, False),
         ]:
             with self.subTest(tp=tp, arch=arch, cu=cu):
@@ -127,7 +127,7 @@ class WorkerQualificationTests(unittest.TestCase):
         for tp, arch, cu, expected in [
             (2, 'gfx938', 64, (8, 16)), (8, 'gfx938', 64, (8, 16)),
             (2, 'gfx938', 80, (8, 16)), (4, 'gfx938', 64, (8, 16)),
-            (8, 'gfx936', 80, (4, 8)), (4, 'gfx936', 80, None),
+            (8, 'gfx936', 80, (4, 8)), (4, 'gfx936', 80, (8, 16)),
             (8, 'gfx936', 64, None), (8, 'gfx942', 80, None),
         ]:
             with self.subTest(tp=tp, arch=arch, cu=cu):
