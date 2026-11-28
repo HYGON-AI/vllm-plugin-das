@@ -6,6 +6,7 @@ import functools
 import importlib
 import inspect
 from collections.abc import Callable
+from math import prod
 from typing import Any
 
 import torch
@@ -50,9 +51,20 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
             f"HCU requires flash_attn.{name} to expose a keyword-compatible "
             "layout parameter"
         )
+    parameter_positions = tuple(signature.parameters)
     layout_position = (
-        tuple(signature.parameters).index("layout")
+        parameter_positions.index("layout")
         if layout_parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        else None
+    )
+    block_table_position = (
+        parameter_positions.index("block_table")
+        if "block_table" in signature.parameters
+        else None
+    )
+    max_seqlen_q_position = (
+        parameter_positions.index("max_seqlen_q")
+        if "max_seqlen_q" in signature.parameters
         else None
     )
 
@@ -140,9 +152,112 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
             kwargs.pop("layout", None)
         else:
             kwargs["layout"] = layout
-        return function(*args, **kwargs)
+        # The HCU paged-attention ABI requires every PA tensor to be
+        # contiguous. Keep the layout normalization above zero-copy, then
+        # adapt the interleaved K/V pages and the small metadata tensors before
+        # entering the vendor wrapper. Non-paged calls retain the original
+        # call path and argument behavior.
+        block_table = kwargs.get("block_table")
+        if block_table is None and block_table_position is not None:
+            if len(args) > block_table_position:
+                block_table = args[block_table_position]
+        max_seqlen_q = kwargs.get("max_seqlen_q")
+        if max_seqlen_q is None and max_seqlen_q_position is not None:
+            if len(args) > max_seqlen_q_position:
+                max_seqlen_q = args[max_seqlen_q_position]
+        if block_table is None or max_seqlen_q != 1:
+            return function(*args, **kwargs)
+        bound = signature.bind_partial(*args, **kwargs)
+        arguments = dict(bound.arguments)
+        for parameter in signature.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                arguments.update(arguments.pop(parameter.name, {}))
+        return run_paged_attention(function, arguments)
 
     return wrapped
+
+
+def _page_view(cache: torch.Tensor) -> tuple[torch.Tensor, int | None]:
+    """Expose dense virtual pages for an interleaved K/V cache view.
+
+    vLLM's fused cache stores K and V pages next to each other. The logical
+    K/V views therefore have a page stride of two pages even though each page
+    is dense internally. The vendor PA ABI only accepts a contiguous page
+    tensor, so expose the intervening pages as a zero-copy view and remap the
+    block table to the even/odd virtual page IDs. The cache allocation and
+    writer views remain unchanged.
+    """
+    if cache.is_contiguous():
+        return cache, 1
+    if cache.ndim != 4 or cache.shape[0] == 0 or not cache[0].is_contiguous():
+        raise ValueError("HCU PA requires dense contents within each KV page")
+    page_elements = prod(cache.shape[1:])
+    if cache.stride(0) < page_elements:
+        raise ValueError("HCU PA KV pages overlap")
+    if cache.stride(0) % page_elements:
+        return cache, None
+    ratio = cache.stride(0) // page_elements
+    # Do not expose the trailing unused half-page after the final real page.
+    shape = ((cache.shape[0] - 1) * ratio + 1, *cache.shape[1:])
+    view = torch.as_strided(cache, shape, (page_elements, *cache.stride()[1:]))
+    return view, ratio
+
+
+def run_paged_attention(
+    vendor: Callable[..., Any], kwargs: dict[str, Any]
+) -> Any:
+    """Adapt single-token paged calls to the contiguous vendor PA ABI."""
+    # Long/chunked prefill and unpacked varlen calls use the vendor's native
+    # path. This seam is only needed for the paged single-token decode path.
+    if kwargs.get("block_table") is None or kwargs.get("max_seqlen_q") != 1:
+        return vendor(**kwargs)
+
+    arguments = dict(kwargs)
+    key, key_ratio = _page_view(arguments["k"])
+    value, value_ratio = _page_view(arguments["v"])
+    if key_ratio != value_ratio:
+        raise ValueError("HCU PA requires K and V to have the same page stride")
+    arguments.update(k=key, v=value)
+
+    block_table = arguments["block_table"]
+    if key_ratio is not None and key_ratio != 1:
+        block_table = block_table * key_ratio
+    arguments["block_table"] = block_table.contiguous()
+
+    for name in (
+        "q",
+        "seqused_k",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "alibi_slopes",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+    ):
+        tensor = arguments.get(name)
+        if tensor is not None:
+            arguments[name] = tensor.contiguous()
+
+    output = arguments.get("out")
+    if output is not None and not output.is_contiguous():
+        arguments["out"] = torch.empty_like(
+            output, memory_format=torch.contiguous_format
+        )
+
+    if key_ratio is None:
+        # A non-integral page stride cannot be represented by integer page
+        # IDs. Materialize only this bounded cache view as a correctness
+        # fallback; normal vLLM HND/NHD allocations use integral page ratios.
+        arguments["k"] = key.contiguous()
+        arguments["v"] = value.contiguous()
+
+    result = vendor(**arguments)
+    if output is not None and arguments.get("out") is not output:
+        output.copy_(arguments["out"])
+        if isinstance(result, tuple):
+            return (output, *result[1:])
+        return output
+    return result
 
 
 # The target vendor FlashAttention owns paged-to-contiguous workspace sizing

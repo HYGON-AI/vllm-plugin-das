@@ -326,6 +326,78 @@ def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
     assert key.stride() == original_stride
 
 
+def test_hcu_fa_paged_decode_materializes_contiguous_pa_views(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    blocks, heads, page_size, head_size = 3, 2, 64, 8
+    # Match the physical HND cache layout: [block, K/V, head, token, dim].
+    backing = torch.arange(
+        blocks * 2 * heads * page_size * head_size,
+        dtype=torch.float32,
+    ).reshape(blocks, 2, heads, page_size, head_size)
+    logical = backing.permute(0, 1, 3, 2, 4)
+    key, value = logical.unbind(1)
+    output_backing = torch.full(
+        (blocks, heads * 2, head_size), -1.0,
+    )
+    output = output_backing[:, ::2]
+    table_backing = torch.tensor(
+        [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]],
+        dtype=torch.int32,
+    )
+    block_table = table_backing[:, ::2]
+    cuq_backing = torch.arange(2 * (blocks + 1), dtype=torch.int32)
+    cu_seqlens_q = cuq_backing[::2]
+    lens_backing = torch.tensor(
+        [page_size, 0, 2 * page_size, 0, 3 * page_size],
+        dtype=torch.int32,
+    )
+    seqused_k = lens_backing[::2]
+    seen = {}
+
+    def vendor(
+        *, q, k, v, out=None, block_table=None, max_seqlen_q=None,
+        layout="bshd", **kwargs,
+    ):
+        seen.update(
+            dict(
+                q=q, k=k, v=v, out=out, block_table=block_table,
+                max_seqlen_q=max_seqlen_q, layout=layout, **kwargs,
+            )
+        )
+        assert k.is_contiguous()
+        assert v.is_contiguous()
+        assert q.is_contiguous()
+        assert out.is_contiguous()
+        assert block_table.is_contiguous()
+        out.fill_(7.0)
+        return out, torch.zeros(1)
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=torch.zeros(blocks, heads, head_size),
+        k=key,
+        v=value,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        max_seqlen_q=1,
+    )
+
+    assert isinstance(result, tuple)
+    assert result[0].data_ptr() == output.data_ptr()
+    torch.testing.assert_close(output, torch.full_like(output, 7.0))
+    assert seen["layout"] == "bhsd"
+    torch.testing.assert_close(
+        seen["block_table"], block_table.contiguous() * 2,
+    )
+    assert seen["k"].shape == (blocks * 2 - 1, heads, page_size, head_size)
+    assert seen["v"].shape == seen["k"].shape
+    assert seen["k"].data_ptr() == key.data_ptr()
+    assert seen["v"].data_ptr() == value.data_ptr()
+
+
 def test_hcu_fa_boundary_uses_bshd_compat_view_for_hnd_128_pages(monkeypatch):
     fa_utils, _ = _load_hcu_fa_utils_module(
         monkeypatch, kv_cache_layout="HND",
