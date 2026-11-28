@@ -1296,7 +1296,16 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         )
 
     def _restore_scale_and_bind(self, layer, runtime, w13, w2, _w13_scale) -> None:
+        from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
         scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+        kernel_tensors = get_layerwise_info(layer).kernel_tensors
+        if kernel_tensors is not None:
+            # Native reload restores persistent kernel Parameters after this
+            # hook. Bind the final owner now: retaining the temporary scale
+            # would miss later in-place updates and captured graph replay.
+            w2_scale = kernel_tensors[0].get("w2_weight_scale", w2_scale)
         configs = {
             id(config): config
             for config in (
@@ -1307,6 +1316,7 @@ class DeepEPAutoW4A8Experts(DeepEPAutoDeepGemmExperts):
         }.values()
         for config in configs:
             config._w1.scale = scale
+            config._w2.scale = w2_scale
         if self._fixed_use_low_latency is not False:
             # BatchedDeepGemmExperts normally seeds these from the logical
             # model config. HIPC must instead size its masked output and

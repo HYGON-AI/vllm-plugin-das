@@ -45,7 +45,8 @@ def test_tp2_group128_moec_hipc(num_tokens):
             f"need_shuffle_scale={config.need_shuffle_scale}"
         )
         assert ok and config.solution_type == "moe_c"
-        if getattr(config, "block_size", None) is None:
+        selected_group = getattr(config, "block_size", None)
+        if selected_group is None and config.need_shuffle_scale:
             from vllm_hcu.model_executor.layers.quantization.grouped_w4a16_moe_runtime import (
                 apply_grouped_w4a16_moe,
             )
@@ -63,7 +64,7 @@ def test_tp2_group128_moec_hipc(num_tokens):
                 "silu", e, None, None, None, None, False,
             )
             return
-        assert config.block_size == 128
+        assert selected_group in (None, 128)
         c_s1, c_s2 = aiter_moe_shfl_scale(s1, s2, config)
         out = aiter_moe(
             hidden_states=x, w1=w1, w2=w2, topk_weights=weights, topk_ids=ids,

@@ -35,6 +35,100 @@ def _flash_attn_layout() -> str:
     raise ValueError(f"Unknown cache layout format {cache_layout}.")
 
 
+def _strided_b16_paged_fwd(parameters: dict[str, Any]):
+    """Use the stride-aware D128 prefix kernel without copying the KV cache."""
+    q, k, v = (parameters[name] for name in ("q", "k", "v"))
+    output = parameters.get("out")
+    native_output = (
+        torch.empty_like(output, memory_format=torch.contiguous_format)
+        if output is not None and not output.is_contiguous()
+        else output
+    )
+    window = parameters.get("window_size") or (-1, -1)
+    softmax_scale = parameters.get("softmax_scale")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    cu = parameters["cu_seqlens_q"].contiguous()
+    result = flash_attn_2_cuda.varlen_fwd(
+        q.contiguous(), k, v, native_output, cu,
+        # The cumulative K lengths are unused for paged attention.
+        cu, parameters["seqused_k"].contiguous(), None,
+        parameters["block_table"].contiguous(), parameters.get("alibi_slopes"),
+        parameters["max_seqlen_q"], parameters["max_seqlen_k"],
+        parameters.get("dropout_p", 0.0),
+        softmax_scale,
+        False, parameters.get("causal", False), window[0], window[1],
+        parameters.get("softcap", 0.0), False,
+        parameters.get("q_descale"), parameters.get("k_descale"),
+        parameters.get("v_descale"), None, parameters.get("s_aux"),
+    )
+    native_output = result[0]
+    if output is not None and native_output is not output:
+        output.copy_(native_output)
+    else:
+        output = native_output
+    if parameters.get("return_softmax_lse", False):
+        return output, result[5], result[6]
+    return output
+
+
+def _softcap_b16_paged_fwd(parameters: dict[str, Any]):
+    """Stride-aware Triton path for softcap and D256 paged attention."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    if parameters.get("q_v") is not None:
+        raise NotImplementedError("HCU paged B16 softcap fallback does not support q_v")
+    if parameters.get("cp_world_size", 1) != 1:
+        raise NotImplementedError(
+            "HCU paged B16 softcap fallback does not support context parallel attention"
+        )
+    if (
+        parameters.get("dropout_p", 0.0) != 0.0
+        or parameters.get("return_softmax_lse", False)
+        or parameters.get("return_attn_probs", False)
+    ):
+        raise NotImplementedError(
+            "HCU paged B16 softcap fallback does not support dropout or returning LSE/probabilities"
+        )
+    window = parameters.get("window_size") or (-1, -1)
+    causal = parameters.get("causal", False)
+    # Triton derives a symmetric noncausal window from the left bound; it
+    # cannot preserve independently specified one-sided FlashAttention bounds.
+    # Keep noncausal admission global-only until windowed cases are qualified.
+    if not causal and (window[0] >= 0 or window[1] >= 0):
+        raise NotImplementedError(
+            "HCU paged B16 softcap fallback only supports a global noncausal window; "
+            "finite left/right windows are unsupported"
+        )
+    q = parameters["q"].contiguous()
+    output = parameters.get("out")
+    contiguous_output = (
+        output if output is not None and output.is_contiguous()
+        else torch.empty_like(q)
+    )
+    scale = parameters.get("softmax_scale")
+    unified_attention(
+        q=q, k=parameters["k"], v=parameters["v"], out=contiguous_output,
+        cu_seqlens_q=parameters["cu_seqlens_q"].contiguous(),
+        max_seqlen_q=parameters["max_seqlen_q"],
+        seqused_k=parameters["seqused_k"].contiguous(),
+        max_seqlen_k=parameters["max_seqlen_k"],
+        softmax_scale=q.shape[-1] ** -0.5 if scale is None else scale,
+        causal=causal, window_size=window,
+        block_table=parameters["block_table"].contiguous(),
+        softcap=parameters.get("softcap", 0.0),
+        q_descale=parameters.get("q_descale"),
+        k_descale=parameters.get("k_descale"),
+        v_descale=parameters.get("v_descale"),
+        alibi_slopes=parameters.get("alibi_slopes"), sinks=parameters.get("s_aux"),
+    )
+    if output is None:
+        return contiguous_output
+    if contiguous_output is not output:
+        output.copy_(contiguous_output)
+    return output
+
+
 def _with_kv_cache_layout(function: Callable[..., Any], name: str):
     try:
         signature = inspect.signature(function)
@@ -103,6 +197,67 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
                     else:
                         kwargs[parameter] = scalar
             args = tuple(positional)
+        # vLLM's [block, K/V, token, head, channel] allocation interleaves
+        # K/V pages. Its unbound caches are strided even in native NHD/HND
+        # order. The gfx938 direct PA ABI rejects those views. The B16 D128
+        # prefix kernel accepts their strides, so retain the original logical
+        # bshd views instead of materializing the entire cache each decode.
+        if (
+            isinstance(key_cache, torch.Tensor)
+            and key_cache.ndim == 4
+            and key_cache.shape[1] == 64
+            and key_cache.shape[-1] in (128, 256)
+            and key_cache.dtype in (torch.bfloat16, torch.float16)
+        ):
+            bound = signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            parameters = dict(bound.arguments)
+            for parameter in signature.parameters.values():
+                if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    parameters.update(parameters.pop(parameter.name, {}))
+            q, v = parameters.get("q"), parameters.get("v")
+            cu = parameters.get("cu_seqlens_q")
+            max_q = parameters.get("max_seqlen_q", 0)
+            if (
+                isinstance(q, torch.Tensor) and q.ndim == 3
+                and isinstance(v, torch.Tensor) and v.shape == key_cache.shape
+                and q.shape[-1] == key_cache.shape[-1]
+                and q.dtype == key_cache.dtype == v.dtype
+                and isinstance(cu, torch.Tensor)
+                and isinstance(parameters.get("block_table"), torch.Tensor)
+                and isinstance(parameters.get("seqused_k"), torch.Tensor)
+                and (
+                    max_q == 1
+                    or (
+                        1 < max_q < 16
+                        and max_q * (cu.shape[0] - 1) == q.shape[0]
+                        and max_q * q.shape[1] <= 64 * key_cache.shape[2]
+                    )
+                )
+            ):
+                if parameters.get("softcap", 0.0) > 0.0:
+                    # The native paged varlen ABI rejects positive softcap,
+                    # while direct PA silently ignores it. Triton implements it.
+                    return _softcap_b16_paged_fwd(parameters)
+                if (
+                    parameters.get("q_v") is None
+                    and parameters.get("cp_world_size", 1) == 1
+                    and not parameters.get("return_attn_probs", False)
+                    and (
+                        not key_cache.is_contiguous()
+                        or not v.is_contiguous()
+                        or not q.is_contiguous()
+                        or (
+                            isinstance(parameters.get("out"), torch.Tensor)
+                            and not parameters["out"].is_contiguous()
+                        )
+                    )
+                ):
+                    if key_cache.shape[-1] == 256:
+                        # Qwen3.5 uses D256. Its strided cache cannot enter PA,
+                        # and the native prefix fallback is qualified for D128.
+                        return _softcap_b16_paged_fwd(parameters)
+                    return _strided_b16_paged_fwd(parameters)
         layout = _flash_attn_layout()
         if layout == "bhsd":
             key_cache = args[1] if len(args) > 1 else kwargs.get("k")

@@ -246,7 +246,7 @@ def slimquant_w4a8_uses_deepep_auto(moe_config: object) -> bool:
             "incompatible all-to-all "
             f"backend {all2all_backend!r} is unsupported "
             "(fixed deepep_high_throughput/deepep_low_latency are "
-            "supported only for Qwen4Exp)"
+            "supported only for Qwen4Exp or the HYV4 CT adapter)"
         )
 
     if all2all_backend != "deepep_auto":
@@ -345,7 +345,7 @@ def slimquant_w4a8_fixed_deepep_use_low_latency(
 
     Returns ``False`` for ``deepep_high_throughput`` and ``True`` for
     ``deepep_low_latency`` when the model is a supported SiLU architecture
-    (Qwen4Exp), and ``None`` for every other combination so the caller keeps
+    (Qwen4Exp or CT HYV4), and ``None`` for every other combination so the caller keeps
     its existing routing.  Both fixed layouts reuse the role-fixed SiLU
     HIPC experts of ``deepep_auto``, which already pad Qwen's 640-wide
     intermediate dimension to the HIPC contract.
@@ -356,12 +356,29 @@ def slimquant_w4a8_fixed_deepep_use_low_latency(
     if all2all_backend not in ("deepep_high_throughput", "deepep_low_latency"):
         return None
     architectures = _slimquant_w4a8_deepep_architectures(moe_config)
-    if _FIXED_DEEPEP_W4A8_ARCHITECTURES.isdisjoint(architectures):
+    is_hyv4_ct = (
+        getattr(moe_config, "_hcu_ct_w4a8", False)
+        and not {"HYV4ForCausalLM", "HYV4MTPModel"}.isdisjoint(architectures)
+    )
+    if (
+        _FIXED_DEEPEP_W4A8_ARCHITECTURES.isdisjoint(architectures)
+        and not is_hyv4_ct
+    ):
         return None
 
     route = f"fixed {all2all_backend}"
+    if is_hyv4_ct and (
+        getattr(parallel_config, "tp_size", 1) != 1
+        or (
+            all2all_backend == "deepep_low_latency"
+            and getattr(parallel_config, "pcp_size", 1) != 1
+        )
+    ):
+        raise ValueError("HYV4 CT W4A8 fixed DeepEP requires TP1 and LL requires PCP1")
     if not (
-        getattr(parallel_config, "dp_size", 1) > 1
+        (getattr(parallel_config, "dp_size", 1) > 1 or (
+            is_hyv4_ct and getattr(parallel_config, "pcp_size", 1) > 1
+        ))
         and getattr(parallel_config, "use_ep", False)
     ):
         raise ValueError(

@@ -568,6 +568,30 @@ def test_hyv4_fp8_incomplete_pair_fails_and_does_not_survive_reload(hyv4_fp8_che
     model.load_weights(iter(weights))
 
 
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_hyv4_int8_indexer_wk_is_dequantized_before_merged_load(
+    hyv4_fp8_checkpoint, scale_first,
+):
+    model = hyv4_fp8_checkpoint
+    scale = torch.tensor([[0.5], [1.0], [2.0], [4.0]])
+    packed = torch.tensor([-128, -7, 0, 127], dtype=torch.int8)[:, None].expand(4, 64)
+    weights = _hyv4_fp8_weights(model, torch.ones(4, 1))
+    prefix = "model.layers.0.self_attn.indexer.wk."
+    weights = [(name, packed if name == prefix + "weight" else
+                scale if name == prefix + "weight_scale" else value)
+               for name, value in weights]
+    if scale_first:
+        weights.reverse()
+
+    loaded = model.load_weights(iter(weights))
+
+    actual = model.model.layers[0].self_attn.indexer.wk_weights_proj.weight
+    torch.testing.assert_close(actual[:4], (packed.float() * scale).bfloat16())
+    torch.testing.assert_close(actual[4:], torch.full_like(actual[4:], 3.0))
+    assert loaded == set(dict(model.named_parameters()))
+    assert not hasattr(model.model, "_checkpoint_accounting")
+
+
 def test_hyv4_fp8_duplicate_scale_alias_fails(hyv4_fp8_checkpoint):
     model = hyv4_fp8_checkpoint
     weights = _hyv4_fp8_weights(model, torch.ones(4, 1))

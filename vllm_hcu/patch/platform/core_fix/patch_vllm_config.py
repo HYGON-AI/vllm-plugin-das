@@ -206,22 +206,27 @@ def _require_hy4_pcp8_contract(vllm_config: object) -> None:
     )
     if bool(getattr(parallel_config, "enable_eplb", False)):
         raise ValueError("HY V4 PCP8 does not support EPLB.")
-    if (
+    expert_backend = (
         _require_hcu_pcp_attribute(
             parallel_config, "all2all_backend", "ParallelConfig"
-        )
-        != "deepep_high_throughput"
-        or _require_hcu_pcp_attribute(
+        ),
+        _require_hcu_pcp_attribute(
             kernel_config, "moe_backend", "KernelConfig"
-        )
-        != "deep_gemm"
+        ),
+    )
+    if (
+        expert_backend not in {
+            ("deepep_high_throughput", "deep_gemm"),
+            ("allgather_reducescatter", "aiter"),
+        }
         or _require_hcu_pcp_attribute(
             cache_config, "cache_dtype", "CacheConfig"
         )
         not in ("fp8_e4m3", "fp8_ds_mla")
     ):
         raise ValueError(
-            "HY V4 PCP8 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
+            "HY V4 PCP8 requires DeepEP HT with DeepGEMM or "
+            "allgather_reducescatter with AITER, and FP8 E4M3 KV."
         )
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

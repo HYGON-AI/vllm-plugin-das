@@ -38,7 +38,12 @@ def test_grouped_w4a16_matches_dequantized_reference(num_tokens, intermediate_si
             quant_type=MoeQuantType.W4A16, activation="silu", use_shuffle=0,
         )
         assert supported and config.solution_type == "moe_c"
-        legacy_group128_moec = getattr(config, "block_size", None) is None
+        # Only the legacy fixed-group scale shuffler needs a group-size field.
+        # Newer configs can omit it when scales are consumed without shuffling.
+        legacy_group128_moec = (
+            getattr(config, "need_shuffle_scale", False)
+            and getattr(config, "block_size", None) is None
+        )
     w1 = torch.randint(0, 256, (e, 2*n, h//2), dtype=torch.uint8, device="cuda")
     w2 = torch.randint(0, 256, (e, h, n//2), dtype=torch.uint8, device="cuda")
     s1 = torch.full((e, 2*n, h//128), 0.01, dtype=torch.bfloat16, device="cuda")
