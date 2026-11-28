@@ -64,6 +64,55 @@ class EngineProc:
 
 
 class TestHiSparseGraphConfig(unittest.TestCase):
+    def test_startup_keeps_the_cli_reasoning_parser_configuration(self):
+        @dataclass
+        class HiSparse:
+            pass
+
+        @dataclass
+        class AttentionConfig:
+            hisparse_config: HiSparse | None
+
+        class EngineArgs(SimpleNamespace):
+            def __post_init__(self):
+                pass
+
+            def create_model_config(self):
+                return SimpleNamespace()
+
+            def create_structured_outputs_config(self):
+                self.structured_outputs_config.reasoning_parser = self.reasoning_parser
+                self.structured_outputs_config.reasoning_parser_plugin = self.reasoning_parser_plugin
+                return self.structured_outputs_config
+
+        namespace = SimpleNamespace(reasoning_parser="", reasoning_parser_plugin="")
+        args = EngineArgs(attention_config=AttentionConfig(HiSparse()),
+                         structured_outputs_config=namespace, block_size=64,
+                         reasoning_parser="hy_v4", reasoning_parser_plugin="external.py")
+
+        def native(clone, **kwargs):
+            return GraphConfig(model_config=clone.create_model_config(),
+                               attention_config=clone.attention_config,
+                               structured_outputs_config=clone.create_structured_outputs_config())
+
+        bindings = [SimpleNamespace(EngineArgs=EngineArgs)]
+        with (patch.object(OWNER, "_require_hisparse"),
+              patch.object(OWNER, "_is_flash", return_value=True),
+              patch.object(OWNER, "_request_bounds", return_value=True),
+              patch.object(OWNER, "_require_model"),
+              patch.object(OWNER, "_graph_requested", return_value=True),
+              patch.object(OWNER, "_validate_result"),
+              patch.object(OWNER, "check_health"),
+              patch.object(OWNER, "_graph_snapshot"),
+              patch.object(OWNER, "_record"),
+              patch.object(OWNER, "validate_hisparse_config")):
+            config = OWNER._construct(native, args, None, False, bindings)
+
+        self.assertIs(args.structured_outputs_config, namespace)
+        self.assertEqual(namespace.reasoning_parser, "hy_v4")
+        self.assertEqual(namespace.reasoning_parser_plugin, "external.py")
+        self.assertEqual(config.structured_outputs_config, namespace)
+
     def test_graph_opt_in_requires_environment_connector_and_cache_dtype(self):
         cfg = candidate()
         with patch.dict(os.environ, {"HCU_VLLM_HY4_HISPARSE": "0"}):

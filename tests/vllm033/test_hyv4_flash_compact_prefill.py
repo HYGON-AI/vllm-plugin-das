@@ -37,7 +37,8 @@ def test_compact_prefill_keeps_context_rows_within_workspace(
 
 def test_sparse_and_window_backends_use_the_compact_prefill_builder():
     source = _SOURCE.with_name("swa.py")
-    classes = {"FlashSparseMetadataBuilder", "FlashSparseBackend", "FlashSWABackend"}
+    classes = {"FlashSparseMetadataBuilder", "FlashSWAMetadataBuilder",
+               "FlashSparseBackend", "FlashSWABackend"}
     definitions = [node for node in ast.parse(source.read_text()).body
                    if isinstance(node, ast.ClassDef) and node.name in classes]
     compact_builder = type("CompactPrefillMetadataBuilder", (), {})
@@ -47,8 +48,12 @@ def test_sparse_and_window_backends_use_the_compact_prefill_builder():
         "AttentionCGSupport": SimpleNamespace(UNIFORM_BATCH=object()),
     }
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)
-    for backend in ("FlashSparseBackend", "FlashSWABackend"):
-        assert issubclass(namespace[backend].get_builder_cls(), compact_builder)
+    sparse_builder = namespace["FlashSparseBackend"].get_builder_cls()
+    window_builder = namespace["FlashSWABackend"].get_builder_cls()
+    assert issubclass(sparse_builder, compact_builder)
+    assert issubclass(window_builder, sparse_builder)
+    assert not sparse_builder._window_owned_kv
+    assert window_builder._window_owned_kv
 
 
 def test_compact_prefill_respects_the_explicit_batch_and_absolute_row_limit():

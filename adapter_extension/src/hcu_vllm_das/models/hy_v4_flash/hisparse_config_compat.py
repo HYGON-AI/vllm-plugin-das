@@ -765,6 +765,9 @@ def _construct(original, args, usage_context, headless, bindings):
             setattr(resolved_hisparse, _GRAPH_ATTESTATION, (os.getpid(), _graph_snapshot(config)))
         _record(config)
     validate_hisparse_config(config)
+    # Core merges parser flags into a config shared with the CLI namespace.
+    # Publish that native side effect after the private construction succeeds.
+    args.create_structured_outputs_config()
     return config
 
 
