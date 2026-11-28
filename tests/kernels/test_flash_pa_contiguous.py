@@ -14,10 +14,12 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("max_q", [1, 4, 32])
+@pytest.mark.parametrize("dim,max_q", [
+    (128, 1), (128, 4), (256, 1), (256, 4), (256, 32),
+])
 @pytest.mark.parametrize("quantized_query", [False, True])
-def test_e4m3_d256_strided_pages_and_changed_graph_replay(
-    monkeypatch, max_q, quantized_query,
+def test_e4m3_paged_strided_pages_and_changed_graph_replay(
+    monkeypatch, dim, max_q, quantized_query,
 ):
     from vllm_hcu.v1.attention import kv_cache_layout
     from vllm_hcu.v1.attention.backends import fa_utils
@@ -25,7 +27,7 @@ def test_e4m3_d256_strided_pages_and_changed_graph_replay(
     monkeypatch.setattr(kv_cache_layout, "_worker_kv_cache_layout", "HND")
     torch.manual_seed(553)
     device = "cuda"
-    batch, heads, qheads, dim, page = 3, 4, 24, 256, 64
+    batch, heads, qheads, page = 3, 4, 24, 64
     storage = (torch.randn(10, 2, heads, page, dim, device=device) * 0.4).to(
         torch.float8_e4m3fn
     )

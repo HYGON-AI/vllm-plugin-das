@@ -512,7 +512,29 @@ def run_paged_attention(
         )
 
 
+    value_scale = None
+    if key.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        # The native mixed-dtype PA path does not apply these descales.
+        # Fold K's scalar into Q and V's scalar into the small output, as
+        # in PR #551; never rescale or materialize the allocated KV cache.
+        for name in ("q_descale", "k_descale", "v_descale"):
+            descale = arguments.get(name)
+            if descale is not None and descale.numel() != 1:
+                raise NotImplementedError("HCU native PA requires scalar descales")
+        query = arguments["q"]
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            query = query.float()
+            if arguments.get("q_descale") is not None:
+                query = query * arguments["q_descale"]
+            query = query.to(torch.bfloat16)
+        if arguments.get("k_descale") is not None:
+            query = (query.float() * arguments["k_descale"]).to(query.dtype)
+        value_scale = arguments.get("v_descale")
+        arguments.update(q=query, q_descale=None, k_descale=None, v_descale=None)
     result = vendor(**arguments)
+    if value_scale is not None:
+        produced = result[0] if isinstance(result, tuple) else result
+        produced.mul_(value_scale)
     if output is not None and arguments.get("out") is not output:
         output.copy_(arguments["out"])
         if isinstance(result, tuple):

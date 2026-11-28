@@ -505,6 +505,47 @@ def test_hcu_fa_e4m3_d256_keeps_strided_cache_and_applies_descales(
     assert seen["out"].is_contiguous()
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("query_dtype", [
+    torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2,
+])
+def test_hcu_fa_native_pa_folds_scalar_descales_without_cache_copy(
+    monkeypatch, cache_dtype, query_dtype,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    storage = torch.zeros(3, 2, 2, 64, 128).to(cache_dtype)
+    key, value = storage.unbind(1)
+    query = torch.full((2, 4, 128), 0.5).to(query_dtype)
+    output = torch.empty(2, 4, 256, dtype=torch.bfloat16)[..., ::2]
+    quantized_q = query_dtype != torch.bfloat16
+    qscale = torch.tensor([0.75]) if quantized_q else None
+    kscale, vscale = torch.tensor([0.5]), torch.tensor([0.25])
+    tail = torch.ones(1)
+
+    def vendor(**arguments):
+        expected = 0.5 * (0.75 if quantized_q else 1.0) * 0.5
+        assert arguments["q"].dtype == torch.bfloat16
+        torch.testing.assert_close(arguments["q"],
+                                   torch.full_like(arguments["q"], expected))
+        for name in ("q_descale", "k_descale", "v_descale"):
+            assert arguments[name] is None
+        assert arguments["k"].data_ptr() == key.data_ptr()
+        assert arguments["v"].data_ptr() == value.data_ptr()
+        arguments["out"].fill_(4)
+        return arguments["out"], tail
+
+    result = fa_utils.run_paged_attention(vendor, dict(
+        q=query, k=key, v=value, out=output,
+        block_table=torch.tensor([[2, 1], [1, 0]], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_seqlen_q=1, layout="bhsd",
+        q_descale=qscale, k_descale=kscale, v_descale=vscale,
+    ))
+    assert result[0] is output
+    assert result[1] is tail
+    torch.testing.assert_close(output, torch.ones_like(output))
+
+
 def test_hcu_fa_oversized_virtual_pages_use_stride_aware_fallback(monkeypatch):
     fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
     # Meta tensors exercise the real >2-GiB span without allocating GPU/CPU RAM.
