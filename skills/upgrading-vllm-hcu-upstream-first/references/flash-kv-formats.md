@@ -86,3 +86,10 @@ successful writer sync. Retain such a failed fixture separately from the
 original model failure; CPU address arithmetic does not qualify device loads.
 Remove the adapter only after a replacement passes the same capability tests,
 not because its full wheel version matches an allowlist.
+
+When a remapped PA result exceeds an independent numerical gate, verify native
+writer bytes and compare the same inputs with contiguous native PA. Bitwise
+equality establishes layout equivalence; it does not qualify native precision.
+Keep the original failure and tolerance. A bounded gather/unquantized varlen
+composition can retain quantized storage for the affected geometry, with its
+scratch/copy costs stated and Graph/model gates rerun separately.

@@ -158,3 +158,22 @@ native-writer synchronization. The regression fixture uses a nonzero 64-element
 aligned offset, matching the allocator's alignment requirement; those earlier
 failed runs are retained separately from the original model failure. No
 FlashAttention source or binary is modified by this follow-up.
+
+
+The corrected installed artifact passes 107 portable cases, 88 native
+writer/reader/Graph cases (48 new and 40 existing), and 25 CI selection/environment
+cases with 298 subtests on gfx938, Core c440c08 and Adapter/kernel 51bd28. Native
+cases retain the existing 0.03 tolerance; no skips or xfails qualify as passes.
+The PA regression is selected by both v0.33 device tiers.
+
+The final Qwen3.6-27B BF16-weight TP4 replay retains FLASH_ATTN, E4M3 KV,
+MRV2, default FULL_AND_PIECEWISE Graph, prefix, context 4096 and 1 GiB KV per rank.
+Startup and output 13/13 / prefix 3/3 pass, with 3200 prefix hits. HumanEval 0–31 is
+raw 2/32 and format-normalized 32/32, with 4961 generated tokens and no length
+truncation. Raw and normalized pass sets match the saved old-provider BF16
+control (4974 tokens); raw 2/32 is not relabeled as32/32. The service exceeds
+the original 15-second exit gate and needs owned-only SIGTERM; EngineDeadError
+and native binding leak diagnostics remain. These are retained lifecycle gaps,
+not clean-exit, performance or whole-upgrade acceptance. Test-owned processes
+are gone. The final checkpoint/provider seals and installed RECORDs are recorded
+separately from those original failures.
