@@ -20,6 +20,17 @@ Adapter activation through the project metadata, covering missing imports and
 invalid ABI both before and after optional activation. These regressions do not
 extend the recorded wheel/device/model qualification below to a new build.
 
+Publication itself also uses Adapter's process-local lifecycle. A child forked
+while the parent is resolving the provider or registering RMS refuses inherited
+incomplete activation before taking a lock or importing another provider. This
+guard covers both the actual published entrypoint through `activate_extensions`
+and the direct provider accessor. A later explicit requirement still preflights
+the provider after an earlier optional activation; health remains read-only and
+initialization failures stay latched. Regression cases use real metadata and
+Adapter activation with controlled CPU provider/registration doubles, preserving
+the parent completion and owned-child cleanup checks. Python activation across
+fork and native/model teardown remain separate qualification gates.
+
 ## Source and component verification
 
 Candidate is based on Plugin `v0.33.0` commit
@@ -91,3 +102,148 @@ with `VLLM_TARGET_ROOT` naming the actual Core checkout. In the admitted install
 HCU stack, retain the original device suites:
 `HCU_VLLM033_RMSNORM_LIVE=1 pytest tests/vllm033/test_rms_norm_hcu.py
  tests/vllm033/test_rms_norm_composed_hcu.py`.
+
+
+## Current v0.33 integration on gfx938 (R227)
+
+The prospective Plugin merge `d659c2e516e7ef0df1fcefe17c7ae188f5d38a68`
+combines PR head `93dcf621` with current v0.33 target `c0e608de` without
+conflicts. The RMS runtime and three fork regressions retain their previous bytes.
+Adapter is proposed #97 head `6eeea954`; it is not merged main. Core remains
+0.33.0+das.c440c08.dtk2610.torch2130.gfx936gfx938.base93. Source-bound wheels
+were installed in a separate physical prefix, with 18 complete original
+RECORDs and source/wheel/installed payload identities verified before and after.
+FlashAttention was neither modified nor rebuilt.
+
+Full unchanged Plugin portable selection: **1360 passed**, zero failures,
+errors or skips; 46 HCU cases were deselected by the original portable marker.
+Eleven separate public-selector subprocesses pass. Eight affected Adapter
+contract files pass **244 cases**, including real metadata discovery/spawn.
+All processes reached successful terminal states; this is not log-only evidence.
+Native components pass **30 RMS/compiled/Graph** and **43 Adapter native-pair**
+cases. A real required RMS owner with the official Worker/FULL Graph manager
+passes six changing-input GPU replays across FP16/BF16 and four sticky refusals
+before pending sends or replay. Its runner/PP doubles do not qualify real PP.
+
+The separate Qwen3-8B candidate-only cohort uses TP1, BF16 weights,
+FLASH_ATTN, `fp8_e4m3`, block64, context8192, maxseq8/batched-tokens1024,
+memory0.6, explicit RMS switches, default compilation/Graph and prefix caching.
+The original checkpoint is double-read sealed; post-run checkpoint and all
+18 RECORD checks pass. Scorer/request/controller sources are sealed as well.
+
+| Original check | Result |
+| --- | --- |
+| Arithmetic at concurrency1/4/8 | 13/13 |
+| Repeated-prefix strict output | 3/3; +1280 prefix-hit tokens |
+| Profiled strict output | 1/1 |
+| HumanEval0-31 raw | 20/32 |
+| Existing format normalization | 31/32 |
+| Length-limited responses | 0 |
+| Completion tokens | 4159 |
+| Owned processes after shutdown | 0 |
+| Original15s grace / frontend exit | within grace / exit0, no forced cleanup |
+| Clean native lifecycle | FAIL: nanobind leaks and shutdown EngineDeadError |
+
+HumanEval/26 remains an actual semantic failure after normalization: the
+completion keeps one copy of repeated values instead of removing every value
+occurring more than once. Do not describe it as formatting. This candidate-only
+phase did not include a matched current-target control; the completed control
+is recorded below. Prior gfx936 scores remain under their old sources.
+
+Before/after worker reports agree: genuine gfx938/BW1100, Adapter Worker,
+official MRV2 runner, 36 HCU Flash implementations and 145 RMS OOT instances.
+The native trace records the E4M3 uint8 cache writer, Flash prefill, paged decode
+and three hipGraphLaunch calls. Default compiled RMS deliberately delegates to
+Core IR: the trace contains fused Triton RMS kernels, not a LightOp execution
+claim. Eager LightOp is qualified only by its separate component evidence.
+
+Local immutable evidence root:
+`evidence/rms-owner-current-combination-r227/`; `cpu-state.json`, native JUnits,
+`model-audit.json`, original model logs, requests/responses/scoring, profile,
+shutdown and post-seal receipts retain their scopes. These are local evidence,
+not a new remote CI qualification or independent approval.
+
+## Matched current-target control on gfx938 (R228)
+
+The separate physical-prefix control uses Plugin target
+`c0e608de81532ac808768cd68133412d132b6971` with the same proposed Adapter #97,
+Core build, checkpoint, device, requests, protocol, switches and default
+compilation/Graph settings as R227. It reached terminal states for all stages:
+11 public selectors, **1357 portable**, **244 Adapter**, **30 RMS/compiled/Graph**
+and **43 native-pair** cases pass, with no failures, errors or skips in those
+selections. The two real required-owner Worker/FULL Graph probes also pass.
+The original 46 hardware cases remain deselected by the portable marker.
+
+The read-only pair audit verifies each original installed RECORD against actual
+file hashes and sizes. Cross-prefix console-script RECORD hashes can differ
+solely because their interpreter shebang changes. For payload comparison only,
+the audit normalizes the exact first-line `#!<that-prefix>/bin/python` in those
+actual console scripts. It does not rewrite RECORDs, normalize package/native
+bytes or excuse additional changes. The sole changed distribution payload is
+the intended Plugin. Checkpoint bytes, CLI, controlled environment, physical
+device and frozen scoring inputs match.
+
+| Original model check | R227 candidate | R228 target control |
+| --- | --- | --- |
+| Strict probes / prefix-hit increment | 17/17 / 1280 | 17/17 / 1280 |
+| HumanEval0-31 raw | 20/32 | 19/32 |
+| Existing format normalization | 31/32 | 30/32 |
+| Completion tokens / length-limited responses | 4159 / 0 | 4348 / 0 |
+| Original15s grace / frontend exit | within grace / exit0 | within grace / exit0 |
+| Forced cleanup / surviving owned processes | none / 0 | none / 0 |
+| Clean native lifecycle | FAIL | FAIL |
+
+All 32 requests and finish reasons match; 28/32 messages, choices and usage
+records match. Changed tasks are **HumanEval/6, /17, /18 and /25**. The
+candidate adds no failed task in this single cohort: it passes /17, whose
+control completion omits the final bare `o` in its hand-written ASCII parser;
+both fail /26. Tasks /6, /18 and /25 change code form without changing their
+pass flags. These observations establish neither 32-output equivalence nor a
+causal accuracy improvement. The source of the four changes is not established.
+
+Both serving arms retain nanobind leak diagnostics and a shutdown
+`EngineDeadError`. Equal failure presence is evidence that the symptom also
+occurs without this fork fix; it neither identifies every leak owner nor
+waives the original clean-lifecycle requirement. Both traces show real FP8
+cache/attention work and three `hipGraphLaunch` calls. Compiled RMS execution
+still delegates to Core IR, so these model results do not qualify LightOp
+execution or performance. Neither arm is a last-good upgrade combination.
+
+An additional source-stage compatibility check against actual Adapter main
+`8490a6b6072bda681982e95b23cbcae313b1eec6` passes **75 extension cases**,
+including real fork regressions. Its imported lifecycle source was checked
+explicitly. This is not a full installed-main model A/B or proof that #97 has
+merged.
+
+Original control evidence is retained under
+`evidence/rms-owner-current-baseline-r228/`, including `paired-audit.json`,
+`model-audit.json`, terminal CPU/native results, raw requests/responses/scoring,
+traces, original shutdown diagnostics and pre/post provenance seals. Keep
+Draft: attribution of changed outputs and clean lifecycle remain open;
+performance and the complete upgrade matrix remain unqualified.
+
+## Adapter directory integration on 2026-11-20
+
+Integrate Plugin target `8631a126c254a355269a866fb3a9a9ecdbd3cb32` into
+RMS candidate `fbf271e0e5338e1133502f26c938a1530994228e`. The one textual
+conflict is the extension test fixture: retain its complete activation-lifecycle
+reset while selecting the real lifecycle class through `adapter_api`.
+
+The first installed test collection against Adapter main
+`d9bb7fa5d2ed7a46e74b06f5c7c2f9ef172bd702` fails because the candidate itself
+adds a direct `hcu_adapter.runtime_lifecycle` import after the common ancestor.
+The target's earlier compatibility audit could not cover that new consumer.
+Use the existing `adapter_api.adapter_module` in the production extension,
+retaining the actual Adapter class, activation action and lifecycle behavior.
+No Core, Adapter, vendor or numerical implementation changes are involved.
+
+Three new source contracts import the real extension body, construct its
+lifecycle and call its discovery factory over root, canonical and broken
+canonical Adapter filesystem fixtures. Before the import repair: **1 passed,
+2 failed**. After: **3 passed**, with unchanged tests and framework imports
+forbidden. These fixtures establish the import/identity/failure boundary; they
+do not qualify an actual old-layout installed wheel, device execution or a
+model. The separate installed current-main checks retain their own evidence.
+
+All prior model accuracy, lifecycle, performance and requested gfx836 gaps
+remain open. Keep Draft; the layout repair is not a model-shutdown fix.
