@@ -326,32 +326,36 @@ def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
     assert key.stride() == original_stride
 
 
-def test_hcu_fa_paged_decode_materializes_contiguous_pa_views(monkeypatch):
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("max_q", [1, 2, 4, 8, 15])
+def test_hcu_fa_paged_decode_materializes_contiguous_pa_views(
+    monkeypatch, layout, max_q,
+):
     fa_utils, _ = _load_hcu_fa_utils_module(
-        monkeypatch, kv_cache_layout="HND",
+        monkeypatch, kv_cache_layout=layout,
     )
     blocks, heads, page_size, head_size = 3, 2, 64, 8
-    # Match the physical HND cache layout: [block, K/V, head, token, dim].
+    native_shape = (
+        (heads, page_size, head_size) if layout == "HND"
+        else (page_size, heads, head_size)
+    )
     backing = torch.arange(
-        blocks * 2 * heads * page_size * head_size,
-        dtype=torch.float32,
-    ).reshape(blocks, 2, heads, page_size, head_size)
-    logical = backing.permute(0, 1, 3, 2, 4)
+        blocks * 2 * heads * page_size * head_size, dtype=torch.float32,
+    ).reshape(blocks, 2, *native_shape)
+    logical = backing.permute(0, 1, 3, 2, 4) if layout == "HND" else backing
     key, value = logical.unbind(1)
     output_backing = torch.full(
-        (blocks, heads * 2, head_size), -1.0,
+        (blocks * max_q, heads * 2, head_size), -1.0,
     )
     output = output_backing[:, ::2]
     table_backing = torch.tensor(
-        [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]],
-        dtype=torch.int32,
+        [[0, 0, 1, 0], [1, 0, 2, 0], [2, 0, 0, 0]], dtype=torch.int32,
     )
     block_table = table_backing[:, ::2]
-    cuq_backing = torch.arange(2 * (blocks + 1), dtype=torch.int32)
+    cuq_backing = torch.arange(2 * (blocks + 1), dtype=torch.int32) * max_q // 2
     cu_seqlens_q = cuq_backing[::2]
     lens_backing = torch.tensor(
-        [page_size, 0, 2 * page_size, 0, 3 * page_size],
-        dtype=torch.int32,
+        [page_size, 0, 2 * page_size, 0, 2 * page_size], dtype=torch.int32,
     )
     seqused_k = lens_backing[::2]
     seen = {}
@@ -366,36 +370,168 @@ def test_hcu_fa_paged_decode_materializes_contiguous_pa_views(monkeypatch):
                 max_seqlen_q=max_seqlen_q, layout=layout, **kwargs,
             )
         )
-        assert k.is_contiguous()
-        assert v.is_contiguous()
-        assert q.is_contiguous()
-        assert out.is_contiguous()
-        assert block_table.is_contiguous()
+        for tensor in (q, k, v, out, block_table, kwargs["cu_seqlens_q"],
+                       kwargs["seqused_k"]):
+            assert tensor.is_contiguous()
         out.fill_(7.0)
         return out, torch.zeros(1)
 
     result = fa_utils._with_kv_cache_layout(vendor, "probe")(
-        q=torch.zeros(blocks, heads, head_size),
-        k=key,
-        v=value,
-        out=output,
-        cu_seqlens_q=cu_seqlens_q,
-        seqused_k=seqused_k,
-        block_table=block_table,
-        max_seqlen_q=1,
+        q=torch.zeros(blocks * max_q, heads * 2, head_size)[:, ::2],
+        k=key, v=value, out=output,
+        cu_seqlens_q=cu_seqlens_q, seqused_k=seqused_k,
+        block_table=block_table, max_seqlen_q=max_q,
     )
 
     assert isinstance(result, tuple)
-    assert result[0].data_ptr() == output.data_ptr()
+    assert result[0] is output
+    assert len(result) == 2
     torch.testing.assert_close(output, torch.full_like(output, 7.0))
-    assert seen["layout"] == "bhsd"
-    torch.testing.assert_close(
-        seen["block_table"], block_table.contiguous() * 2,
-    )
-    assert seen["k"].shape == (blocks * 2 - 1, heads, page_size, head_size)
+    assert seen["layout"] == ("bhsd" if layout == "HND" else "bshd")
+    assert seen["max_seqlen_q"] == max_q
+    torch.testing.assert_close(seen["block_table"], block_table.contiguous() * 2)
+    assert seen["k"].shape == (blocks * 2 - 1, *native_shape)
     assert seen["v"].shape == seen["k"].shape
     assert seen["k"].data_ptr() == key.data_ptr()
     assert seen["v"].data_ptr() == value.data_ptr()
+    native_key = key.transpose(1, 2) if layout == "HND" else key
+    native_value = value.transpose(1, 2) if layout == "HND" else value
+    torch.testing.assert_close(seen["k"][::2], native_key)
+    torch.testing.assert_close(seen["v"][::2], native_value)
+
+
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize(
+    "max_q,page_size,qheads,total_q,value_dim,expected",
+    [
+        (1, 64, 16, 2, 8, True),
+        (4, 64, 16, 8, 8, True),
+        (8, 64, 16, 16, 8, True),
+        (9, 64, 16, 18, 8, False),  # exceeds PA's per-KV-head query limit
+        (4, 64, 16, 7, 8, False),  # nonuniform/ragged batch
+        (16, 64, 2, 32, 8, False),  # native prefill boundary
+        (4, 128, 16, 8, 8, False),
+        (1, 128, 16, 2, 8, False),
+        (4, 64, 16, 8, 4, False),  # mixed head dimensions use another path
+    ],
+)
+def test_hcu_fa_direct_pa_admission_matches_vendor(
+    monkeypatch, layout, max_q, page_size, qheads, total_q, value_dim, expected,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    native_shape = (2, page_size) if layout == "bhsd" else (page_size, 2)
+    kwargs = dict(
+        q=torch.zeros(total_q, qheads, 8),
+        k=torch.zeros(3, *native_shape, 8),
+        v=torch.zeros(3, *native_shape, value_dim),
+        cu_seqlens_q=torch.tensor([0, max_q, total_q], dtype=torch.int32),
+        max_seqlen_q=max_q,
+        block_table=torch.zeros(2, 2, dtype=torch.int32), layout=layout,
+    )
+    assert fa_utils._uses_direct_paged_attention(kwargs) is expected
+    if not expected:
+        seen = {}
+
+        def vendor(**arguments):
+            seen.update(arguments)
+            return "native"
+
+        assert fa_utils.run_paged_attention(vendor, kwargs) == "native"
+        for name, value in kwargs.items():
+            assert seen[name] is value
+
+
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("max_q", [1, 4, 32])
+@pytest.mark.parametrize("quantized_query", [False, True])
+@pytest.mark.parametrize("with_out", [False, True])
+def test_hcu_fa_e4m3_d256_keeps_strided_cache_and_applies_descales(
+    monkeypatch, layout, max_q, quantized_query, with_out,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    blocks, heads, page, dim, batch = 3, 4, 64, 256, 2
+    native_shape = (heads, page, dim) if layout == "HND" else (page, heads, dim)
+    backing = torch.zeros(blocks, 2, *native_shape).to(torch.float8_e4m3fn)
+    logical = backing.permute(0, 1, 3, 2, 4) if layout == "HND" else backing
+    key, value = logical.unbind(1)
+    qdtype = torch.float8_e4m3fn if quantized_query else torch.bfloat16
+    query = torch.zeros(batch * max_q, 24, dim).to(qdtype)
+    output = torch.empty(batch * max_q, 24, dim * 2, dtype=torch.bfloat16)[..., ::2]
+    if not with_out:
+        output = None
+    cuq = torch.arange(batch + 1, dtype=torch.int32) * max_q
+    lengths = torch.tensor([64, 128], dtype=torch.int32)
+    table = torch.tensor([[2, 1], [0, 2]], dtype=torch.int32)
+    kscale = torch.tensor([0.5])
+    vscale = torch.tensor([0.25])
+    seen = {}
+
+    def unified_attention(**arguments):
+        seen.update(arguments)
+        arguments["out"].fill_(7)
+
+    stub = ModuleType("vllm.v1.attention.ops.triton_unified_attention")
+    stub.unified_attention = unified_attention
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        raise AssertionError("unqualified D256/KV4 E4M3 geometry reached native PA")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=query, k=key, v=value, out=output,
+        cu_seqlens_q=cuq, seqused_k=lengths, block_table=table,
+        max_seqlen_q=max_q, max_seqlen_k=128, causal=True,
+        q_descale=torch.tensor([1.0]) if quantized_query else None,
+        k_descale=kscale.expand(batch, heads),
+        v_descale=vscale.expand(batch, heads),
+    )
+    if with_out:
+        assert result is output
+    assert result.dtype == torch.bfloat16
+    torch.testing.assert_close(result, torch.full_like(result, 7))
+    assert seen["k"].stride() == key.stride()
+    assert seen["v"].stride() == value.stride()
+    assert seen["k"].data_ptr() == key.data_ptr()
+    assert seen["v"].data_ptr() == value.data_ptr()
+    assert seen["block_table"] is table
+    assert seen["max_seqlen_q"] == max_q
+    assert seen["kv_quant_mode"] == 1  # FP8_PER_TENSOR
+    assert seen["k_descale"].data_ptr() == kscale.data_ptr()
+    assert seen["v_descale"].data_ptr() == vscale.data_ptr()
+    assert seen["q"].dtype == torch.bfloat16
+    if quantized_query:
+        assert seen["q_descale"] is None
+    assert seen["out"].dtype == torch.bfloat16
+    assert seen["out"].is_contiguous()
+
+
+def test_hcu_fa_oversized_virtual_pages_use_stride_aware_fallback(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    # Meta tensors exercise the real >2-GiB span without allocating GPU/CPU RAM.
+    storage = torch.empty(65540, 2, 2, 64, 128, device="meta",
+                          dtype=torch.float8_e4m3fn)
+    key, value = storage.unbind(1)
+    kwargs = dict(
+        q=torch.empty(1, 2, 128, device="meta"), k=key, v=value,
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        max_seqlen_q=1, layout="bhsd",
+    )
+    seen = {}
+
+    def fallback(arguments):
+        seen.update(arguments)
+        return "stride-aware"
+
+    monkeypatch.setattr(fa_utils, "_run_stride_aware_paged_attention", fallback)
+
+    def vendor(**arguments):
+        raise AssertionError("oversized virtual cache reached signed-32-bit PA")
+
+    assert fa_utils.run_paged_attention(vendor, kwargs) == "stride-aware"
+    assert seen["k"] is key
+    assert seen["v"] is value
+    assert seen["block_table"] is kwargs["block_table"]
 
 
 def test_hcu_fa_boundary_uses_bshd_compat_view_for_hnd_128_pages(monkeypatch):

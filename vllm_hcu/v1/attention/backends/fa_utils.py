@@ -165,7 +165,7 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
         if max_seqlen_q is None and max_seqlen_q_position is not None:
             if len(args) > max_seqlen_q_position:
                 max_seqlen_q = args[max_seqlen_q_position]
-        if block_table is None or max_seqlen_q != 1:
+        if block_table is None or max_seqlen_q is None:
             return function(*args, **kwargs)
         bound = signature.bind_partial(*args, **kwargs)
         arguments = dict(bound.arguments)
@@ -175,6 +175,34 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
         return run_paged_attention(function, arguments)
 
     return wrapped
+
+
+def _uses_direct_paged_attention(arguments: dict[str, Any]) -> bool:
+    """Mirror the vendor's equal-head-dimension, 64-token PA dispatch."""
+    if arguments.get("block_table") is None:
+        return False
+    q, k, v = (arguments.get(name) for name in ("q", "k", "v"))
+    if not all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v)):
+        return False
+    if q.ndim != 3 or k.ndim != 4 or v.ndim != 4:
+        return False
+    layout = arguments.get("layout", "bshd")
+    if layout not in ("bhsd", "bshd"):
+        return False
+    page_axis, head_axis = (2, 1) if layout == "bhsd" else (1, 2)
+    if k.shape[page_axis] != 64 or q.shape[-1] != v.shape[-1]:
+        return False
+    max_q = arguments.get("max_seqlen_q")
+    if max_q == 1:
+        return True
+    cu_seqlens_q = arguments.get("cu_seqlens_q")
+    return (
+        max_q is not None
+        and 1 < max_q < 16
+        and isinstance(cu_seqlens_q, torch.Tensor)
+        and max_q * (cu_seqlens_q.shape[0] - 1) == q.shape[0]
+        and max_q * q.shape[1] <= 64 * k.shape[head_axis]
+    )
 
 
 def _page_view(cache: torch.Tensor) -> tuple[torch.Tensor, int | None]:
@@ -203,13 +231,90 @@ def _page_view(cache: torch.Tensor) -> tuple[torch.Tensor, int | None]:
     return view, ratio
 
 
+def _run_stride_aware_paged_attention(arguments: dict[str, Any]) -> Any:
+    """Use Core's stride-aware FP8 kernel without copying the allocated cache."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    if (
+        arguments.get("dropout_p", 0.0) != 0.0
+        or arguments.get("return_softmax_lse", False)
+        or arguments.get("return_attn_probs", False)
+        or arguments.get("q_v") is not None
+        or arguments.get("cp_world_size", 1) != 1
+    ):
+        raise NotImplementedError(
+            "HCU stride-aware PA fallback requires local inference without LSE/probabilities"
+        )
+    q, k, v = (arguments[name] for name in ("q", "k", "v"))
+    if arguments.get("layout", "bshd") == "bhsd":
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
+    window = arguments.get("window_size") or (-1, -1)
+    causal = arguments.get("causal", False)
+    if not causal and (window[0] >= 0 or window[1] >= 0):
+        raise NotImplementedError("HCU stride-aware PA requires global noncausal attention")
+    slopes = arguments.get("alibi_slopes")
+    if slopes is not None and slopes.ndim != 1:
+        raise NotImplementedError("HCU stride-aware PA requires per-head ALiBi slopes")
+    quantized = k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    scales = {}
+    for name in ("q_descale", "k_descale", "v_descale"):
+        scale = arguments.get(name)
+        if scale is not None and scale.numel() != 1:
+            raise NotImplementedError("HCU stride-aware PA requires scalar descales")
+        if scale is None and quantized:
+            scale = torch.ones(1, device=q.device, dtype=torch.float32)
+        scales[name] = scale
+    # BF16 Q also avoids the native FP8 probability-rounding error and works
+    # for E5M2 queries when Core's platform default FP8 format is E4M3.
+    if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        q = (q.float() * scales["q_descale"]).to(torch.bfloat16)
+        scales["q_descale"] = None
+    output = arguments.get("out")
+    dtype = torch.bfloat16 if q.dtype in (
+        torch.float8_e4m3fn, torch.float8_e5m2,
+    ) else q.dtype
+    native_output = (
+        output if output is not None and output.is_contiguous()
+        else torch.empty(q.shape, device=q.device, dtype=dtype)
+    )
+    scale = arguments.get("softmax_scale")
+    unified_attention(
+        q=q.contiguous(), k=k, v=v, out=native_output,
+        cu_seqlens_q=arguments["cu_seqlens_q"].contiguous(),
+        max_seqlen_q=arguments["max_seqlen_q"],
+        seqused_k=arguments["seqused_k"].contiguous(),
+        max_seqlen_k=arguments["max_seqlen_k"],
+        softmax_scale=q.shape[-1] ** -0.5 if scale is None else scale,
+        causal=causal, window_size=window,
+        block_table=arguments["block_table"].contiguous(),
+        softcap=arguments.get("softcap", 0.0), alibi_slopes=slopes,
+        sinks=arguments.get("s_aux"),
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR if quantized else KVQuantMode.NONE,
+        **scales,
+    )
+    if output is not None and output is not native_output:
+        output.copy_(native_output)
+        return output
+    return native_output
+
+
 def run_paged_attention(
     vendor: Callable[..., Any], kwargs: dict[str, Any]
 ) -> Any:
-    """Adapt single-token paged calls to the contiguous vendor PA ABI."""
-    # Long/chunked prefill and unpacked varlen calls use the vendor's native
-    # path. This seam is only needed for the paged single-token decode path.
-    if kwargs.get("block_table") is None or kwargs.get("max_seqlen_q") != 1:
+    """Adapt decode and MTP calls to the contiguous vendor PA ABI."""
+    key_cache = kwargs.get("k")
+    if kwargs.get("block_table") is not None and isinstance(key_cache, torch.Tensor):
+        kv_heads = key_cache.shape[1 if kwargs.get("layout") == "bhsd" else 2]
+        # PR #551 also excludes this E4M3 geometry from native PA: its
+        # contiguous control fails non-unit-scale accuracy qualification.
+        # Core's FP8 kernel keeps the original strided pages and applies scales.
+        if key_cache.dtype == torch.float8_e4m3fn and (
+            key_cache.shape[-1] == 256 and kv_heads == 4
+        ):
+            return _run_stride_aware_paged_attention(kwargs)
+    # Match the vendor's 64-token direct-PA admission, including uniform MTP.
+    if not _uses_direct_paged_attention(kwargs):
         return vendor(**kwargs)
 
     arguments = dict(kwargs)
@@ -217,6 +322,13 @@ def run_paged_attention(
     value, value_ratio = _page_view(arguments["v"])
     if key_ratio != value_ratio:
         raise ValueError("HCU PA requires K and V to have the same page stride")
+    if key_ratio is None or max(
+        key.numel() * key.element_size(), value.numel() * value.element_size(),
+    ) > torch.iinfo(torch.int32).max:
+        # Virtual pages double the addressable span for fused K/V storage.
+        # Avoid the vendor's signed-32-bit indexing limit and never copy the
+        # full cache. Core uses stride-aware 64-bit cache addressing instead.
+        return _run_stride_aware_paged_attention(kwargs)
     arguments.update(k=key, v=value)
 
     block_table = arguments["block_table"]
@@ -244,12 +356,6 @@ def run_paged_attention(
             output, memory_format=torch.contiguous_format
         )
 
-    if key_ratio is None:
-        # A non-integral page stride cannot be represented by integer page
-        # IDs. Materialize only this bounded cache view as a correctness
-        # fallback; normal vLLM HND/NHD allocations use integral page ratios.
-        arguments["k"] = key.contiguous()
-        arguments["v"] = value.contiguous()
 
     result = vendor(**arguments)
     if output is not None and arguments.get("out") is not output:
