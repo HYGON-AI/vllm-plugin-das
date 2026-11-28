@@ -149,6 +149,17 @@ class QueryConcatTests(unittest.TestCase):
                 self.assertIs(result.owner, buffers[0])
                 self.assertEqual(len(calls), int(t > 0))
 
+    def test_gfx936_tp4_uses_existing_workspace_for_both_head_layouts(self):
+        for heads in (8, 16):
+            with self.subTest(heads=heads), harness(tp=4) as (Impl, buffers, calls, _):
+                obj = Impl(num_heads=heads)
+                buffers[0] = Tensor((64, heads, 576))
+                result = obj.forward_mqa(query(33, heads), 'cache', 'metadata', 'layer')
+                self.assertIs(result.owner, buffers[0])
+                self.assertEqual(result.shape, (33, heads, 576))
+                self.assertEqual(obj.seen[1:], ('cache', 'metadata', 'layer'))
+                self.assertEqual([op for op, _ in calls], ['native'])
+
     def test_unsupported_devices_keep_original_tuple(self):
         for tp, arch, cu in ((4, 'gfx938', 64), (8, 'gfx938', 80),
                              (4, 'gfx936', 80), (8, 'gfx936', 64), (8, 'other', 80)):

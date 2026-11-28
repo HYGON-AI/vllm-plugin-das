@@ -14,7 +14,7 @@ _MIDDLE_SCORING_BOUND = 16384
 def _qualified_worker_tuple(tp, arch, compute_units):
     """Keep worker-bank admission scoped to qualified platform/TP pairs."""
     return ((tp, arch, compute_units) in (
-        (4, "gfx938", 64), (8, "gfx936", 80),
+        (4, "gfx938", 64), (4, "gfx936", 80), (8, "gfx936", 80),
     ))
 
 
@@ -27,7 +27,7 @@ def _require_qualified_graph_worker(tp, device):
             tp, str(getattr(properties, "gcnArchName", "")).split(":")[0],
             getattr(properties, "multi_processor_count", None)):
         raise NotImplementedError(
-            "Flash W4A8 Graph worker requires gfx938/64CU TP4 or gfx936/80CU TP8")
+            "Flash W4A8 Graph worker requires gfx938/64CU TP4 or gfx936/80CU TP4/TP8")
 
 
 def is_qualified_config(cfg, *, breakable):
