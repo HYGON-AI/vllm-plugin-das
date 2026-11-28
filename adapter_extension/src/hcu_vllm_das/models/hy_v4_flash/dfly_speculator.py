@@ -330,14 +330,18 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         self._storage_validated = False
         cache_groups = kv_cache_config.kv_cache_groups
         if self.vllm_config.attention_config.hisparse_config is not None:
-            # The HiSparse writer retains Core's mapping when it binds the cache.
-            # Resident groups need draft slots even without a draft attention layer.
             slots = block_tables.slot_mappings
             if (slots.ndim != 2 or slots.dtype != torch.int64
-                    or slots.shape[0] != len(cache_groups)
-                    or slots.shape[1] < self.max_num_tokens):
-                raise ValueError("HiSparse DFly slot mapping capacity or layout mismatch")
+                    or slots.shape[0] != len(cache_groups)):
+                raise ValueError("HiSparse DFly slot mapping layout mismatch")
+            # Core binds the writers after set_attn. Give target and draft the
+            # same persistent storage even when draft queries outnumber the
+            # target scheduling budget.
+            if slots.shape[1] < self.max_num_tokens:
+                slots = slots.new_full((len(cache_groups), self.max_num_tokens), PAD_SLOT_ID)
+                block_tables.slot_mappings = slots
             self._slot_mappings = slots
+            # Resident groups need draft slots even without a draft attention layer.
             self._query_slot_groups = tuple(gid for gid, group in enumerate(cache_groups)
                                             if group.kv_cache_spec.uses_slot_mapping)
         else:
