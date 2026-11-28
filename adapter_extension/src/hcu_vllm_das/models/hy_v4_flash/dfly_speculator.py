@@ -183,10 +183,13 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         self._requested_cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         draft_vllm_config = copy(vllm_config)
         draft_vllm_config.scheduler_config = copy(vllm_config.scheduler_config)
-        draft_vllm_config.scheduler_config.max_num_batched_tokens = max(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.scheduler_config.max_num_seqs
-            * (spec.num_speculative_tokens + 1),
+        query_capacity = (
+            vllm_config.scheduler_config.max_num_seqs * (spec.num_speculative_tokens + 1)
+        )
+        draft_vllm_config.scheduler_config.max_num_batched_tokens = (
+            query_capacity if self._hy4_pd_role == "producer" else max(
+                vllm_config.scheduler_config.max_num_batched_tokens, query_capacity,
+            )
         )
         super().__init__(draft_vllm_config, device)
         self._hisparse_config_owner = vllm_config if hisparse else None
@@ -295,7 +298,10 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         ):
             raise ValueError("DFly requires BF16 shared embedding and LM head weights")
         draft.logits_processor.head_dtype = self.vllm_config.model_config.head_dtype
-        self.reuse = HYV4DFlyTargetReuse(target_model, draft, self.vllm_config)
+        self.reuse = HYV4DFlyTargetReuse(
+            target_model, draft, self.vllm_config,
+            capture_target_indices=self._hy4_pd_role != "producer",
+        )
         self.query_model = HYV4DFlyQueryModel(
             draft, self.draft_tokens, self._sample_step
         )
@@ -711,6 +717,11 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
             from ..hy4_standard.pcp_draft import require_producer_zero_drafts
             require_producer_zero_drafts(dummy_run=dummy_run, is_profile=is_profile,
                 num_speculative_tokens=num_speculative_tokens)
+            # The owned scheduler admits only K=0 producer requests. Dummy
+            # profiling must represent that same path, not allocate/execute
+            # a multi-step draft which no live producer request can reach.
+            if dummy_run:
+                num_speculative_tokens = 0
         batch = self.max_num_reqs if dummy_run and is_profile else input_batch.num_reqs
         from .dfly_topology import validate_rank_local_dfly_step
         validate_rank_local_dfly_step(

@@ -23,7 +23,8 @@ from .dfly_rotary import validate_dfly_rotary_pair
 
 class HYV4DFlyTargetReuse:
     def __init__(
-        self, target: nn.Module, draft: nn.Module, vllm_config: VllmConfig
+        self, target: nn.Module, draft: nn.Module, vllm_config: VllmConfig,
+        *, capture_target_indices: bool = True,
     ):
         config = draft.config
         # The public Core normally validates this while deriving the draft.
@@ -129,14 +130,21 @@ class HYV4DFlyTargetReuse:
         index_layer_ids = list(self.index_layers)
         first = next(iter(self.index_layers.values())).topk_indices_buffer
         assert first is not None
-        self.snapshots = torch.full(
-            (len(index_layer_ids), *first.shape),
-            -1,
-            dtype=first.dtype,
-            device=first.device,
-        )
-        for slot, index in enumerate(index_layer_ids):
-            self.index_layers[index].topk_snapshot = self.snapshots[slot]
+        self.capture_target_indices = capture_target_indices
+        if capture_target_indices:
+            self.snapshots = torch.full(
+                (len(index_layer_ids), *first.shape),
+                -1,
+                dtype=first.dtype,
+                device=first.device,
+            )
+            for slot, index in enumerate(index_layer_ids):
+                self.index_layers[index].topk_snapshot = self.snapshots[slot]
+        else:
+            # A sealed prefill-only producer never executes a draft query.
+            # Keep all KV aliases and their validation, without retaining a
+            # full scheduler-sized index copy for each unused draft source.
+            self.snapshots = first.new_empty((len(index_layer_ids), 0, first.shape[-1]))
         self.layer_snapshot_slots = torch.tensor(
             [index_layer_ids.index(i) for i in config.target_index_layer],
             dtype=torch.int32,
@@ -212,6 +220,8 @@ class HYV4DFlyTargetReuse:
         anchors: torch.Tensor,
         padded_batch: int,
     ) -> None:
+        if not self.capture_target_indices:
+            raise ValueError("DFly indices are unavailable on a prefill-only producer")
         build_dfly_reuse_indices(
             self.draft.model.topk_indices,
             self.snapshots,
