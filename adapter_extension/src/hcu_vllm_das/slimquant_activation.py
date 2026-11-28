@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 from importlib import import_module
+from importlib.util import find_spec
 from contextlib import contextmanager
+import inspect
 import os
 from threading import RLock
 
@@ -18,12 +20,14 @@ _lock = RLock()
 _published = None
 _failure = False
 _activating = False
+_packed_provider = None
+_packed_provider_pid = None
 
 
 def _after_fork_child():
     global _lock, _failure
     _lock = RLock()
-    if _activating:
+    if _activating or _packed_provider is not None:
         _failure = True
 
 
@@ -98,6 +102,85 @@ def check_health():
         raise ExtensionCommitError(
             "SlimQuant registry owner changed; restart the process"
         )
+
+
+def require_usable():
+    """Reject poisoned execution without requiring activation for pure metadata."""
+    if _failure:
+        raise ExtensionCommitError("SlimQuant owner failed; restart the process")
+
+
+def prepare_packed_provider():
+    """Prepare the optional vendor only for explicit packed selection.
+
+    Host health is queried outside the owner lock. A clean absent top-level
+    dependency does not poison expanded INT8; partial native import does.
+    """
+    global _packed_provider, _packed_provider_pid, _failure
+    from hcu_adapter.bridges.vllm import require_extension_healthy
+
+    require_extension_healthy(CAPABILITY)
+    try:
+        with _lock, _attempt():
+            if _packed_provider is not None:
+                if _packed_provider_pid != os.getpid():
+                    raise ExtensionCommitError(
+                        "SlimQuant native provider cannot be inherited; use a fresh spawned process"
+                    )
+                check_health()
+                return _packed_provider
+            try:
+                dependency = find_spec("boltops")
+            except BaseException as error:
+                _failure = True
+                raise ExtensionCommitError(
+                    "SlimQuant native dependency discovery failed; restart the process"
+                ) from error
+            if dependency is None:
+                raise RuntimeError("packed SlimQuant requires optional BoltOps")
+            try:
+                module = import_module("boltops.fused_moe")
+                function = module.fused_experts
+                normalizer = module.normalize_moe_activation
+                for candidate in (function, normalizer):
+                    implementations = ((candidate,) if inspect.isroutine(candidate)
+                                       else (candidate, candidate.__call__))
+                    if (not callable(candidate)
+                            or any(check(implementation)
+                                   for implementation in implementations
+                                   for check in (inspect.iscoroutinefunction,
+                                                 inspect.isasyncgenfunction,
+                                                 inspect.isgeneratorfunction))):
+                        raise TypeError("BoltOps entry must be synchronous")
+                # Public normalization loads the shipped lazy backend before
+                # apply, keeping partial imports inside this guarded attempt.
+                if normalizer("silu") != ("silu", True):
+                    raise ValueError("BoltOps gated SiLU contract unavailable")
+                inspect.signature(function).bind(
+                    object(), object(), object(), object(), object(),
+                    inplace=False, activation="silu", use_int4_w4a8=True,
+                    per_channel_quant=True, global_num_experts=2,
+                    w1_scale=object(), w2_scale=object(), output_dtype=object(),
+                )
+                check_health()
+            except BaseException as error:
+                # Latch before any exception formatting, including bad __str__.
+                _failure = True
+                raise ExtensionCommitError(
+                    "SlimQuant native preparation failed; restart the process"
+                ) from error
+            _packed_provider = function
+            _packed_provider_pid = os.getpid()
+            return function
+    except BaseException:
+        if _failure:
+            # Publish the failed owner through the public host health API only
+            # after releasing the owner lock. Never clear or repair reports.
+            try:
+                require_extension_healthy(CAPABILITY)
+            except BaseException:
+                pass
+        raise
 
 
 def extension_spec():

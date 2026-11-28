@@ -76,6 +76,151 @@ A passing explicit suite on a new stack does not qualify that stack's default
 selection or skipped automatic-admission tests. Extending admission still needs
 its actual eager/Graph/model evidence; do not loosen the table to make skips pass.
 
+## Packed MoE serving performance
+
+Compare expanded INT8 and packed SlimQuant on the same checkpoint, devices,
+TP geometry, Graph policy, PLE placement and KV allocation. A small native
+reload/Graph test does not establish that the full expanded control fits.
+Record all-rank method/storage ownership before and after measurement.
+
+When using the target's official random serving benchmark, inspect its actual
+length-range contract and retain the final requests after server-tokenizer
+alignment. Match all model-input fields across arms; preserve the benchmark's
+unique per-run request IDs separately. A common seed alone is not that evidence.
+Warm each arm, retain prefix-reset/cache-hit state and every
+measured repetition, and collect kernel attribution in a separate profiler
+session. Forced output length is a synthetic performance workload, not model
+accuracy evidence. Keep the original full-model lifecycle gate independent
+of a clean component exit or successful benchmark.
+
+Keep a measured packed-provider regression as a failed performance gate even
+when native math and every request pass. Separate padding preparation from
+vendor GEMM attribution; a missing tuned configuration warning is not proof
+of the cause. Kernel timings from a separate profiler session do not replace
+serving measurements. Record executor-internal worker termination as well as
+controller signals and exit codes. Profiler teardown can affect lifecycle;
+retain that scope instead of claiming a packed-only shutdown root cause.
+
+If fusing padding preparation, preserve active IDs/weights and assign distinct
+unused experts to padding; clamping every negative ID to zero can collide in
+the vendor sorter. Select zero for wholly padded NaN/Inf hidden rows rather
+than multiplying by zero. Bound any K-by-K candidate tile and whole-row hidden
+tile, preserving the original path outside that geometry. Validate non-power-
+of-two top-k, strided route metadata, empty batches, fallback shapes and Graph
+replay that changes a padded row into an active row and back. A preparation-only
+speedup does not qualify full serving performance.
+
+Do not assume a vendor is invariant to different zero-weight padding-ID
+permutations. Compare the original and fused payloads separately, retaining
+which fields differ, and qualify the real provider at the relevant geometry.
+Audit existing benchmark outputs as a separate functional diagnostic: preserve
+every differing round even if previous rounds match. Keep a failed exact-output
+gate failed while completing independent provenance/performance audits; neither
+algebraic zero contribution nor successful HTTP responses resolve its cause.
+
+When investigating that permutation, use the actual expert count, hidden and
+intermediate widths and top-k with the same packed weights/scales in both arms.
+Include repeated eager execution, changing-input Graph replay, mixed/all-padding
+rows and an independent signed-INT4 reference for nonzero valid outputs. A
+matching vendor component matrix narrows the hypothesis; it does not explain
+a prior model divergence. Do not reproduce an unspecified Torch sort tie order
+as a production fix without causal evidence. For the next model diagnostic,
+save the actual HTTP bytes and token IDs/top logprobs, and distinguish single
+from explicitly grouped requests. Label short diagnostic requests separately
+from the original performance or accuracy cohort and preserve its failed gate.
+
+Equal HTTP bytes, temperature zero and a fixed seed do not establish equal
+execution batches. Use Core's `--enable-logging-iteration-details` where
+available; preserve raw log windows and context/generation request and token
+counts for single/grouped/single order controls. These are aggregate scheduler
+counts, not per-request layer inputs or actual padded GPU geometry. If counts
+differ, control enqueue-before-step through a supported execution interface
+before attributing decoded-text differences to a kernel.
+
+For an offline enqueue control, verify the actual Core client. The inspected
+v0.33 `InprocClient` (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) adds requests without
+stepping; a background client can process them before the enqueue loop finishes.
+Record waiting/running counts, rendered prompt token IDs and subsequent steps.
+Keep this changed engine mode separate from online serving acceptance.
+Enqueue IDs can be internal while `RequestOutput.request_id` is external.
+Observe Core's real mapping; do not compare opaque IDs directly or strip a
+suffix by guesswork. Preserve a harness failure and its completed requests when
+repairing diagnostics, and disclose any changed phase order or lost controls.
+
+For online control, inspect the target's public pause API and router registration.
+The inspected v0.33 dev router supports `pause?mode=keep&clear_cache=false`,
+`is_paused` and `resume`: keep accepts requests while scheduling is paused.
+Abort/wait reject new requests and are not equivalent. Retain every pause-state
+receipt, raw request/response and iteration window. A pending frontend future
+or settling interval does not prove Core queue depth; verify actual admission
+after resume. Preserve the engine mode and phase-order controls in both arms.
+
+Check the target's reproducibility contract separately. Core v0.33 does not
+guarantee default online reproducibility; its beta `VLLM_BATCH_INVARIANT` mode
+is a separate capability requiring architecture/provider validation. Do not
+enable it in one arm or assume that documented AMD support covers HCU gfx938.
+Retain original failed gates while qualifying this capability independently.
+Generated Triton AST and cached launch-option comparisons can narrow a
+compilation hypothesis, but cache entries may include benchmark candidates;
+their presence does not identify the binary actually executed or its cause.
+Separate selected profiler-event duration sums from benchmark throughput and
+critical-path latency. If the real shape uses a provider's default launch
+configuration, investigate that provider's supported tuning path; a missing
+shape file proves neither a correctness defect nor a performance improvement.
+
+Use the provider's documented tuning entry when available, in a private physical
+installation with private logs and caches: it may write configs beside its
+installed source. Confirm CLI parameter mapping against both runtime GEMM
+filenames; names such as hidden/FFN can map differently to local N and K.
+Keep numerical references and changed-input Graph checks separate from tuning
+scores, especially if the tool has no complete correctness reference.
+
+Check the tuner's actual compiler API before spending a device run. A Triton
+version or reported config-capability family does not establish support for
+vendor-only `autotune` keywords such as `perf_debug`. When repairing the provider's
+tool, preserve candidate generation and measurement policy and emit its parser
+format within that tool; do not inject runtime overrides through the Plugin.
+Track compile-only, training, parsing, correctness and measured CSV export
+separately. A successful dry-run establishes parameter mapping only.
+
+If compile/training/parsing succeeded but benchmark collection fails on a
+missing dependency, retain the original exit code and generated configs. Check
+whether the selected public CLI supports benchmark-only recovery: the inspected
+BoltOps `--benchmark` path skips Steps1-3 and reuses installed configs. Add only
+missing dependencies in physically owned package/metadata directories; validate
+shared dependency owners and RECORDs before and after installation. Seal the
+configs, recover Steps4-5 in a new bounded run, and bind its result to the original
+successful stages. This path uses relaxed CSV discovery, so separately require
+the exact requested M/architecture/dtype/geometry coverage and positive finite
+measurements. Do not retune, rewrite a failed full-run receipt, or let old native
+or model supervisors silently accept the recovered lineage.
+
+Inspect the current correctness stage rather than relying on an older guide.
+The observed INT4 W4A8 tuner uses FP16 and enables its reference only for
+M<=256; its Torch fallback shares provider activation quantization. That does
+not qualify BF16 serving or larger batches. Check independent signed-INT4 math
+and changing-input Graph execution for the actual serving dtype and shape
+before model/performance acceptance. Retain any existing unmerged provider
+repairs in an explicitly recorded validation combination; replacing that
+combination with the provider's default branch can silently remove a fix.
+
+
+After tuning, distinguish packing parity within one configuration from numerical
+comparisons between untuned and tuned configurations. Keep weights, inputs and
+routes identical in a separate component comparison before attributing changed
+model outputs to a particular tile or reduction. Even matching aggregate online
+steps and passing component references do not close observed model differences.
+Inspect whether a changed K tile also changes where scales enter accumulation;
+that source hypothesis is not proof of the first model divergence.
+
+Persist each child exit code and identity-bound descendant state before port
+or attestation checks that can raise. If the controller loses an unsaved exit
+code, record it as unknown. A later successful bind does not establish immediate
+port release or exit0; retain the first refusal and resume only missing work.
+For bind refusals, capture the task port's TCP/TCP6 state at the time of failure:
+TIME_WAIT and a live listener are different observations. Keep immediate bind,
+bounded later release, process exit and teardown diagnostics as separate results.
+
 ## Native JIT and interrupted cold builds
 
 When a vendor builds after a native-module miss, compatibility stubs must not
