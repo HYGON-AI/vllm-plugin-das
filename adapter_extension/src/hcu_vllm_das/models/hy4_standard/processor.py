@@ -205,6 +205,8 @@ def adaptive_resize(
         raise ValueError(
             "Video dimensions, frame count and pixel budget must be positive"
         )
+    if video_max_image_size < factor:
+        raise ValueError("video_max_image_size must fit at least one patch and merge")
     frame_tokens = height * width // factor**2 + max(height, width) // factor
     budget = max(
         1,
@@ -214,14 +216,19 @@ def adaptive_resize(
     )
     if frame_tokens * num_frames > budget:
         scale = math.sqrt(budget / (frame_tokens * num_frames))
-    elif height * width > video_max_image_size**2:
-        scale = video_max_image_size / math.sqrt(height * width)
     else:
         scale = 1.0
-    return (
-        max(factor, int(height * scale) // factor * factor),
-        max(factor, int(width * scale) // factor * factor),
-    )
+    if height * width > video_max_image_size**2:
+        scale = min(scale, video_max_image_size / math.sqrt(height * width))
+    h = max(factor, int(height * scale) // factor * factor)
+    w = max(factor, int(width * scale) // factor * factor)
+    # Clamping a thin axis to one patch can exceed the frame area again.
+    if h * w > video_max_image_size**2:
+        if h >= w:
+            h = int(video_max_image_size**2 // w // factor) * factor
+        else:
+            w = int(video_max_image_size**2 // h // factor) * factor
+    return h, w
 
 
 class HYV4VideoProcessorKwargs(VideosKwargs, total=False):  # type: ignore[call-arg]
@@ -351,7 +358,8 @@ class HYV4VLVideoProcessor(BaseVideoProcessor):
                     w,
                     t,
                     patch_size,
-                    merge_size,
+                    merge_size
+                    * kwargs.get("spatial_patch_size", self.spatial_patch_size),
                     size.longest_edge,
                     video_max_image_size or self.video_max_image_size,
                     timestamp_token_per_frame
@@ -492,8 +500,11 @@ class HYV4VLProcessor(ProcessorMixin):
         processor_dict, _ = HYV4VLImageProcessor.get_image_processor_dict(
             pretrained_model_name_or_path, **load_kwargs
         )
+        video_processor_dict, _ = HYV4VLVideoProcessor.get_video_processor_dict(
+            pretrained_model_name_or_path, **load_kwargs
+        )
         image_kwargs = {**processor_dict, **kwargs.pop("images_kwargs", {})}
-        video_kwargs = {**processor_dict, **kwargs.pop("videos_kwargs", {})}
+        video_kwargs = {**video_processor_dict, **kwargs.pop("videos_kwargs", {})}
         for key, value in kwargs.items():
             if key in HYV4ImageProcessorKwargs.__annotations__:
                 image_kwargs[key] = value

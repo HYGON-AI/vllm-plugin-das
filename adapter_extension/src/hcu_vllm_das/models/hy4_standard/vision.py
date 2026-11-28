@@ -333,6 +333,19 @@ class HYV4VisionTransformer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.rotary_pos_emb is not None
         max_grid = max(max(h, w) for _, h, w in grid_thw)
+        if max_grid > self.rotary_pos_emb.max_position_embeddings:
+            # The learned position grid is interpolated for tall/wide images;
+            # its initial edge is not an input-axis limit for rotary positions.
+            self.rotary_pos_emb = get_rope(
+                head_size=self.config.hidden_size // self.config.num_attention_heads,
+                max_position=max_grid,
+                is_neox_style=True,
+                rope_parameters={
+                    "rope_theta": self.config.rope_2d_theta,
+                    "partial_rotary_factor": 0.5,
+                },
+                dtype=torch.float32,
+            ).to(device=self.device)
         cos_table, sin_table = self.rotary_pos_emb.get_cos_sin(max_grid)
         indices = [
             torch.stack(

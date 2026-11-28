@@ -91,3 +91,31 @@ An additional 16 concurrent requests with input lengths of 39–99 tokens all
 returned their expected arithmetic answers.
 HumanEval, long-context accuracy, Graph execution and comparative throughput
 remain separate validation work.
+
+## DeepEP low-latency validation
+
+For the same installed DP16/EP16 DFly service, replace these two options in the
+command above:
+
+```bash
+  --all2all-backend deepep_low_latency \
+  --max-num-batched-tokens 256
+```
+
+The 4096-token HT budget requests about 24.5 GiB of RocSHMEM heap per rank with
+this checkpoint and failed allocation during LL startup. A 256-token budget
+requests about 1.65 GiB; the rest of the command and environment stayed unchanged.
+
+On runtime commit `852fb81` (documentation head `ef19b1b`), LL loaded the full
+checkpoint and correctly served text, both image layouts and the video. The
+same 16 concurrent arithmetic requests passed 16/16; all 16 ranks had nonzero
+draft and accepted counters. These functional requests produced 26 drafts,
+156 draft tokens and 66 accepted tokens, with `/health` returning 200 afterward.
+This is a short functional check, not a throughput comparison or full accuracy
+evaluation. PCP/PD and HiSparse are outside this result.
+
+The subsequent review fixes cover per-video timing cache identity, dedicated
+video config loading, simultaneous resize bounds, compressed-video profiling,
+and 2-D rotary table growth. An isolated wheel installation passed 30 new CPU
+regressions and 79 existing checks; two HCU-only tests were skipped in this CPU
+run. These checks do not replace full-model validation of the revised code.

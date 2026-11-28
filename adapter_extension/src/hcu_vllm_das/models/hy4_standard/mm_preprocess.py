@@ -9,6 +9,7 @@ from functools import partial
 from typing import ClassVar
 
 import torch
+from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.multimodal.parse import (
     DictEmbeddingItems,
@@ -171,19 +172,24 @@ class HYV4VLProcessingInfo(BaseProcessingInfo):
         max_frames = options.get("max_frames", processor.max_frames)
         side = options.get("video_max_image_size", processor.video_max_image_size)
         available = max(1, seq_len // max(1, sum(mm_counts.values())))
+        min_frames = 1 if config.spatial_patch_size == 1 else 2
+        if max_frames < min_frames:
+            raise ValueError("max_frames cannot represent a supported HYV4 video")
+        merge = config.spatial_merge_size * config.spatial_patch_size
+        factor = config.patch_size * merge
         best = (
             0,
-            1,
-            config.patch_size * config.spatial_merge_size,
-            config.patch_size * config.spatial_merge_size,
+            min_frames,
+            factor,
+            factor,
         )
-        for frames in range(1, min(max_frames, available) + 1):
+        for frames in range(min_frames, min(max_frames, available) + 1):
             height, width = adaptive_resize(
                 side,
                 side,
                 frames,
                 config.patch_size,
-                config.spatial_merge_size,
+                merge,
                 maximum,
                 side,
                 options.get(
@@ -229,23 +235,25 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
         )
 
     def get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
-        size = self.info.get_image_size_with_most_features()
-        frames, height, width = self.info.get_dummy_video_shape(seq_len, mm_counts)
-        videos = self._get_dummy_videos(
-            width=width,
-            height=height,
-            num_frames=frames,
-            num_videos=mm_counts.get("video", 0),
-            overrides=mm_options.get("video"),
-        )
-        return {
-            "image": self._get_dummy_images(
+        data = {}
+        if mm_counts.get("image", 0):
+            size = self.info.get_image_size_with_most_features()
+            data["image"] = self._get_dummy_images(
                 width=size.width,
                 height=size.height,
                 num_images=mm_counts.get("image", 0),
                 overrides=mm_options.get("image"),
-            ),
-            "video": [
+            )
+        if mm_counts.get("video", 0):
+            frames, height, width = self.info.get_dummy_video_shape(seq_len, mm_counts)
+            videos = self._get_dummy_videos(
+                width=width,
+                height=height,
+                num_frames=frames,
+                num_videos=mm_counts["video"],
+                overrides=mm_options.get("video"),
+            )
+            data["video"] = [
                 (
                     video,
                     {
@@ -258,11 +266,19 @@ class HYV4VLDummyInputsBuilder(BaseDummyInputsBuilder[HYV4VLProcessingInfo]):
                     },
                 )
                 for video in videos
-            ],
-        }
+            ]
+        return data
 
 
 class HYV4VLMultiModalProcessor(BaseMultiModalProcessor[HYV4VLProcessingInfo]):
+    def _call_hf_processor(self, hf_data, hf_kwargs):
+        # apply() has attached the effective interval to each video. Suppress
+        # configured defaults here too: Core merges them again at the HF call,
+        # which may now contain only the videos missing from the cache.
+        return super()._call_hf_processor(
+            hf_data, {**hf_kwargs, "second_per_grid_ts": None}
+        )
+
     def apply(self, inputs, timing_ctx):
         processor = self.info.get_hf_processor(**inputs.hf_processor_mm_kwargs)
         prompt = inputs.prompt
@@ -286,6 +302,7 @@ class HYV4VLMultiModalProcessor(BaseMultiModalProcessor[HYV4VLProcessingInfo]):
         if intervals is not None:
             videos = inputs.mm_data_items.get("video", ())
             mm_items = inputs.mm_data_items
+            mm_uuids = inputs.mm_uuid_items
             if not isinstance(videos, DictEmbeddingItems):
                 if len(intervals) != len(videos):
                     raise ValueError("second_per_grid_ts must match video count")
@@ -302,10 +319,34 @@ class HYV4VLMultiModalProcessor(BaseMultiModalProcessor[HYV4VLProcessingInfo]):
                 mm_items = MultiModalDataItems(
                     {**inputs.mm_data_items, "video": VideoProcessorItems(normalized)}
                 )
+                video_uuids = (mm_uuids or {}).get("video")
+                if video_uuids is not None:
+                    # Core substitutes UUIDs for the whole media item, so an
+                    # explicit processing override needs its own UUID variant.
+                    # Leave raw metadata and UUID-only retrieval to Core when
+                    # no interval option was supplied. None IDs retain native
+                    # content hashing of the normalized per-video metadata.
+                    algorithm = self.info.ctx.get_mm_config().mm_hasher_algorithm
+                    mm_uuids = {
+                        **mm_uuids,
+                        "video": [
+                            MultiModalHasher.hash_kwargs(
+                                algorithm,
+                                video=uuid,
+                                second_per_grid_t=float(interval),
+                            )
+                            if uuid is not None
+                            else None
+                            for uuid, interval in zip(video_uuids, intervals)
+                        ],
+                    }
             kwargs = dict(inputs.hf_processor_mm_kwargs)
             kwargs.pop("second_per_grid_ts", None)
             inputs = replace(
-                inputs, mm_data_items=mm_items, hf_processor_mm_kwargs=kwargs
+                inputs,
+                mm_data_items=mm_items,
+                mm_uuid_items=mm_uuids,
+                hf_processor_mm_kwargs=kwargs,
             )
         return super().apply(inputs, timing_ctx)
 
