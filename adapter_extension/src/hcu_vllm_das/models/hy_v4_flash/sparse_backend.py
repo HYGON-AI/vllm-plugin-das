@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """HCU kernel leaves on the actual Core033 sink-aware sparse MLA backend."""
 
+from dataclasses import dataclass
+from functools import cache as cache_result
+
 import torch
 import torch.nn.functional as F
 
@@ -10,10 +13,19 @@ from vllm.models.hy_v4.nvidia.flashmla_sparse import (
     HYV4FlashMLASparseBackend as CoreSinkBackend,
     HYV4FlashMLASparseImpl as CoreSinkImpl,
 )
-from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
+from vllm.logger import init_logger
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    FlashMLASparseMetadata,
+    FlashMLASparseMetadataBuilder,
+    _fp8_kv_pages,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from ...environment import fp8_fusions_enabled
+from .compact_prefill import compact_prefill_offsets
 from .hisparse_runtime import (
     HiSparseBindingError,
     HiSparseRuntimeBinding,
@@ -24,6 +36,97 @@ from .hisparse_runtime import (
 )
 from .flashmla_ops import get_flashmla_ops
 from .runtime import is_hcu_platform
+
+logger = init_logger(__name__)
+_GATHER_GROUP_SIZE = 512
+
+
+@cache_result
+def _get_compact_prefill_gather():
+    try:
+        from lightop.op import decode_gather_and_up_convert_with_indices
+    except ImportError:
+        return None
+    from hcu_adapter._base import Missing
+
+    op = decode_gather_and_up_convert_with_indices
+    return op if callable(op) and not isinstance(op, Missing) else None
+
+
+@dataclass
+class _CompactPrefill:
+    starts: torch.Tensor
+    slots: torch.Tensor
+    lengths: torch.Tensor
+    rows: int
+
+
+@dataclass
+class _SparseMetadata(FlashMLASparseMetadata):
+    compact_prefill: _CompactPrefill | None = None
+
+
+class CompactPrefillMetadataBuilder(FlashMLASparseMetadataBuilder):
+    metadata_cls = _SparseMetadata
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._use_compact_prefill = False
+        if (
+            self.fp8_use_mixed_batch and is_hcu_platform()
+            and vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+            and fp8_fusions_enabled()
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+        ):
+            from .fullgraph_runner import _qualified_worker_tuple
+
+            props = torch.cuda.get_device_properties(device)
+            arch = props.gcnArchName.split(":")[0]
+            self._use_compact_prefill = (
+                arch == "gfx936"
+                and _qualified_worker_tuple(
+                    vllm_config.parallel_config.tensor_parallel_size,
+                    arch, props.multi_processor_count,
+                )
+                and _get_compact_prefill_gather() is not None
+            )
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if not self._use_compact_prefill or metadata.num_prefills == 0:
+            return metadata
+        if metadata.block_size % 64 != 0:
+            return metadata
+        seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound
+        if seq_lens is None:
+            return metadata
+        first = metadata.num_decodes
+        last = first + metadata.num_prefills
+        offsets = compact_prefill_offsets(
+            seq_lens[first:last].tolist(),
+            metadata.num_actual_tokens - metadata.num_decode_tokens,
+        )
+        if offsets is None:
+            return metadata
+        rows = offsets[-1]
+        starts = torch.tensor(offsets[:-1], dtype=torch.int32, pin_memory=True).to(
+            self.device, non_blocking=True
+        )
+        padded_rows = ((rows + _GATHER_GROUP_SIZE - 1) // _GATHER_GROUP_SIZE) * _GATHER_GROUP_SIZE
+        row = torch.arange(padded_rows, dtype=torch.int32, device=self.device)
+        live = row.clamp_max(rows - 1)
+        request = torch.bucketize(live, starts[1:], right=True)
+        position = live - starts[request]
+        block_size = metadata.block_size
+        pages = metadata.block_table[first:last]
+        slots = pages[request, position // block_size] * block_size + position % block_size
+        slots.masked_fill_(row >= rows, -1)
+        lengths = (rows - row[::_GATHER_GROUP_SIZE]).clamp_(0, _GATHER_GROUP_SIZE)
+        metadata.compact_prefill = _CompactPrefill(
+            starts, slots.view(-1, _GATHER_GROUP_SIZE), lengths, rows,
+        )
+        return metadata
 
 
 class FlashSparseImpl(CoreSinkImpl):
@@ -293,6 +396,65 @@ class FlashSparseImpl(CoreSinkImpl):
         return binding.read(
             lambda: reader(q, kv_c_and_k_pe_cache, attn_metadata, layer)
         )
+
+    def _forward_fp8_kv_mixed_batch(
+        self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata,
+        kernel_metadata=None,
+    ):
+        fp8_fallback = super()._forward_fp8_kv_mixed_batch
+        prefill = getattr(attn_metadata, "compact_prefill", None)
+        cache = kv_c_and_k_pe_cache
+        if not (
+            prefill is not None and kernel_metadata is None
+            and self._hcu_fp8_ds_mla_writer and self.kv_cache_dtype == "fp8_ds_mla"
+            and q.shape[0] == attn_metadata.num_actual_tokens
+            and not self.need_to_return_lse_for_decode
+        ):
+            return fp8_fallback(q, cache, topk_indices, attn_metadata, kernel_metadata)
+        block_size = attn_metadata.block_size
+        pages, block_stride_rows = _fp8_kv_pages(cache, block_size)
+        if not self._use_fp8_small_heads(q.unsqueeze(0), pages, topk_indices.unsqueeze(0)):
+            return fp8_fallback(q, cache, topk_indices, attn_metadata, kernel_metadata)
+        gather = _get_compact_prefill_gather()
+        _, workspace, *_ = current_workspace_manager().get_simultaneous(*self.workspace_specs)
+        if gather is None or prefill.slots.numel() > workspace.shape[0]:
+            return fp8_fallback(q, cache, topk_indices, attn_metadata, kernel_metadata)
+
+        num_decode = attn_metadata.num_decode_tokens
+        decoded = None
+        if num_decode:
+            decoded, _ = fp8_fallback(q[:num_decode], cache, topk_indices[:num_decode], attn_metadata)
+        window = self._use_window_fp8_prefix(q.unsqueeze(0), pages, topk_indices.unsqueeze(0))
+        logical = topk_indices[num_decode:, :512] if window else topk_indices[num_decode:]
+        request = attn_metadata.req_id_per_token[num_decode: q.shape[0]]
+        indices, counts = triton_convert_req_index_to_global_index(
+            request, attn_metadata.block_table, logical,
+            BLOCK_SIZE=block_size, NUM_TOPK_TOKENS=logical.shape[1],
+            HAS_PREFILL_WORKSPACE=True,
+            prefill_workspace_request_ids=request - attn_metadata.num_decodes,
+            prefill_workspace_starts=prefill.starts, return_valid_counts=True,
+        )
+        slots = prefill.slots
+        if block_stride_rows is not None and block_stride_rows != block_size:
+            # The flattened vendor cache may include gaps between Core blocks.
+            physical = slots.div(block_size, rounding_mode="floor") * block_stride_rows
+            physical.add_(slots.remainder(block_size)).masked_fill_(slots < 0, -1)
+            slots = physical
+        remap = torch.empty_like(slots)
+        gathered = workspace[:slots.numel()].view(*slots.shape, 576)
+        gather(pages, slots, gathered, prefill.lengths, remap, 1)
+        compact = gathered.view(-1, 576).index_select(0, remap.view(-1)[:prefill.rows])
+        q_prefill = q[num_decode:].contiguous()
+        sinks = self._sinks_for_query(q_prefill, 1, q_prefill.shape[1])
+        if sinks is not None:
+            sinks = sinks.contiguous()
+        out, _, _ = self._hcu_ops.sparse_fwd(
+            q_prefill, compact.unsqueeze(1), indices.unsqueeze(1), self.softmax_scale,
+            attn_sink=sinks, topk_length=counts,
+        )
+        logger.info_once("HYV4 gfx936 compact BF16 sparse prefill active (H=%d K=%d)",
+                         q_prefill.shape[1], indices.shape[1])
+        return (out if decoded is None else torch.cat((decoded, out))), None
 
     def _bf16_flash_mla_kernel(
         self,

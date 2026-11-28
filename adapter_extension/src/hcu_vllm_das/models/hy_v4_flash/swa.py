@@ -8,13 +8,10 @@ import torch
 from torch import nn
 
 from vllm.forward_context import get_forward_context
-from .sparse_backend import FlashSparseKernelBackend
+from .sparse_backend import CompactPrefillMetadataBuilder, FlashSparseKernelBackend
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
-from vllm.v1.attention.backends.mla.flashmla_sparse import (
-    FlashMLASparseMetadata,
-    FlashMLASparseMetadataBuilder,
-)
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 from .runtime import is_hcu_platform
 from .flashmla_ops import get_flashmla_ops
 
@@ -31,7 +28,7 @@ class FlashWindowIndexGroupBuilder(SparseMLAIndexGroupBuilder):
         return super().register_layer(is_index_producing_layer, None, **kwargs)
 
 
-class FlashSparseMetadataBuilder(FlashMLASparseMetadataBuilder):
+class FlashSparseMetadataBuilder(CompactPrefillMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
