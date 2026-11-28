@@ -574,6 +574,17 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # GLM5Next KDA/K-pool and DeepSeek V4 attention see the full,
         # replicated token batch, including during profiling.
         if pcp_size <= 1 or _uses_global_pcp_batch(self.vllm_config):
+            if is_step5_config(self.vllm_config):
+                from vllm_hcu.model_executor.layers.fused_moe.dp_pipe_output_pool import (
+                    measured_profile_scope,
+                )
+                from vllm_hcu.model_executor.layers.fused_moe.workspace_growth import (
+                    reserve_step5_decode_workspace,
+                )
+
+                with measured_profile_scope(self.vllm_config, self.device):
+                    reserve_step5_decode_workspace(self)
+                    return super().profile_run()
             return super().profile_run()
 
         original_max = self.max_num_tokens

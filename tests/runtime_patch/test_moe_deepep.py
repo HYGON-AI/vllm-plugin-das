@@ -159,7 +159,18 @@ def test_deepseek_expert_resolvers_strictly_separate_activation_and_clamp(
         module._lightop_clamp("fuse_silu_mul_quant")
 
 
-def test_all2all_dispatch_selection_contract():
+def test_all2all_dispatch_selection_contract(monkeypatch):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    dispatch_modes = []
+    monkeypatch.setattr(
+        deepep_runtime,
+        "configure_step5_ll_tp_tokens",
+        lambda prepare, moe: dispatch_modes.append(
+            (prepare.use_fp8_dispatch, prepare.use_int8_dispatch)
+        ),
+    )
+
     class DeepEPLLPrepareAndFinalize:
         pass
 
@@ -214,6 +225,9 @@ def test_all2all_dispatch_selection_contract():
     result = module.maybe_make_prepare_finalize(moe, int8_config)
     assert result.use_fp8_dispatch is False
     assert result.use_int8_dispatch is True
+    # Upstream leaves FP8 off for channel quantization during construction.
+    # Step5's TP adapter must see the final HCU dispatch mode.
+    assert dispatch_modes == [(True, False), (False, True)]
 
 
 def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():

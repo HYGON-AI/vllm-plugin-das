@@ -85,9 +85,10 @@ class Tests(unittest.TestCase):
         self.p = subject.Step5DPFabricProxy(self.n, self.f)
 
     def test_dispatch_validated_byte_payload(self):
-        for size in [66624, 266496]:
+        payloads = [66624, 266496] + [rows * width for rows in (40, 48, 56) for width in (4164, 4196)]
+        for size in payloads:
             self.p.all_gather(Tensor("uint8", (size * 4,)), Tensor("uint8", (size,)))
-        self.assertEqual(self.f.calls, ["gather", "gather"])
+        self.assertEqual(self.f.calls, ["gather"] * len(payloads))
         self.assertEqual(self.n.calls, [])
 
     def test_other_payloads_and_noncontiguous_inputs_fall_back(self):
@@ -120,12 +121,13 @@ class Tests(unittest.TestCase):
             )
         for t in [
             Tensor("bf16", (128, 4096)),
+            Tensor("bf16", (192, 4096)),
             Tensor("float32", (256, 4096)),
             Tensor("bf16", (256, 4096), False),
         ]:
             self.p.reduce_scatter(t, t)
         self.assertEqual(self.f.calls, ["scatter", "scatter"])
-        self.assertEqual(self.n.calls, ["reduce_scatter"] * 3)
+        self.assertEqual(self.n.calls, ["reduce_scatter"] * 4)
 
     def test_explicit_stream_keeps_native(self):
         t = Tensor("uint8", (266496,))

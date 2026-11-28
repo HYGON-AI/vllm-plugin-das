@@ -142,6 +142,11 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_shutdown)
     def hcu_shutdown(self):
+        deepgemm_megamoe = sys.modules.get(
+            "vllm_hcu.model_executor.layers.fused_moe.deepgemm_megamoe"
+        )
+        if deepgemm_megamoe is not None:
+            deepgemm_megamoe.release_buffers()
         megamoe_runtime = sys.modules.get(
             "vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime"
         )

@@ -113,6 +113,7 @@ def test_target_metadata_schema_and_round_trip(mooncake):
         "registered_layer_indices",
         "registered_group_indices",
         "num_blocks_per_layer",
+        "dsa_aux",
     )
     metadata = _metadata(
         mooncake,
@@ -128,6 +129,12 @@ def test_target_metadata_schema_and_round_trip(mooncake):
     encoded = msgspec.msgpack.encode(metadata)
     decoded = msgspec.msgpack.decode(encoded, type=mooncake.MooncakeXferMetadata)
     assert decoded == metadata
+
+
+def test_non_step5_wire_payload_omits_empty_auxiliary_extension(mooncake):
+    metadata = _metadata(mooncake)
+    payload = msgspec.msgpack.decode(msgspec.msgpack.encode(metadata))
+    assert "dsa_aux" not in payload
 
 
 def test_mooncake_uses_v028_page_layout(mooncake):

@@ -31,13 +31,15 @@ from boltops.fused_moe.triton.moe_config_utils import try_get_optimal_moe_config
 from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
 from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
 from vllm_hcu.platforms import envs as henvs
+from .step5_wide_fp8_gemm import needs_wide_a, invoke_wide_fp8
 
 FP8 = torch.float8_e4m3fn
 _announced = False
 STEP5_EXPERT_GRID = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 )
-_step5_grid_announced = False
+STEP5_EXPERT_GRID_DP4_SHAPES = os.environ.get("HCU_STEP5_EXPERT_GRID_DP4_SHAPES", "0") == "1"
+_step5_grid_announced = set()
 STEP5_PREFILL_G2 = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
 )
@@ -123,6 +125,58 @@ def _ep_swiglustep_quant_deepgemm_kernel(
         # Router weights belong to DeepGEMM's unpermute/reduce after GEMM2.
         # Invalid rows store zero q and the harmless native zero-row scale.
         tl.store(scale_ptr + rows, scale, mask=row_mask)
+
+
+@triton.jit
+def _ep_masked_swiglustep_quant_deepgemm_kernel(
+    q_ptr, scale_ptr, in_ptr, counts_ptr,
+    T: tl.constexpr, D: tl.constexpr, LIMIT: tl.constexpr,
+    LANES: tl.constexpr, CH: tl.constexpr,
+):
+    expert = tl.program_id(0) // LANES
+    lane = tl.program_id(0) % LANES
+    count = tl.minimum(tl.load(counts_ptr + expert), T)
+    cols = tl.arange(0, CH)
+    # Counts remain GPU values so replay accepts new routing without reading
+    # uninitialized padding. Reuse Step5's post-SiLU clamp and BF16 rounding.
+    for row in range(lane, count, LANES):
+        flat = expert.to(tl.int64) * T + row
+        offs = flat * (2 * D) + cols
+        y0 = _ep_swiglu_chunk(in_ptr, offs, True, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, True, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, True, LIMIT, D)
+        amax = tl.maximum(tl.maximum(tl.max(tl.abs(y0), 0), tl.max(tl.abs(y1), 0)),
+                          tl.max(tl.abs(y2), 0))
+        scale = tl.maximum(amax.to(tl.float32), 1.0e-10) / 448.0
+        inv = 1.0 / scale
+        out = flat * D + cols
+        tl.store(q_ptr + out, (y0 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + CH, (y1 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(scale_ptr + flat, scale)
+
+
+def ep_masked_swiglustep_quant_deepgemm(cache1, counts, limit=7.0, *, q=None, scale=None):
+    """Step5 activation and full-token FP8 quantization in LL expert layout."""
+    if (cache1.dtype != torch.bfloat16 or cache1.ndim != 3
+            or cache1.shape[-1] != 3072 or not cache1.is_contiguous()):
+        raise ValueError("Step5 LL activation requires contiguous BF16 [E,T,3072]")
+    e, t, _ = cache1.shape
+    if (counts.dtype != torch.int32 or counts.shape != (e,)
+            or not counts.is_contiguous() or counts.device != cache1.device):
+        raise ValueError("Step5 LL requires contiguous device per-expert counts")
+    if q is None:
+        q = torch.empty((e, t, 1536), dtype=FP8, device=cache1.device)
+    if scale is None:
+        scale = torch.empty((e, t, 1), dtype=torch.float32, device=cache1.device)
+    if (q.shape != (e, t, 1536) or q.dtype != FP8 or not q.is_contiguous()
+            or scale.shape != (e, t, 1) or scale.dtype != torch.float32
+            or not scale.is_contiguous() or q.device != cache1.device or scale.device != cache1.device):
+        raise ValueError("Step5 LL activation output/scale geometry differs")
+    _ep_masked_swiglustep_quant_deepgemm_kernel[(e * 32,)](
+        q, scale, cache1, counts, T=t, D=1536, LIMIT=float(limit), LANES=32, CH=512,
+        num_warps=4, num_stages=1)
+    return q, scale
 
 
 @triton.jit
@@ -491,7 +545,7 @@ def _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted
         B_scale.stride(1) if B_scale.ndim >= 2 else 0,
         A.size(0), 0, 0,
         MUL_ROUTED_WEIGHT=False,
-        USE_ADDR_OFFSET_INT64_A=A.numel() * A.element_size() >= lim,
+        USE_ADDR_OFFSET_INT64_A=needs_wide_a(A),
         USE_ADDR_OFFSET_INT64_B=B.numel() * B.element_size() >= lim,
         USE_ADDR_OFFSET_INT64_C=C.numel() * C.element_size() >= lim,
         top_k=top_k, compute_type=compute_type, use_fp8_w8a8=True, use_int8_w8a8=False,
@@ -514,6 +568,10 @@ def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_
                            sorted_w, expert_ids, nvalid, top_k, compute_type, config=config,
                            **{k: v for k, v in kw.items() if k != "ck_sorting"})
         return
+    if needs_wide_a(A):
+        return invoke_wide_fp8(
+            A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
+            sorted_w, expert_ids, nvalid, top_k, compute_type, config, **kw)
     invoke_fused_moe_kernel(A, B, C, A_scale, B_scale, None, topk_weights, topk_ids,
                             sorted_ids, sorted_w, expert_ids, nvalid, False, top_k,
                             compute_type=compute_type, use_fp8_w8a8=True,
@@ -620,7 +678,8 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
         a_q, a_s = hidden_states, a1_scale.view(-1, 1) if a1_scale.numel() > 1 else a1_scale
 
     expert_layout = None
-    if (M == 256 and configs is None and STEP5_EXPERT_GRID
+    if ((M == 256 or (STEP5_EXPERT_GRID_DP4_SHAPES and M in (160, 192, 224)))
+            and configs is None and STEP5_EXPERT_GRID
             and EP_SORT_MAX_ROUTES >= M * topk):
         from .step5_expert_grid import can_use_expert_grid, expert_grid_configs
 
@@ -630,10 +689,9 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
             cfg1, cfg2 = expert_grid_configs()
             bm, presort, use_mls = 16, False, False
             expert_layout = torch.empty((E, 2), dtype=torch.int32, device=a_q.device)
-            global _step5_grid_announced
-            if not _step5_grid_announced:
-                _step5_grid_announced = True
-                print("[step5_expert_grid] active: E22 M256 BM16 workers4", flush=True)
+            if M not in _step5_grid_announced:
+                _step5_grid_announced.add(M)
+                print(f"[step5_expert_grid] active: E22 M{M} BM16 workers4", flush=True)
     sorting_args = (topk_ids, topk_weights, expert_mask, G, E, bm, expert_map)
     if expert_layout is None:
         sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(*sorting_args)
@@ -791,3 +849,81 @@ def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, 
                           topk_ids[s:s + CHUNK], expert_map, w1_scale, w2_scale,
                           a1_scale=None if a1 is None or a1.numel() == 1 else a1[s:s + CHUNK], **kw)
         for s in range(0, M, CHUNK)])
+
+
+@triton.jit
+def _ep_masked_swiglustep_quant_deepgemm_kernel(
+    q_ptr,
+    scale_ptr,
+    in_ptr,
+    counts_ptr,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    LIMIT: tl.constexpr,
+    LANES: tl.constexpr,
+    CH: tl.constexpr,
+):
+    # Each expert owns a fixed row-worker grid. Counts remain GPU values,
+    # so graph replay handles new routing without processing padded rows.
+    expert = tl.program_id(0) // LANES
+    lane = tl.program_id(0) % LANES
+    count = tl.minimum(tl.load(counts_ptr + expert), T)
+    cols = tl.arange(0, CH)
+    for row in range(lane, count, LANES):
+        flat = expert.to(tl.int64) * T + row
+        offs = flat * (2 * D) + cols
+        y0 = _ep_swiglu_chunk(in_ptr, offs, True, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, True, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, True, LIMIT, D)
+        amax = tl.maximum(
+            tl.maximum(tl.max(tl.abs(y0), 0), tl.max(tl.abs(y1), 0)),
+            tl.max(tl.abs(y2), 0),
+        )
+        scale = tl.maximum(amax.to(tl.float32), 1.0e-10) / 448.0
+        inv = 1.0 / scale
+        out = flat * D + cols
+        tl.store(q_ptr + out, (y0 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + CH, (y1 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(scale_ptr + flat, scale)
+
+
+def ep_masked_swiglustep_quant_deepgemm(cache1, counts, limit=7.0, *, q=None, scale=None):
+    """Step5's existing post-SiLU clamp/BF16/FP8 math on LL expert rows."""
+    if (
+        cache1.dtype != torch.bfloat16
+        or cache1.ndim != 3
+        or cache1.shape[-1] != 3072
+        or not cache1.is_contiguous()
+    ):
+        raise ValueError("Step5 LL activation requires contiguous BF16 [E,T,3072]")
+    experts, capacity, _ = cache1.shape
+    if (
+        counts.dtype != torch.int32
+        or counts.shape != (experts,)
+        or not counts.is_contiguous()
+        or counts.device != cache1.device
+    ):
+        raise ValueError("Step5 LL requires contiguous GPU per-expert counts")
+    q_shape = (experts, capacity, 1536)
+    scale_shape = (experts, capacity, 1)
+    if q is None:
+        q = torch.empty(q_shape, dtype=FP8, device=cache1.device)
+    if scale is None:
+        scale = torch.empty(scale_shape, dtype=torch.float32, device=cache1.device)
+    if (
+        q.shape != q_shape
+        or q.dtype != FP8
+        or not q.is_contiguous()
+        or scale.shape != scale_shape
+        or scale.dtype != torch.float32
+        or not scale.is_contiguous()
+        or q.device != cache1.device
+        or scale.device != cache1.device
+    ):
+        raise ValueError("Step5 LL activation output/scale geometry differs")
+    _ep_masked_swiglustep_quant_deepgemm_kernel[(experts * 32,)](
+        q, scale, cache1, counts, T=capacity, D=1536, LIMIT=float(limit),
+        LANES=32, CH=512, num_warps=4, num_stages=1,
+    )
+    return q,scale

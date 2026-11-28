@@ -55,7 +55,11 @@ import torch.nn.functional as F
 import numpy as np
 from torch import nn
 
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode, VllmConfig, get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
+from vllm_hcu.runtime_compat.step5 import is_step5_pd_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
@@ -1882,6 +1886,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
+        self._step5_pd = is_step5_pd_config(get_current_vllm_config_or_none())
 
         if BOLTOPS_STAGES:
             stages = _boltops_attention()
@@ -1922,6 +1927,8 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         slot_mapping: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        attn_metadata: Step4DSAMetadata | None = None,
+        allow_paged_bridge: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Scatter K/V into the paged cache and return the flattened views.
 
@@ -1971,6 +1978,14 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 if kv_cache.dtype == torch.uint8
                 else kv_cache
             )
+            if allow_paged_bridge and base.stride(0) != block_size * base.stride(2):
+                from vllm_hcu.model_executor.layers.step5_paged_kv import (
+                    write_paged_kv_and_get_flat,
+                )
+                return write_paged_kv_and_get_flat(
+                    kv_cache, key, value, slot_mapping, k_scale, v_scale,
+                    metadata=attn_metadata,
+                )
             sizes = (num_blocks * block_size, num_kv_heads, head_size)
             strides = (base.stride(2), base.stride(1), 1)
             k_flat = base.as_strided(sizes, strides)
@@ -2024,6 +2039,8 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
             attn_metadata.slot_mapping,
             k_scale,
             v_scale,
+            attn_metadata=attn_metadata,
+            allow_paged_bridge=getattr(self, "_step5_pd", False),
         )
 
         plan = getattr(layer, "step4_sparse_plan", None)
@@ -2487,6 +2504,10 @@ class Step4PendingTable:
         self._row_of_slot: dict[int, int] = {}
         self._slot_of_row: list[int] = [-1] * capacity
         self._touched: list[int] = [-1] * capacity
+        # An asynchronous PD import may wait across many decode iterations.
+        # Its destination cannot be recycled until the request consumes it,
+        # or a cancelled import's DMA has completed.
+        self._reservations: dict[int, object] = {}
         self.step = 0
 
     def begin_step(self) -> None:
@@ -2503,6 +2524,7 @@ class Step4PendingTable:
                 f"so this fails loudly rather than silently attending to noise."
             )
         self._touched[row] = self.step
+        self._reservations.pop(slot, None)
         return row
 
     def acquire(self, slot: int) -> int:
@@ -2513,9 +2535,28 @@ class Step4PendingTable:
             self._row_of_slot[slot] = row
             self._slot_of_row[row] = slot
         self._touched[row] = self.step
+        self._reservations.pop(slot, None)
         return row
 
+    def reserve(self, slot: int, owner: object) -> int:
+        previous = self._reservations.get(slot)
+        if previous is not None and previous is not owner:
+            raise RuntimeError("Step5 PD pending slot is reserved by another import")
+        row = self.acquire(slot)
+        self._reservations[slot] = owner
+        return row
+
+    def is_reserved(self, slot: int, owner: object) -> bool:
+        return self._reservations.get(slot) is owner
+
+    def release_reservation(self, slot: int, owner: object) -> None:
+        if self.is_reserved(slot, owner):
+            self._reservations.pop(slot)
+            self.release(slot)
+
     def release(self, slot: int) -> None:
+        if slot in self._reservations:
+            return
         row = self._row_of_slot.pop(slot, None)
         if row is not None:
             self._slot_of_row[row] = -1
@@ -2532,6 +2573,8 @@ class Step4PendingTable:
         Rows retired in the previous step retain their normal age until the
         next schedule has had a chance to protect a speculative rollback.
         """
+        if slot in self._reservations:
+            return
         row = self._row_of_slot.get(slot)
         if row is not None:
             self._touched[row] = self.step - (1 << 40)
@@ -2544,6 +2587,8 @@ class Step4PendingTable:
         fresh_retired = self.step - 1 - (1 << 40)
         oldest_row, oldest_step = -1, self.step
         for row in range(self.capacity):
+            if self._slot_of_row[row] in self._reservations:
+                continue
             if self._slot_of_row[row] < 0:
                 return row
             touched = self._touched[row]
@@ -2711,6 +2756,7 @@ class Step4DSAState:
         max_num_reqs: int = 0,
         max_model_len: int = 0,
         spec_query_len: int = 1,
+        step5_ll_allocation_barrier: bool = False,
     ) -> None:
         self.num_layers = num_layers
         self.geometry = geometry
@@ -2721,6 +2767,7 @@ class Step4DSAState:
         # no longer than this may be rolled back by rejection after the step,
         # so the regions it closes are kept recoverable; 1 disables that.
         self.spec_query_len = int(spec_query_len)
+        self._step5_ll_allocation_barrier = bool(step5_ll_allocation_barrier)
         # One row past the allocator's capacity, never handed out by the table.
         # The vectorized decode path writes every request's tail unconditionally
         # and sends the requests that have no tail here, which keeps the scatter
@@ -2838,6 +2885,16 @@ class Step4DSAState:
                 "capture time. The capture warmup must run at least one eager "
                 "step through the DSA layers first."
             )
+        # First-use allocations may synchronize HIP. Do not let a fast Step5
+        # rank enter LL receive while another rank grows its DSA summary pool.
+        step5_ep_cpu_group = None
+        if self._step5_ll_allocation_barrier:
+            import torch.distributed as step5_dist
+            from vllm.distributed import get_ep_group
+
+            step5_ep_cpu_group = get_ep_group().cpu_group
+            step5_dist.barrier(group=step5_ep_cpu_group)
+            torch.cuda.synchronize(device)
         # Read the block count and block size from whichever rank the cache
         # arrived in. On 0.28's fused 4-D page ([B, H, N, 2 * head_size]) the
         # naive shape[1]/shape[2] pair reads H (== 1 at TP8) as the block count
@@ -2885,6 +2942,9 @@ class Step4DSAState:
             2 * self.pending_key.numel() * self.pending_key.element_size() / 2**20,
         )
         self._allocate_graph_buffers(rows, device)
+        if step5_ep_cpu_group is not None:
+            torch.cuda.synchronize(device)
+            step5_dist.barrier(group=step5_ep_cpu_group)
 
     def _allocate_graph_buffers(self, pool_rows: int, device: torch.device) -> None:
         """Persistent decode-schedule buffers and the fixed-width score pool.
@@ -4141,6 +4201,9 @@ class Step4Indexer:
         index_q, index_k, index_z, weights = self._project(
             hidden_states[:num_tokens], positions[:num_tokens], num_tokens
         )
+        pd_capture = getattr(state, "_pd_aux_capture", None)
+        if pd_capture is not None:
+            pd_capture(self, md, sched, index_k, index_z)
         self._update_summaries(sched, index_k, index_z)
         prefill_logits, decode_logits, width = self._score(md, sched, index_q, weights)
 
@@ -4601,11 +4664,14 @@ class Step4Indexer:
                 if PREFILL_FP8_INDEXER and not DENSE_EQUIV and INDEXER_Q_CHUNK == 0
                 else torch.zeros
             )
-            prefill_logits = alloc(
-                (groups * num_prefill_tokens, max(width_prefill, 1)),
-                dtype=torch.float32,
-                device=device,
-            )
+            shape = (groups * num_prefill_tokens, max(width_prefill, 1))
+            workspace = getattr(state, "_pd_prefill_workspace", None)
+            if workspace is None:
+                prefill_logits = alloc(shape, dtype=torch.float32, device=device)
+            else:
+                prefill_logits = workspace.get(
+                    *shape, device=device, zero=alloc is torch.zeros,
+                )
         if DENSE_EQUIV:
             # All-zero scores plus topk >= every row's region count selects
             # every visible region, which makes DSA exactly full causal

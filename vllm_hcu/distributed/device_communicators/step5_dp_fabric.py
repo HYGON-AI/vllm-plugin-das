@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Optional Fabric fast path for the two validated uniform Step5 Decode shapes."""
+"""Optional Fabric fast path for validated uniform Step5 Decode shapes."""
 
 from __future__ import annotations
 
@@ -9,6 +9,18 @@ import torch
 
 from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+# Packed FP8 dispatch uses 4,164 bytes per row with int32 expert IDs and
+# 4,196 with int64 IDs. Keep the original payloads for the existing path.
+_DISPATCH_PAYLOADS = {
+    66624: "dispatch",
+    266496: "dispatch",
+    **{
+        rows * row_bytes: f"dispatch{rows}"
+        for rows in (40, 48, 56)
+        for row_bytes in (4164, 4196)
+    },
+}
 
 
 class Step5DPFabricProxy:
@@ -35,19 +47,20 @@ class Step5DPFabricProxy:
             )
 
     def all_gather(self, out, inp, stream=None):
+        dispatch = _DISPATCH_PAYLOADS.get(inp.numel())
         eligible = (
             stream is None
             and not self.disabled
             and self._group_depth == 0
             and inp.dtype == torch.uint8
             and inp.ndim == 1
-            and inp.numel() in (66624, 266496)
+            and dispatch is not None
             and inp.is_contiguous()
             and out.is_contiguous()
             and self.fabric.should_custom_ag(inp, 0)
         )
         if eligible:
-            self._announce("dispatch")
+            self._announce(dispatch)
             return self.fabric.all_gather_unreg(inp, out=out, dim=0)
         if stream is None:
             return self.original.all_gather(out, inp)

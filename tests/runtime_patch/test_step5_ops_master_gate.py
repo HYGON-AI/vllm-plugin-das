@@ -159,6 +159,39 @@ def test_cached_dense_entry_returns_before_touching_inputs(monkeypatch, henvs):
     assert tuned.tuned_fp8_gemm(object(), object(), object(), object()) is None
 
 
+def test_dense_uses_aiter_default_selection_without_tuning_file(monkeypatch, henvs):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("HCU_STEP5_DENSE_TUNING", "0")
+    monkeypatch.delenv("HCU_STEP5_TUNING_CONFIG", raising=False)
+    x = SimpleNamespace(shape=(2, 16))
+    xs, ws_t, weight_t, output, bf16 = (object() for _ in range(5))
+    ws = SimpleNamespace(t=lambda: ws_t)
+    weight = SimpleNamespace(shape=(32, 16), t=lambda: weight_t)
+    calls = []
+    aiter = ModuleType("aiter")
+    aiter_ops = ModuleType("vllm_hcu.model_executor.layers.fused_moe.aiter_ops")
+
+    def gemm(*args, **kwargs):
+        assert args == (x, weight_t)
+        assert kwargs == dict(
+            solution_index=-1, out_dtype=bf16, scaleA=xs, scaleB=ws_t,
+            scaleType=1,
+        )
+        calls.append("gemm")
+        return output
+
+    aiter.hipb_mm = gemm
+    aiter_ops._ensure_hipb_mm_extension_initialized = lambda: calls.append("init")
+    monkeypatch.setitem(sys.modules, aiter.__name__, aiter)
+    monkeypatch.setitem(sys.modules, aiter_ops.__name__, aiter_ops)
+    dense = fragment(
+        "fp8_dense.py", henvs, symbols={"_TUNED_DENSE", "_step5_fp8_gemm"},
+        torch=SimpleNamespace(bfloat16=bf16),
+    )
+    assert dense._step5_fp8_gemm(x, xs, weight, ws) is output
+    assert calls == ["init", "gemm"]
+
+
 def test_dense_child_cached_on_uses_fallback_after_master_is_disabled(
     monkeypatch, henvs
 ):

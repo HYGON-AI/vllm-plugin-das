@@ -150,7 +150,8 @@ class FusedScatterContractTest(unittest.TestCase):
              "compute_aligned_M_and_alignment", scope=self.scope)
         load(EXPERTS, "_step5_fused_scatter_rows", "apply", scope=self.scope)
         self.runtime = load(RUNTIME, "ht_receiver",
-                            "_uses_post_dispatch_channel_fp8_quant")
+                            "_uses_post_dispatch_channel_fp8_quant",
+                            "_step5_fused_scatter_alignment", scope={"os": os})
 
     def gemm(self, inputs, weights, output, expert_ids, **kwargs):
         self.calls.append((inputs, output, expert_ids))
@@ -163,13 +164,15 @@ class FusedScatterContractTest(unittest.TestCase):
                 Tensor((rows,), "int32"),
                 Tensor(kwargs["topk_ids"].shape, "int32"), 256)
 
-    def receive(self, experts=22, rows=256, counts=None, scatter=True):
+    def receive(self, experts=22, rows=256, counts=None, scatter=True, wasp128=False):
         counts = [rows] + [0] * (experts - 1) if counts is None else counts
+        dispatchers = 8 if experts == 44 else 16
         buffer = object()
         key = (id(buffer), 0)
         pf = SimpleNamespace(
-            rank_expert_offset=0, buffer=buffer,
+            rank_expert_offset=0, buffer=buffer, num_dispatchers_=dispatchers,
             _hcu_step5_fused_scatter_enabled=scatter,
+            _hcu_step5_wasp128_enabled=wasp128,
             _hcu_step5_scatter_buffers={key: (
                 Tensor((sum(counts), 4096)),
                 Tensor((sum(counts), 1), "float32"),
@@ -191,14 +194,17 @@ class FusedScatterContractTest(unittest.TestCase):
             return self.runtime["ht_receiver"](
                 module, pf, SimpleNamespace(event=None), True,
                 (Tensor((rows, 4096)), Tensor((rows, 1), "float32")),
-                Tensor((rows, 8), "int32"), experts * 16, counts,
+                Tensor((rows, 8), "int32"), experts * dispatchers, counts,
                 Tensor((rows, 8), "float32"), None, quant, True,
             )
 
-    def apply(self, result, *, experts=22, compact=False, scatter=True, owner=True):
+    def apply(self, result, *, experts=22, compact=False, scatter=True, owner=True,
+              wasp128=False, ep8_mode1000=False):
         x, scale, meta, ids, weights = result
         expert = SimpleNamespace(
             _hcu_step5_owner=owner, _hcu_step5_compact_ht=compact,
+            _hcu_step5_wasp128_enabled=wasp128,
+            _hcu_step5_ep8_pair32_mode1000=ep8_mode1000,
             _hcu_step5_fused_scatter_enabled=scatter,
             _hcu_logical_n=3072, _hcu_logical_k=4096, block_shape=None,
             w1_scale=object(), w2_scale=object(), mxfp8=False,
@@ -209,8 +215,47 @@ class FusedScatterContractTest(unittest.TestCase):
         self.scope["apply"](
             expert, self.output, x, Tensor((experts,) + (1,) * 6),
             Tensor((experts,) + (1,) * 6), weights, ids, "swiglustep",
-            experts * 16, None, scale, None, Tensor((1,)), Tensor((1,)), meta, False,
+            experts * (8 if experts == 44 else 16), None, scale, None,
+            Tensor((1,)), Tensor((1,)), meta, False,
         )
+
+    def test_wasp128_dispatch_and_consumer_share_e22_e23_layout(self):
+        for experts in (22, 23):
+            result = self.receive(experts, rows=128, wasp128=True)
+            self.assertEqual(result[2]._hcu_step5_fused_scatter_alignment, 128)
+            module = ModuleType("vllm_hcu.model_executor.layers.fused_moe.step5_wasp128")
+            module.grouped_fp8 = self.gemm
+            self.scope["__package__"] = "vllm_hcu.model_executor.layers.fused_moe.experts"
+            with patch.dict("sys.modules", {module.__name__: module}):
+                with self.assertRaises(GemmReached):
+                    self.apply(result, experts=experts, wasp128=True)
+            self.assertEqual(self.calls[-1][0][0].shape, (128, 4096))
+
+    def test_wasp128_cannot_consume_a_256_dispatch_contract(self):
+        with self.assertRaisesRegex(ValueError, "alignment disagree"):
+            self.apply(self.receive(), wasp128=True)
+
+    def test_ep8_mode1000_selects_pair32_only_for_256_aligned_scatter(self):
+        result = self.receive(44, rows=256)
+        self.assertEqual(result[2]._hcu_step5_fused_scatter_alignment, 256)
+        ep8 = ModuleType("vllm_hcu.model_executor.layers.fused_moe.ep8_wasp128")
+
+        def grouped_fp8(*args):
+            self.calls.append("ep8_pair32")
+            self.gemm(*args)
+
+        ep8.grouped_fp8 = grouped_fp8
+        self.scope["__package__"] = "vllm_hcu.model_executor.layers.fused_moe.experts"
+        with patch.dict("sys.modules", {ep8.__name__: ep8}), self.assertRaises(GemmReached):
+            self.apply(result, experts=44, ep8_mode1000=True)
+        self.assertEqual(self.calls[0], "ep8_pair32")
+
+        with self.assertRaisesRegex(ValueError, "requires 256-row expert alignment"):
+            self.apply(self.receive(44, rows=128, wasp128=True), experts=44, ep8_mode1000=True)
+
+    def test_wasp128_rejects_dispatch_counts_not_aligned_to_128(self):
+        with self.assertRaisesRegex(ValueError, "aligned"):
+            self.receive(rows=64, wasp128=True)
 
     def test_all_compact_and_scatter_combinations_for_e22_and_e23(self):
         for experts in (22, 23):
@@ -240,7 +285,8 @@ class FusedScatterContractTest(unittest.TestCase):
         self.assertEqual(self.calls[-1][0][0].shape, (256, 4096))
 
     def test_construction_accepts_scatter_without_compact_flag(self):
-        configure = load(RUNTIME, "configure_step5_ht_kernel", scope={"os": os})[
+        scope = {"os": os, "__package__": "vllm_hcu.model_executor.layers.fused_moe"}
+        configure = load(RUNTIME, "configure_step5_ht_kernel", scope=scope)[
             "configure_step5_ht_kernel"]
         primary, secondary = object(), object()
         pf = type("DeepEPHTPrepareAndFinalize", (), {})()
@@ -253,7 +299,9 @@ class FusedScatterContractTest(unittest.TestCase):
         kernel = SimpleNamespace(prepare_finalize=pf, fused_experts=expert)
         config = ModuleType("vllm.config")
         config.get_current_vllm_config_or_none = lambda: SimpleNamespace(
-            parallel_config=SimpleNamespace(enable_dbo=True))
+            parallel_config=SimpleNamespace(
+                enable_dbo=True, data_parallel_size=8, data_parallel_size_local=8,
+                tensor_parallel_size=1))
         step5 = ModuleType("vllm_hcu.runtime_compat.step5")
         step5.is_step5_owner = lambda _: True
         manager = SimpleNamespace(
@@ -276,6 +324,23 @@ class FusedScatterContractTest(unittest.TestCase):
         self.assertTrue(pf._hcu_step5_fused_scatter_enabled)
         self.assertTrue(expert._hcu_step5_fused_scatter_enabled)
         self.assertEqual(pf._hcu_step5_buffer_pair, (primary, secondary))
+
+        pf.num_dispatchers_ = 8
+        ep8 = ModuleType("vllm_hcu.model_executor.layers.fused_moe.ep8_wasp128")
+        ep8.available = lambda _: True
+        modules[ep8.__name__] = ep8
+        env.update(DEEP_EP_NORMAL_MNVL="0", VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE="1")
+        for mode1000 in (False, True):
+            ep8.nightly_weight_packer = lambda _, enabled=mode1000: object() if enabled else None
+            with (
+                self.subTest(mode1000=mode1000),
+                patch.dict(os.environ, env, clear=True),
+                patch.dict("sys.modules", modules),
+            ):
+                self.assertIs(configure(kernel, quant, object()), kernel)
+                self.assertIs(expert._hcu_step5_ep8_pair32_mode1000, mode1000)
+                self.assertEqual(self.runtime["_step5_fused_scatter_alignment"](pf, 352),
+                                 256 if mode1000 else 128)
 
     def test_scatter_uses_all_aligned_expert_slices(self):
         result = self.receive(rows=512, counts=[512, 256] + [0] * 20)
@@ -304,7 +369,9 @@ class FusedScatterContractTest(unittest.TestCase):
     def test_receiver_rejects_unaligned_negative_and_wrong_expert_counts(self):
         for counts in ([255] + [0] * 21, [-256] + [0] * 21,
                        [256.0] + [0] * 21, [256] + [0] * 20):
-            with self.subTest(counts=counts), self.assertRaisesRegex(ValueError, "dispatch counts"):
+            with self.subTest(counts=counts), self.assertRaisesRegex(
+                ValueError, "aligned counts for every local expert"
+            ):
                 self.receive(counts=counts)
 
     def test_stale_or_invalid_metadata_is_rejected_before_gemm(self):

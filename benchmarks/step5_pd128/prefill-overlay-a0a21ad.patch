@@ -1,0 +1,363 @@
+diff --git a/vllm_hcu/model_executor/layers/ep8_sparse_group_major.py b/vllm_hcu/model_executor/layers/ep8_sparse_group_major.py
+new file mode 100644
+--- /dev/null
++++ b/vllm_hcu/model_executor/layers/ep8_sparse_group_major.py
+@@ -0,0 +1,38 @@
++"""FP8 sparse-attention workspace using group-major read pages."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _copy_pages(Cache, Used, Key, Value, block_stride: tl.constexpr,
++                head_stride: tl.constexpr, token_stride: tl.constexpr,
++                arena_blocks: tl.constexpr, page: tl.constexpr, tile: tl.constexpr):
++    block = tl.load(Used + tl.program_id(0))
++    head = tl.program_id(1)
++    token = tl.program_id(2) * tile + tl.arange(0, tile)
++    column = tl.arange(0, 256)
++    mask = (token[:, None] < page) & (column[None, :] < 192)
++    src = block * block_stride + head * head_stride + token[:, None] * token_stride + column[None, :]
++    dst = ((head * arena_blocks + block) * page + token[:, None]) * 192 + column[None, :]
++    k = tl.load(Cache + src, mask, other=0)
++    v = tl.load(Cache + src + 192, mask, other=0)
++    tl.store(Key + dst, k, mask)
++    tl.store(Value + dst, v, mask)
++
++
++def allocate(base):
++    blocks, heads, page, content = base.shape
++    shape = (heads, blocks, page, content // 2)
++    return tuple(torch.empty(shape, device=base.device, dtype=torch.uint8) for _ in range(2))
++
++
++def copy(base, used, workspace, tile=8):
++    blocks, heads, page, _ = base.shape
++    if used.numel():
++        _copy_pages[(used.numel(), heads, triton.cdiv(page, tile))](
++            base.view(torch.uint8), used, *workspace, *base.stride()[:3], blocks, page, tile,
++            num_warps=4,
++        )
++    return tuple(t.view(heads, blocks * page, 192).transpose(0, 1).view(base.dtype)
++                 for t in workspace)
+--- a/vllm_hcu/model_executor/layers/fused_moe/deepep_runtime.py
++++ b/vllm_hcu/model_executor/layers/fused_moe/deepep_runtime.py
+@@ -86,12 +86,12 @@
+     recv_tokens = getattr(prepare, "_hcu_step5_recv_tokens", 512)
+     if not hasattr(prepare, "_hcu_step5_num_sms"):
+         return original
+-    if prepare.num_dispatchers_ != 16 or original is None:
+-        raise ValueError("Step5 custom NVL chunks require EP16 high-throughput configuration")
++    if prepare.num_dispatchers_ not in (8, 16) or original is None:
++        raise ValueError("Step5 custom NVL chunks require EP8/EP16 high-throughput configuration")
+     config = type(original)(prepare._hcu_step5_num_sms, send, recv_tokens, 16, 128)
+     # A smaller receive queue lets more channels fit the startup allocation.
+     # Enforce the conservative BF16-width hint even for FP8 dispatch.
+-    if config.get_nvl_buffer_size_hint(4096 * 2, 16) > prepare.buffer.num_nvl_bytes:
++    if config.get_nvl_buffer_size_hint(4096 * 2, prepare.num_dispatchers_) > prepare.buffer.num_nvl_bytes:
+         raise ValueError("Step5 DeepEP runtime config exceeds its reserved NVL buffer")
+     return config
+ 
+@@ -119,8 +119,8 @@
+         prepare._hcu_step5_profile_dbo_output_requested = bool(owner and configured_dbo)
+         prepare._hcu_step5_runtime_tuning_allowed = bool(owner)
+         if owner and configured_dbo and os.environ.get("HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR", "0") == "1":
+-            if prepare.num_dispatchers_ != 16 or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
+-                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP16 NORMAL MNVL")
++            if prepare.num_dispatchers_ not in (8, 16) or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
++                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP8/EP16 NORMAL MNVL")
+             fused_scatter_requested = os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
+             if fused_scatter_requested:
+                 if not (
+@@ -543,8 +543,11 @@
+     fused_scatter = bool(getattr(self, "_hcu_step5_fused_scatter_enabled", False))
+     scatter_kwargs = {}
+     if fused_scatter:
+-        if not (has_scales and expert_alignment == 256 and num_experts in (352, 368)):
+-            raise ValueError("Step5 fused scatter requires E22/E23 with EP16 per-token FP8 scales")
++        valid_experts = {8: (352,), 16: (352, 368)}.get(self.num_dispatchers_, ())
++        if not (has_scales and expert_alignment == 256 and num_experts in valid_experts):
++            raise ValueError("Step5 fused scatter requires E44 with EP8 or E22/E23 with EP16 per-token FP8 scales")
++        if self.num_dispatchers_ == 8 and num_experts == 352 and os.environ.get("HCU_STEP5_EP8_WASP128_LIBRARY"):
++            expert_alignment = 128
+         data, scales = token_data
+         if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
+             raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
+@@ -676,10 +679,15 @@
+     ubatch_id = module.dbo_current_ubatch_id()
+     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+         counts = tuple(expert_num_tokens_per_expert_list)
+-        if len(counts) not in (22, 23) or any(
+-            type(c) is not int or c < 0 or c % 256 for c in counts
++        alignment = 128 if self.num_dispatchers_ == 8 and num_experts == 352 and os.environ.get("HCU_STEP5_EP8_WASP128_LIBRARY") else 256
++        expert_tokens_meta._hcu_step5_fused_scatter_alignment = alignment
++        if len(counts) != num_experts // self.num_dispatchers_ or any(
++            type(c) is not int or c < 0 or c % alignment for c in counts
+         ):
+-            raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
++            raise ValueError("Step5 fused scatter requires aligned counts for every local expert")
++        if os.environ.get("HCU_STEP5_EP8_CALIBRATION_DIR") and module.dbo_enabled():
++            from .ep8_route_calibration import capture
++            capture(self, ubatch_id, counts)
+         rows = sum(counts)
+         sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
+         for tensor in (sx, ss, si, sm):
+diff --git a/vllm_hcu/model_executor/layers/fused_moe/ep8_route_calibration.py b/vllm_hcu/model_executor/layers/fused_moe/ep8_route_calibration.py
+new file mode 100644
+--- /dev/null
++++ b/vllm_hcu/model_executor/layers/fused_moe/ep8_route_calibration.py
+@@ -0,0 +1,129 @@
++"""Collect aligned EP8 routing work and construct a capacity-constrained expert order."""
++
++import json
++import os
++from pathlib import Path
++
++LAYERS = 88
++RANKS = 8
++PER_RANK = 44
++SAMPLES = 16
++_layers = {}
++_samples = {}
++_written = False
++
++
++def capture(prepare, ubatch, counts):
++    """Diagnostic only, after an EP8 scatter has returned its host counters."""
++    global _written
++    if _written:
++        return
++    output = os.environ.get('HCU_STEP5_EP8_CALIBRATION_DIR')
++    if not output:
++        return
++    assert prepare.num_dispatchers_ == RANKS and len(counts) == PER_RANK
++    assert prepare.rank_expert_offset % PER_RANK == 0 and ubatch in (0, 1)
++    rank = prepare.rank_expert_offset // PER_RANK
++    assert 0 <= rank < RANKS
++    index = _layers.setdefault(id(prepare), len(_layers))
++    if index >= LAYERS:
++        return
++    series = _samples.setdefault((index, ubatch), [])
++    if len(series) < SAMPLES:
++        series.append(tuple(counts))
++    if len(_samples) != 2 * LAYERS or any(len(v) != SAMPLES for v in _samples.values()):
++        return
++    doc = {'rank':rank,'samples_per_layer_and_ubatch':SAMPLES,'aligned_rows':[
++        [_samples[(layer,0)],_samples[(layer,1)]] for layer in range(LAYERS)]}
++    (Path(output)/f'rank-{rank}.json').write_text(json.dumps(doc,separators=(',',':')))
++    _written=True
++
++
++def assign_layer(rows):
++    import numpy as np
++
++    normalized = rows / np.maximum(rows.mean(axis=1,keepdims=True),1)
++    heavy = normalized.max(axis=0)
++    mean = normalized.mean(axis=0)
++    order = sorted(range(RANKS*PER_RANK),key=lambda i:(heavy[i],mean[i],-i),reverse=True)
++    bins = [[] for _ in range(RANKS)]
++    totals = np.zeros((len(rows),RANKS))
++    for expert in order:
++        dst = min((i for i in range(RANKS) if len(bins[i])<PER_RANK),
++                  key=lambda i:(float(np.max(totals[:,i]+normalized[:,expert])),
++                                float(np.mean(totals[:,i]+normalized[:,expert])),len(bins[i]),i))
++        bins[dst].append(expert)
++        totals[:,dst]+=normalized[:,expert]
++
++    def cost(t):
++        peak=t.max(axis=1)
++        return float(peak.mean()+.2*np.max(peak))
++
++    for _ in range(8):
++        best=cost(totals)
++        worst_sample,src=np.unravel_index(np.argmax(totals),totals.shape)
++        targets=np.argsort(totals[worst_sample])[:3]
++        largest=sorted(bins[src],key=lambda i:normalized[worst_sample,i],reverse=True)[:8]
++        pair=None
++        for dst in targets:
++            if dst==src:
++                continue
++            smallest=sorted(bins[dst],key=lambda i:normalized[worst_sample,i])[:8]
++            for a in largest:
++                for b in smallest:
++                    trial=totals.copy()
++                    delta=normalized[:,a]-normalized[:,b]
++                    trial[:,src]-=delta
++                    trial[:,dst]+=delta
++                    score=cost(trial)
++                    if score < best-1e-10:
++                        best=score
++                        pair=(dst,a,b,trial)
++        if pair is None:
++            break
++        dst,a,b,totals=pair
++        bins[src][bins[src].index(a)]=b
++        bins[dst][bins[dst].index(b)]=a
++    return [e for group in bins for e in group]
++
++
++def build(directory, previous_map, output):
++    import numpy as np
++    import torch
++
++    directory=Path(directory)
++    data=[]
++    for rank in range(RANKS):
++        obj=json.loads((directory/f'rank-{rank}.json').read_text())
++        assert obj['rank']==rank and obj['samples_per_layer_and_ubatch']==SAMPLES
++        arr=np.asarray(obj['aligned_rows'],dtype=np.int64)
++        assert arr.shape==(LAYERS,2,SAMPLES,PER_RANK)
++        assert np.all(arr>=0) and np.all(arr%256==0)
++        data.append(arr)
++    rows=np.concatenate(data,axis=-1).reshape(LAYERS,2*SAMPLES,RANKS*PER_RANK)
++    original=torch.load(previous_map,map_location='cpu',weights_only=True)['physical_to_logical_map']
++    assert original.shape==(LAYERS,RANKS*PER_RANK)
++    candidate=[]
++    old_max=[]
++    new_max=[]
++    for index,layer in enumerate(rows):
++        perm=assign_layer(layer)
++        assert sorted(perm)==list(range(RANKS*PER_RANK))
++        old_max.extend(layer.reshape(2*SAMPLES,RANKS,PER_RANK).sum(axis=2).max(axis=1).tolist())
++        new_max.extend(layer[:,perm].reshape(2*SAMPLES,RANKS,PER_RANK).sum(axis=2).max(axis=1).tolist())
++        candidate.append(original[index,torch.tensor(perm)])
++    result=torch.stack(candidate)
++    assert torch.equal(result.sort(dim=1).values,torch.arange(RANKS*PER_RANK).expand(LAYERS,-1))
++    torch.save({'physical_to_logical_map':result},output)
++    summary={'scope':'Predicted aligned work for calibration inputs, not a TPS measurement',
++             'layers':LAYERS,'samples_per_layer':2*SAMPLES,'rank_experts':PER_RANK,
++             'aligned_slowest_rank_rows_before':sum(old_max),'aligned_slowest_rank_rows_after':sum(new_max),
++             'predicted_reduction':1-sum(new_max)/sum(old_max)}
++    Path(output).with_suffix('.json').write_text(json.dumps(summary,indent=2))
++    print(json.dumps(summary),flush=True)
++
++
++if __name__=='__main__':
++    import sys
++
++    build(*sys.argv[1:])
+diff --git a/vllm_hcu/model_executor/layers/fused_moe/ep8_wasp128.py b/vllm_hcu/model_executor/layers/fused_moe/ep8_wasp128.py
+new file mode 100644
+--- /dev/null
++++ b/vllm_hcu/model_executor/layers/fused_moe/ep8_wasp128.py
+@@ -0,0 +1,24 @@
++import hashlib
++import json
++import os
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++from vllm.logger import init_logger
++
++
++@lru_cache(maxsize=1)
++def _operator():
++    library=Path(os.environ["HCU_STEP5_EP8_WASP128_LIBRARY"])
++    proof=json.loads(library.with_suffix('.json').read_text())
++    assert proof['passed'] and proof['torch']==torch.__version__,proof
++    assert hashlib.sha256(library.read_bytes()).hexdigest()==proof['sha256']
++    torch.ops.load_library(str(library))
++    init_logger('vllm.hcu.step5_wasp128').info_once('EP8 WASP128 native G1/G2 active',scope='process')
++    return torch.ops.step5_wasp128_probe.gemm
++
++
++def grouped_fp8(a,b,out,experts):
++    bn=384 if a[0].size(1)==4096 else 256
++    return _operator()(a[0],b[0],out,a[1].contiguous(),b[1].contiguous(),experts.contiguous(),128,bn,4)
+--- a/vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
++++ b/vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+@@ -164,11 +164,14 @@
+     ):
+         raise ValueError("Step5 fused scatter is missing dispatch layout metadata")
+     shape, counts = layout
++    alignment = getattr(meta, "_hcu_step5_fused_scatter_alignment", 256)
++    if alignment not in (128, 256):
++        raise ValueError("Unsupported Step5 scatter alignment")
+     if (
+         shape != tuple(topk_ids.shape)
+         or not isinstance(counts, tuple)
+         or len(counts) != local_num_experts
+-        or any(type(c) is not int or c < 0 or c % 256 for c in counts)
++        or any(type(c) is not int or c < 0 or c % alignment for c in counts)
+     ):
+         raise ValueError("Step5 fused scatter has mismatched dispatch counts or batch shape")
+     rows = sum(counts)
+@@ -617,7 +620,7 @@
+         )
+         fused_scatter = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter", None)
+         if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+-            if not step5_channel_fp8 or fused_scatter is None or local_num_experts not in (22, 23):
++            if not step5_channel_fp8 or fused_scatter is None or local_num_experts not in (22, 23, 44):
+                 raise ValueError("Step5 DeepGEMM requires matching fused-scatter metadata")
+             # DeepEP already wrote aligned expert slices. Their exact row
+             # count is part of this input contract, regardless of whether
+@@ -629,7 +632,7 @@
+                 output.zero_()
+                 return
+             a1q, a1q_scale, expert_ids, inv_perm = fused_scatter
+-            align_used = _HCU_HT_EP_TOKEN_ALIGNMENT
++            align_used = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter_alignment", _HCU_HT_EP_TOKEN_ALIGNMENT)
+         else:
+             M_sum, _ = compute_aligned_M_and_alignment(
+                 M=topk_ids.size(0),
+@@ -672,6 +675,9 @@
+             if current_platform.is_rocm() and self.quant_config.use_int8_w8a8
+             else mk_alignment_scope(align_used)
+         )
++        grouped_fp8 = m_grouped_fp8_gemm_nt_contiguous
++        if step5_channel_fp8 and fused_scatter is not None and align_used == 128:
++            from ..ep8_wasp128 import grouped_fp8
+         with alignment_scope:
+             mm1_out = _resize_cache(workspace2, (M_sum, N))
+             if self.quant_config.use_int8_w8a8:
+@@ -706,7 +712,7 @@
+                     expert_ids,
+                 )
+             else:
+-                m_grouped_fp8_gemm_nt_contiguous(
++                grouped_fp8(
+                     (a1q, a1q_scale),
+                     (w1, self.w1_scale),
+                     mm1_out,
+@@ -756,7 +762,7 @@
+                     )
+ 
+                 mm2_out = _resize_cache(workspace2, (M_sum, K))
+-                m_grouped_fp8_gemm_nt_contiguous(
++                grouped_fp8(
+                     (a2q, a2q_scale),
+                     (w2, self.w2_scale),
+                     mm2_out,
+--- a/vllm_hcu/model_executor/layers/step5_paged_kv.py
++++ b/vllm_hcu/model_executor/layers/step5_paged_kv.py
+@@ -10,6 +10,7 @@
+ """
+ from __future__ import annotations
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -91,6 +92,20 @@
+         )
+     flat_k, flat_v = _FLAT_BUFFERS[workspace_key]
+     used = _read_blocks(metadata, blocks, page, base.device)
++    if (
++        os.environ.get("HCU_STEP5_EP8_SPARSE_GROUP_MAJOR") == "1"
++        and base.is_cuda and base.dtype == torch.float8_e4m3fn
++        and heads == 4 and dim == 192
++        and getattr(metadata, "num_prefills", 0) > 0
++        and getattr(metadata, "num_decodes", 0) == 0
++    ):
++        from vllm.logger import init_logger
++        from .ep8_sparse_group_major import copy
++
++        init_logger("vllm.hcu.step5_paged_kv").info_once(
++            "Step5 EP8 group-major sparse KV workspace active", scope="process"
++        )
++        return copy(base, used, (flat_k.view(torch.uint8), flat_v.view(torch.uint8)))
+     k_pages = base[..., :dim].transpose(1, 2)
+     v_pages = base[..., dim:].transpose(1, 2)
+     # Copy bytes so FP8 representations are preserved exactly and the path

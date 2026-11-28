@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded channel-FP8 expert grids for Step5's uniform C64 decode shape.
+"""Bounded channel-FP8 expert grids for uniform Step5 decode shapes.
 
-Only the validated E22/M256 contiguous per-token/per-channel layout enters
-this implementation. Each expert owns four M workers, retaining parallelism
+Only the validated E22 contiguous per-token/per-channel layouts enter this
+implementation. Each expert owns four M workers, retaining parallelism
 on hot experts while avoiding a grid sized for unused global route rows.
 """
 from __future__ import annotations
@@ -10,19 +10,21 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
+EXPERT_GRID_ROWS = (160, 192, 224, 256)
+
 
 def can_use_expert_grid(a, a_scale, w1, w2, w1_scale, w2_scale, ids, out_dtype):
     return (
         out_dtype == torch.bfloat16
         and a.is_cuda
-        and a.shape == (256, 4096)
-        and ids.shape == (256, 8)
+        and a.ndim == 2 and a.shape[0] in EXPERT_GRID_ROWS and a.shape[1] == 4096
+        and ids.shape == (a.shape[0], 8)
         and w1.shape == (22, 3072, 4096)
         and w2.shape == (22, 4096, 1536)
         and a.dtype == w1.dtype == w2.dtype == torch.float8_e4m3fn
         and a_scale is not None
         and a_scale.dtype == torch.float32
-        and a_scale.numel() == 256
+        and a_scale.numel() == a.shape[0]
         and w1_scale is not None and w2_scale is not None
         and w1_scale.shape in ((22, 3072), (22, 3072, 1))
         and w2_scale.shape in ((22, 4096), (22, 4096, 1))
@@ -86,7 +88,7 @@ def invoke_expert_grid(a, b, c, a_scale, b_scale, sorted_ids, layout, topk_ids,
                        config, *, a_sorted=False, c_sorted=False):
     e, n, k = b.shape
     m, topk = topk_ids.shape
-    assert e == 22 and m == 256 and topk == 8
+    assert e == 22 and m in EXPERT_GRID_ROWS and topk == 8
     assert a.is_contiguous() and b.is_contiguous() and c.is_contiguous()
     assert a_scale.is_contiguous() and b_scale.is_contiguous()
     assert a.dtype == b.dtype == torch.float8_e4m3fn and c.dtype == torch.bfloat16

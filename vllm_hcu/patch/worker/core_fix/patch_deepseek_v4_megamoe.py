@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Select the opt-in MegaMoE method before fallback kernel construction.
 
-On HCU, ``--moe-backend deep_gemm_mega_moe`` selects the standalone megamoe
-package instead of vLLM's NVIDIA DeepGEMM MegaMoE path. Other backends
-retain their existing selection logic.
+On HCU, Channel-FP8 uses the public deepgemm.mega API. The existing standalone
+INT4 adapter remains available. Other backends retain their selection logic.
 """
 
 from __future__ import annotations
@@ -43,6 +42,12 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original)
     def hcu_get_quant_method(self, prefix, quant_config, moe_config):
         if getattr(moe_config, "moe_backend", None) == MEGA_MOE_BACKEND:
+            from vllm_hcu.model_executor.layers.fused_moe.deepgemm_megamoe import (
+                select_method as select_deepgemm_method,
+            )
+            method = select_deepgemm_method(self, quant_config, moe_config)
+            if method is not None:
+                return method
             from vllm_hcu.model_executor.layers.fused_moe.megamoe_runtime import (
                 select_method,
             )
@@ -53,7 +58,7 @@ def apply_to_module(module: ModuleType) -> bool:
             # vLLM's own deep_gemm_mega_moe path is NVIDIA-only.
             raise ValueError(
                 f"moe_backend={MEGA_MOE_BACKEND!r} on HCU supports "
-                "DeepSeek-V4 target/DSpark models only"
+                "Channel-FP8 experts or the existing standalone INT4 adapter"
             )
         return original(self, prefix, quant_config, moe_config)
 

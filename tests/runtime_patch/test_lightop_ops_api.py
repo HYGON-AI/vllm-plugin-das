@@ -442,31 +442,24 @@ def test_dynamic_rms_quant_consumes_returned_tensors(
 
 
 def _load_gemma_forward(*, custom_ops_enabled: bool = True):
-    method = copy.deepcopy(
-        next(
-            node
-            for node in next(
-                node
-                for node in _module("vllm_hcu/ops/gemma_rms_norm.py").body
-                if isinstance(node, ast.ClassDef) and node.name == "HcuGemmaRMSNorm"
-            ).body
-            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
-        )
-    )
-    method.decorator_list = []
-    module = ast.Module(body=[method], type_ignores=[])
-    ast.fix_missing_locations(module)
-    namespace: dict[str, object] = {
-        "torch": torch,
+    path = "vllm_hcu/ops/gemma_rms_norm.py"
+    # Route through the registered op bodies without depending on the
+    # process-wide torch dispatcher or launching accelerator kernels.
+    ops = SimpleNamespace(vllm=SimpleNamespace(
+        hcu_gemma_rms_norm=_function(path, "_hcu_gemma_rms_norm", {"torch": torch}),
+        hcu_gemma_fused_add_rms_norm=_function(
+            path, "_hcu_gemma_fused_add_rms_norm", {"torch": torch}
+        ),
+    ))
+    return _method(path, "HcuGemmaRMSNorm", "forward_hip", {
+        "torch": SimpleNamespace(Tensor=torch.Tensor, ops=ops),
         "henvs": SimpleNamespace(
             VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM=True,
             optional_custom_op_enabled=lambda feature_enabled=True: bool(
                 custom_ops_enabled and feature_enabled
             ),
         ),
-    }
-    exec(compile(module, "gemma_forward_contract", "exec"), namespace)
-    return namespace["forward_hip"]
+    })
 
 
 def test_gemma_rmsnorm_master_off_delegates_to_current_native_fallback() -> None:
@@ -1030,7 +1023,7 @@ def _install_masked_fp8_gemm(
 def _masked_fp8_namespace(logger: _WarningLogger) -> dict[str, object]:
     return {
         "torch": torch,
-        "MoEActivation": SimpleNamespace(SILU="silu"),
+        "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "_resize_cache": lambda _cache, shape: torch.empty(shape),
         "logger": logger,

@@ -169,7 +169,7 @@ class ConstructionIsolationTest(unittest.TestCase):
 
     def test_unsupported_ep_group_rejected_before_optional_import_or_allocation(self):
         prepare = type("DeepEPHTPrepareAndFinalize", (), {})()
-        prepare.num_dispatchers_ = 8
+        prepare.num_dispatchers_ = 4
         kernel = SimpleNamespace(prepare_finalize=prepare,
                                  fused_experts=SimpleNamespace())
         with patch.dict(os.environ, {
@@ -177,7 +177,7 @@ class ConstructionIsolationTest(unittest.TestCase):
             "HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR": "1",
             "DEEP_EP_NORMAL_MNVL": "1",
         }), patch.dict("sys.modules", self.modules()):
-            with self.assertRaisesRegex(ValueError, "EP16 NORMAL MNVL"):
+            with self.assertRaisesRegex(ValueError, "EP8/EP16 NORMAL MNVL"):
                 self.configure(kernel, None, SimpleNamespace(step5=True))
         self.assertFalse(hasattr(prepare, "_hcu_step5_buffer_pair"))
 

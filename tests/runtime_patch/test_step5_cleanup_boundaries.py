@@ -93,17 +93,15 @@ def test_external_recipe_is_data_and_does_not_execute_code(monkeypatch,tmp_path)
     with pytest.raises(json.JSONDecodeError):load_tuning().tuning_data()
 
 
-@pytest.mark.parametrize("build", [False,True])
-def test_dense_build_dependency_is_explicit(monkeypatch,build):
-    monkeypatch.setenv("VLLM_HCU_BUILD_STEP5_DENSE",str(int(build)))
+def test_dense_uses_no_native_wheel_build_dependency():
     tree=ast.parse((ROOT/"setup.py").read_text(encoding="utf-8"))
     nodes=[n for n in tree.body if isinstance(n,ast.Assign) and any(
-        isinstance(t,ast.Name) and t.id in {"_BUILD_STEP5_DENSE","ext_modules"} for t in n.targets)]
+        isinstance(t,ast.Name) and t.id == "ext_modules" for t in n.targets)]
     ns=dict(os=os,CUDAExtension=lambda **kw:kw)
     exec(compile(ast.Module(body=nodes,type_ignores=[]),"setup.py","exec"),ns)
     extension=ns["ext_modules"][0]
-    assert ("hipblaslt" in extension["libraries"]) is build
-    assert ("vllm_hcu/csrc/step5_fp8_dense.cpp" in extension["sources"]) is build
+    assert "hipblaslt" not in extension.get("libraries", [])
+    assert "vllm_hcu/csrc/step5_fp8_dense.cpp" not in extension["sources"]
 
 
 def test_retired_runtime_and_tuning_artifacts_are_absent():

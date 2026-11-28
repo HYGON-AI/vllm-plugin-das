@@ -86,12 +86,12 @@ def step5_ht_launch_config(prepare, original, *, combine=False):
     recv_tokens = getattr(prepare, "_hcu_step5_recv_tokens", 512)
     if not hasattr(prepare, "_hcu_step5_num_sms"):
         return original
-    if prepare.num_dispatchers_ != 16 or original is None:
-        raise ValueError("Step5 custom NVL chunks require EP16 high-throughput configuration")
+    if prepare.num_dispatchers_ not in (8, 16) or original is None:
+        raise ValueError("Step5 custom NVL chunks require EP8/EP16 high-throughput configuration")
     config = type(original)(prepare._hcu_step5_num_sms, send, recv_tokens, 16, 128)
     # A smaller receive queue lets more channels fit the startup allocation.
     # Enforce the conservative BF16-width hint even for FP8 dispatch.
-    if config.get_nvl_buffer_size_hint(4096 * 2, 16) > prepare.buffer.num_nvl_bytes:
+    if config.get_nvl_buffer_size_hint(4096 * 2, prepare.num_dispatchers_) > prepare.buffer.num_nvl_bytes:
         raise ValueError("Step5 DeepEP runtime config exceeds its reserved NVL buffer")
     return config
 
@@ -119,8 +119,18 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
         prepare._hcu_step5_profile_dbo_output_requested = bool(owner and configured_dbo)
         prepare._hcu_step5_runtime_tuning_allowed = bool(owner)
         if owner and configured_dbo and os.environ.get("HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR", "0") == "1":
-            if prepare.num_dispatchers_ != 16 or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
-                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP16 NORMAL MNVL")
+            single_node_ep8 = (
+                prepare.num_dispatchers_ == 8
+                and config is not None
+                and config.parallel_config.data_parallel_size == 8
+                and config.parallel_config.data_parallel_size_local == 8
+                and config.parallel_config.tensor_parallel_size == 1
+                and os.environ.get("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE") == "1"
+            )
+            if prepare.num_dispatchers_ not in (8, 16) or (
+                os.environ.get("DEEP_EP_NORMAL_MNVL") != "1" and not single_node_ep8
+            ):
+                raise ValueError("Step5 DeepEP buffer-pair overlap requires EP8/EP16 NORMAL MNVL or local EP8 intranode")
             fused_scatter_requested = os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
             if fused_scatter_requested:
                 if not (
@@ -133,6 +143,13 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                     and moe_quant_config.block_shape is None
                 ):
                     raise ValueError("Step5 fused DeepEP scatter requires TP1 channel-FP8 DeepGemmExperts")
+                wasp128 = False
+                if os.environ.get("HCU_STEP5_WASP128") == "1":
+                    from .step5_wasp128 import nightly_weight_packer
+
+                    wasp128 = nightly_weight_packer(moe_config) is not None
+                prepare._hcu_step5_wasp128_enabled = wasp128
+                experts._hcu_step5_wasp128_enabled = wasp128
             import deep_ep
             from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
@@ -160,6 +177,13 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                 prepare._hcu_step5_scatter_guards = manager._hcu_step5_scatter_guards
                 prepare._hcu_step5_fused_scatter_enabled = True
                 experts._hcu_step5_fused_scatter_enabled = True
+                if prepare.num_dispatchers_ == 8:
+                    from .ep8_wasp128 import available, nightly_weight_packer
+
+                    mode1000 = nightly_weight_packer(moe_config) is not None
+                    experts._hcu_step5_ep8_pair32_mode1000 = mode1000
+                    # The public mode 1000 kernel consumes 256 rows per expert tile.
+                    prepare._hcu_step5_wasp128_enabled = not mode1000 and available(moe_config)
 
     return kernel
 
@@ -481,6 +505,12 @@ def _uses_post_dispatch_channel_fp8_quant(quant_config) -> bool:
     )
 
 
+def _step5_fused_scatter_alignment(prepare, num_experts):
+    if num_experts in (352, 368) and getattr(prepare, "_hcu_step5_wasp128_enabled", False):
+        return 128
+    return 256
+
+
 def ht_do_dispatch(
     module,
     self,
@@ -570,8 +600,10 @@ def ht_do_dispatch(
     fused_scatter = bool(getattr(self, "_hcu_step5_fused_scatter_enabled", False))
     scatter_kwargs = {}
     if fused_scatter:
-        if not (has_scales and expert_alignment == 256 and num_experts in (352, 368)):
-            raise ValueError("Step5 fused scatter requires E22/E23 with EP16 per-token FP8 scales")
+        valid_experts = {8: (352,), 16: (352, 368)}.get(self.num_dispatchers_, ())
+        if not (has_scales and expert_alignment == 256 and num_experts in valid_experts):
+            raise ValueError("Step5 fused scatter requires E44 with EP8 or E22/E23 with EP16 per-token FP8 scales")
+        expert_alignment = _step5_fused_scatter_alignment(self, num_experts)
         data, scales = token_data
         if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
             raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
@@ -591,8 +623,14 @@ def ht_do_dispatch(
             # final Gather use into DeepEP's own stream before any overwrite.
             module.torch.cuda.current_stream().wait_event(guard["last_use"])
             dispatch_previous_event = buffer.capture()
+        intranode_ep8 = (
+            self.num_dispatchers_ == 8
+            and os.environ.get("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE") == "1"
+            and os.environ.get("DEEP_EP_NORMAL_MNVL") != "1"
+        )
         scatter_kwargs = dict(scatter_x=sx, scatter_x_scales=ss,
-                              scatter_output_index=si, scatter_m_indices=sm)
+                              scatter_output_index=si,
+                              scatter_m_indices=None if intranode_ep8 else sm)
     dispatch = buffer.dispatch_scatter if fused_scatter else buffer.dispatch
     (
         token_data,
@@ -703,12 +741,24 @@ def ht_receiver(
     ubatch_id = module.dbo_current_ubatch_id()
     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
         counts = tuple(expert_num_tokens_per_expert_list)
-        if len(counts) not in (22, 23) or any(
-            type(c) is not int or c < 0 or c % 256 for c in counts
+        alignment = _step5_fused_scatter_alignment(self, num_experts)
+        expert_tokens_meta._hcu_step5_fused_scatter_alignment = alignment
+        if len(counts) != num_experts // self.num_dispatchers_ or any(
+            type(c) is not int or c < 0 or c % alignment for c in counts
         ):
-            raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
+            raise ValueError("Step5 fused scatter requires aligned counts for every local expert")
         rows = sum(counts)
         sx, ss, si, sm = self._hcu_step5_scatter_buffers[(id(self.buffer), ubatch_id)]
+        if (
+            self.num_dispatchers_ == 8
+            and os.environ.get("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE") == "1"
+            and os.environ.get("DEEP_EP_NORMAL_MNVL") != "1"
+        ):
+            local_expert_ids = module.torch.arange(len(counts), device=expert_x.device, dtype=module.torch.int32)
+            indices = module.torch.repeat_interleave(
+                local_expert_ids, expert_tokens_meta.expert_num_tokens, output_size=rows,
+            )
+            sm.resize_(rows).copy_(indices)
         for tensor in (sx, ss, si, sm):
             tensor.record_stream(module.torch.cuda.current_stream())
         expert_tokens_meta._hcu_step5_fused_scatter = (sx[:rows], ss[:rows], sm[:rows], si)
@@ -905,6 +955,101 @@ def ht_finalize_with_buffer_pair(
     return receiver
 
 
+class _Step5TPTokenBuffer:
+    """Send each replicated TP token once; restore full rows after combine."""
+
+    def __init__(self, buffer, max_tokens_per_rank, hidden_size):
+        import torch
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        self._buffer = buffer
+        self._tp = get_tp_group()
+        self._size, self._rank = self._tp.world_size, self._tp.rank_in_group
+        if self._size != 4 or buffer.group_size != 16:
+            raise ValueError("Step5 routed-token partition requires TP4/EP16")
+        self._capacity = max_tokens_per_rank
+        self._gather_comm = PyNcclCommunicator(
+            self._tp.cpu_group, device=torch.device("cuda", torch.cuda.current_device()))
+        if not self._gather_comm.available or self._gather_comm.disabled:
+            raise RuntimeError("Step5 routed-token partition requires a TP gather communicator")
+        self._local_output = torch.empty(
+            ((max_tokens_per_rank + 3) // 4, hidden_size),
+            dtype=torch.bfloat16, device=torch.cuda.current_device())
+
+    def __getattr__(self, name):
+        return getattr(self._buffer, name)
+
+    @staticmethod
+    def _complete_receive(event, hook):
+        if hook is not None:
+            hook()
+        if event is not None and event.event is not None:
+            event.current_stream_wait()
+
+    def low_latency_dispatch(
+        self, x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank,
+        num_experts, quant_type=1, quant_group_size=0, fp8_round_scale=False,
+        async_finish=False, return_recv_hook=False, x_scales=None, ll_route_hint=None,
+    ):
+        import torch
+
+        if async_finish:
+            raise ValueError("Step5 TP partition requires synchronous dispatch")
+        if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
+            raise ValueError("Step5 LL dispatch expects BF16 input before its FP8 quantization")
+        n = x.shape[0]
+        partition = n > 0 and n % self._size == 0
+        if partition:
+            width = n // self._size
+            start = self._rank * width
+            x, topk_idx, topk_weight = (
+                t[start:start + width] for t in (x, topk_idx, topk_weight))
+        received, counts, handle, event, hook = self._buffer.low_latency_dispatch(
+            x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank, num_experts,
+            quant_type=quant_type, quant_group_size=quant_group_size,
+            fp8_round_scale=fp8_round_scale, async_finish=False,
+            return_recv_hook=False, x_scales=x_scales, ll_route_hint=ll_route_hint)
+        self._complete_receive(event, hook)
+        return received, counts, (handle, n if partition else None), event, (
+            (lambda: None) if return_recv_hook else None)
+
+    def low_latency_combine(self, x, topk_idx, topk_weights, handle, **kwargs):
+        import torch
+
+        native_handle, n = handle
+        if kwargs.get("async_finish", False):
+            raise ValueError("Step5 TP partition requires the DBO-disabled synchronous combine")
+        requested_hook = kwargs.get("return_recv_hook", False)
+        # This route disables DBO. Complete send/receive in one native kernel
+        # and preserve the modular caller's callback contract with a no-op.
+        kwargs["return_recv_hook"] = False
+        if n is None:
+            output, event, hook = self._buffer.low_latency_combine(
+                x, topk_idx, topk_weights, native_handle, **kwargs)
+            self._complete_receive(event, hook)
+            return output, event, ((lambda: None) if requested_hook else None)
+        output = kwargs.pop("out", None)
+        if output is None or output.shape != (n, x.shape[-1]) or not output.is_contiguous():
+            raise ValueError("Step5 TP partition requires a contiguous caller-owned full output")
+        width, start = n // self._size, self._rank * (n // self._size)
+        if width > self._local_output.shape[0]:
+            raise ValueError("Step5 TP partition exceeds its reserved token capacity")
+        local = self._local_output[:width]
+        _, event, hook = self._buffer.low_latency_combine(
+            x, topk_idx[start:start + width], topk_weights[start:start + width],
+            native_handle, out=local, **kwargs)
+        self._complete_receive(event, hook)
+        # Enqueue at the combine call site, before shared-expert TP reduction.
+        # A deferred gather callback could invert collective order between ranks.
+        self._gather_comm.all_gather(output, local, stream=torch.cuda.current_stream())
+        return output, event, ((lambda: None) if requested_hook else None)
+
+    def get_next_low_latency_combine_buffer(self, handle):
+        native_handle, _ = handle
+        return self._buffer.get_next_low_latency_combine_buffer(native_handle)
+
+
 def ll_init(
     original,
     self,
@@ -933,6 +1078,67 @@ def ll_init(
     self._vllm_hcu_clean_low_latency_buffer = False
     self._hcu_low_latency_dispatch_abi = _has_hcu_low_latency_dispatch_abi(buffer)
     self._hcu_low_latency_cleanup_topk = _has_topk_low_latency_cleanup_abi(buffer)
+    from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
+    from vllm_hcu.platforms import envs as henvs
+
+    self._hcu_step5_ll_transport = bool(
+        is_step5_tp4_deepep_ll() and henvs.optional_custom_op_enabled(True))
+    if self._hcu_step5_ll_transport:
+        import weakref
+
+        self._vllm_hcu_clean_low_latency_buffer = True
+        reference = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
+        proxy = reference() if reference is not None else None
+        if proxy is None:
+            proxy = _Step5TPTokenBuffer(buffer, max_tokens_per_rank, 4096)
+            buffer._hcu_step5_tp_tokens_proxy = weakref.ref(proxy)
+        elif proxy._capacity < max_tokens_per_rank:
+            raise ValueError("Step5 LL shared transport capacity changed after construction")
+        self.buffer = proxy
+
+
+def configure_step5_ll_tp_tokens(prepare, moe):
+    """Install the TP adapter after the HCU FP8 dispatch decision."""
+    if henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_DEEPEP_TP_TOKENS") == "1"
+    ):
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+        config = get_current_vllm_config_or_none()
+        if config is None or not is_step5_config(config):
+            return
+        parallel = config.parallel_config
+        if not (
+            prepare.num_dispatchers_ == 8
+            and parallel.tensor_parallel_size == 4
+            and parallel.data_parallel_size == parallel.data_parallel_size_local == 2
+            and parallel.all2all_backend == "deepep_low_latency"
+            and not parallel.use_ubatching
+            and not config.compilation_config.pass_config.enable_sp
+            and int(os.environ.get("HCU_DBO_MIN_TOKENS", "0")) == 0
+            and not moe.is_sequence_parallel
+            and moe.hidden_dim == 4096
+            and moe.num_experts == 352
+            and prepare.use_fp8_dispatch
+            and prepare._hcu_low_latency_dispatch_abi
+            and os.environ.get("HCU_STEP5_DEEPEP_SWIGLUSTEP") == "1"
+        ):
+            raise ValueError(
+                "Step5 LL token partition requires single-node TP4/DP2/EP8, "
+                "FP8 SwiGLUStep, the HCU DeepEP ABI, and DBO disabled"
+            )
+        from .step5_ll_tp_tokens import Step5LLTPTokenBuffer
+
+        buffer = prepare.buffer
+        proxy = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
+        if proxy is None:
+            proxy = Step5LLTPTokenBuffer(
+                buffer, prepare.max_tokens_per_rank, moe.hidden_dim
+            )
+            buffer._hcu_step5_tp_tokens_proxy = proxy
+        prepare.buffer = proxy
+        prepare._hcu_step5_tp_tokens = True
 
 
 def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None):
@@ -1027,6 +1233,8 @@ def ll_receiver(
         expert_num_tokens=expert_num_tokens,
         expert_num_tokens_cpu=None,
     )
+    if getattr(self, "_hcu_step5_tp_tokens", False):
+        expert_tokens_meta._hcu_step5_tp_tokens = True
     return expert_x, expert_x_scale, expert_tokens_meta, None, None
 
 
@@ -1117,9 +1325,14 @@ def ll_prepare_async(
             if block_k is None and quant_config.per_act_token_quant
             else module.DEEPEP_QUANT_BLOCK_SIZE
         )
-    if getattr(
-        self, "_vllm_hcu_clean_low_latency_buffer", False
-    ) and _claim_ll_buffer_cleanup(self.buffer):
+    step5_ll = getattr(self, "_hcu_step5_ll_transport", False)
+    clean_required = getattr(self, "_vllm_hcu_clean_low_latency_buffer", False) and (
+        not getattr(self.buffer, "_hcu_step5_ll_initialized", False)
+        if step5_ll else _claim_ll_buffer_cleanup(self.buffer)
+    )
+    if clean_required:
+        if step5_ll and module.torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Step5 LL initialization must finish before graph capture")
         cleanup = getattr(self.buffer, "clean_low_latency_buffer", None)
         if not callable(cleanup):
             raise RuntimeError(
@@ -1139,6 +1352,15 @@ def ll_prepare_async(
             quant_group_size,
             **cleanup_kwargs,
         )
+        if step5_ll:
+            import torch.distributed as dist
+            from vllm.distributed import get_ep_group
+
+            module.torch.cuda.synchronize()
+            dist.barrier(group=get_ep_group().cpu_group)
+            # Pure LL never hands this buffer to HT. Its kernels reset the
+            # next slot themselves; graph warmups must not repeat CPU barriers.
+            self.buffer._hcu_step5_ll_initialized = True
     try:
         if use_hcu_api:
             result = self.buffer.low_latency_dispatch(
