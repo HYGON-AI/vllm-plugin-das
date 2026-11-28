@@ -30,6 +30,25 @@ def _require_qualified_graph_worker(tp, device):
             "Flash W4A8 Graph worker requires gfx938/64CU TP4 or gfx936/80CU TP4/TP8")
 
 
+def _is_hisparse_connector(cfg):
+    kv = getattr(cfg, "kv_transfer_config", None)
+    return (
+        getattr(kv, "kv_connector", None) == "HCUHiSparseConnector"
+        and getattr(kv, "kv_connector_module_path", None)
+        == "hcu_vllm_das.models.hy_v4_flash.hisparse_planner_compat"
+    )
+
+
+def _uses_hisparse_graph(cfg):
+    return (_is_hisparse_connector(cfg)
+            and getattr(cfg.attention_config, "hisparse_config", None) is not None)
+
+
+def _admits_hisparse_graph(cfg):
+    return (os.environ.get("HCU_VLLM_HY4_HISPARSE") == "1"
+            and _uses_hisparse_graph(cfg) and is_qualified_config(cfg, breakable=False))
+
+
 def is_qualified_config(cfg, *, breakable):
     """Configuration predicate only; platform/version ownership is separate."""
     if breakable:
@@ -41,6 +60,7 @@ def is_qualified_config(cfg, *, breakable):
         compilation, spec, cache = (
             cfg.compilation_config, cfg.speculative_config, cfg.cache_config
         )
+        hisparse = _uses_hisparse_graph(cfg)
         if (not cfg.use_v2_model_runner or model.enforce_eager is not False
                 or model.enable_prompt_embeds
                 or model.hf_text_config.model_type != "hy_v4_flash"
@@ -52,7 +72,9 @@ def is_qualified_config(cfg, *, breakable):
                     "prefill_context_parallel_size", "decode_context_parallel_size"))
                 or parallel.enable_dbo or parallel.enable_eplb
                 or type(parallel.disable_custom_all_reduce) is not bool
-                or cfg.lora_config is not None or cfg.kv_transfer_config is not None
+                or cfg.lora_config is not None
+                or (cfg.kv_transfer_config is not None and not hisparse)
+                or (hisparse and parallel.tensor_parallel_size != 4)
                 or spec is None or spec.method != "dfly"
                 or spec.num_speculative_tokens != 5
                 or cache.cache_dtype != "fp8_ds_mla"
@@ -116,6 +138,9 @@ def _check_registration():
         if _runner_cls is not None and (
             _runner_cls.initialize_kv_cache,
             _runner_cls.gather_batch_req_state,
+            _runner_cls.profile_cudagraph_memory,
+            _runner_cls.capture_model,
+            _runner_cls.execute_model,
         ) != _runner_methods:
             raise RuntimeError("Flash graph-bank runner methods changed owner")
     except BaseException:
@@ -146,9 +171,12 @@ def matches(cfg):
     if torch.version.hip is None:
         return False
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    arch = str(getattr(properties, "gcnArchName", "")).split(":")[0]
+    if _uses_hisparse_graph(cfg) and (arch != "gfx936" or not _admits_hisparse_graph(cfg)):
+        return False
     return _qualified_worker_tuple(
         cfg.parallel_config.tensor_parallel_size,
-        str(getattr(properties, "gcnArchName", "")).split(":")[0],
+        arch,
         getattr(properties, "multi_processor_count", None))
 
 
@@ -167,6 +195,11 @@ def runner_class():
         class FlashBankModelRunner(GPUModelRunner):
             def initialize_kv_cache(self, *args, **kwargs):
                 super().initialize_kv_cache(*args, **kwargs)
+                if _uses_hisparse_graph(self.vllm_config):
+                    is_profiling = args[1] if len(args) > 1 else kwargs.get("is_profiling", False)
+                    self.speculator.reuse.bind_hisparse_resident_readers(profiling=is_profiling)
+                    # Keep Core's graph manager and connector ordering for host-backed KV.
+                    return
                 wide = self.cudagraph_manager
                 if type(wide) is not ModelCudaGraphManager:
                     raise RuntimeError("Flash bank requires the admitted Core manager")
@@ -211,6 +244,32 @@ def runner_class():
                     scoring_banks=scoring_banks,
                 )
 
+            def profile_cudagraph_memory(self):
+                try:
+                    return super().profile_cudagraph_memory()
+                finally:
+                    if _uses_hisparse_graph(self.vllm_config) and self.speculator.reuse is not None:
+                        self.speculator.reuse.release_hisparse_profile_readers()
+
+            def capture_model(self, *, profile_only=False):
+                if _uses_hisparse_graph(self.vllm_config):
+                    from .hisparse_runtime import suspend_hisparse_mirrors
+
+                    with suspend_hisparse_mirrors(self.compilation_config.static_forward_context.values()):
+                        return super().capture_model(profile_only=profile_only)
+                return super().capture_model(profile_only=profile_only)
+
+            def execute_model(self, *args, **kwargs):
+                if (_uses_hisparse_graph(self.vllm_config)
+                        and getattr(self.kv_connector, "_disabled", False)):
+                    # Core's synthetic warmup disables the connector, but its
+                    # resident attention handles still hold mirror callbacks.
+                    from .hisparse_runtime import suspend_hisparse_mirrors
+
+                    with suspend_hisparse_mirrors(self.compilation_config.static_forward_context.values()):
+                        return super().execute_model(*args, **kwargs)
+                return super().execute_model(*args, **kwargs)
+
             def gather_batch_req_state(self, scheduler_output, dummy_run):
                 state, uniform = super().gather_batch_req_state(
                     scheduler_output, dummy_run
@@ -232,6 +291,8 @@ def runner_class():
         _runner_cls = FlashBankModelRunner
         _runner_methods = (
             _runner_cls.initialize_kv_cache, _runner_cls.gather_batch_req_state,
+            _runner_cls.profile_cudagraph_memory, _runner_cls.capture_model,
+            _runner_cls.execute_model,
         )
     return _runner_cls
 

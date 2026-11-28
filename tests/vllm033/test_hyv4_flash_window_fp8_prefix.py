@@ -118,6 +118,8 @@ def setup(monkeypatch):
         def __init__(self, *args, **kwargs):
             self._indexer = kwargs.get('indexer')
             self._topk_indices_buffer = kwargs.get('topk_indices_buffer')
+            self.kv_cache_dtype = 'fp8_ds_mla'
+            self.num_heads = kwargs.get('num_heads', 16)
             self.fp8_decode_padded_heads = 64 if kwargs.get('num_heads',16) <= 64 else 128
             self.softmax_scale = .25
 
@@ -174,6 +176,27 @@ def setup(monkeypatch):
 def invoke(values):
     obj,q,cache,indices,metadata = values
     return obj._fp8_flash_mla_kernel(q,cache,indices,metadata)
+
+
+def test_only_window_metadata_forces_fp8_mixed_on_hisparse():
+    source = (Path(__file__).resolve().parents[2] /
+              'adapter_extension/src/hcu_vllm_das/models/hy_v4_flash/swa.py')
+    names = {'FlashSparseMetadataBuilder', 'FlashSWAMetadataBuilder'}
+    tree = ast.parse(source.read_text())
+    builders = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in names]
+
+    class CoreBuilder:
+        def __init__(self, _spec, _layers, config, _device):
+            self.use_hisparse = config.hisparse
+            self.fp8_use_mixed_batch = False
+
+    ns = {'CompactPrefillMetadataBuilder':CoreBuilder, 'is_hcu_platform':lambda:False,
+          'AttentionCGSupport':NS(UNIFORM_BATCH=object())}
+    exec(compile(ast.Module(body=builders,type_ignores=[]),str(source),'exec'),ns)
+    sparse, window = (ns[name] for name in ('FlashSparseMetadataBuilder','FlashSWAMetadataBuilder'))
+    assert not sparse(None,[],NS(hisparse=True),None).fp8_use_mixed_batch
+    assert sparse(None,[],NS(hisparse=False),None).fp8_use_mixed_batch
+    assert window(None,[],NS(hisparse=True),None).fp8_use_mixed_batch
 
 
 def test_window_uses_private512_clone_and_fresh_scheduler(setup):

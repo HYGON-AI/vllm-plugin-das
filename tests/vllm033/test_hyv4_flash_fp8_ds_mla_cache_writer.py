@@ -1,5 +1,6 @@
 """CPU contracts for the native-writer composition, not GPU numerical tests."""
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace as N
@@ -117,6 +118,80 @@ class WriterContracts(unittest.TestCase):
         namespace = load()
         with patch.dict(sys.modules, {'lightop': None}):
             namespace['write_fp8_ds_mla_cache'](*args(0))
+
+    def test_hisparse_write_uses_the_same_fp8_codec_inside_the_binding(self):
+        backend = SOURCE.with_name('sparse_backend.py')
+        cls = next(n for n in ast.parse(backend.read_text(encoding='utf-8')).body
+                   if isinstance(n, ast.ClassDef) and n.name == 'FlashSparseImpl')
+        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'do_kv_cache_update']
+        calls = []
+
+        class Core:
+            def do_kv_cache_update(self, *args):
+                calls.append(('core', args))
+
+        class Binding:
+            def validate_batch(self, metadata, **kwargs):
+                calls.append(('validate', metadata, kwargs))
+
+            def write(self, writer, **kwargs):
+                calls.append(('write', kwargs))
+                return writer()
+
+        namespace = {'CoreSinkImpl': Core, '__package__': '_hisparse_codec_test'}
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(backend), 'exec'), namespace)
+        impl = namespace['FlashSparseImpl']()
+        impl._hcu_fp8_ds_mla_writer = True
+        impl.topk_indices_buffer = N(shape=(6, 2176))
+        metadata = object()
+        impl._checked_hisparse_call = lambda: (Binding(), metadata)
+        codec = ModuleType('_hisparse_codec_test.fp8_ds_mla_cache')
+        codec.write_fp8_ds_mla_cache = lambda *args: calls.append(('fp8', args)) or 'encoded'
+        a = args(6)
+        with patch.dict(sys.modules, {codec.__name__: codec}):
+            self.assertEqual(impl.do_kv_cache_update(*a, 'fp8_ds_mla', object()), 'encoded')
+            self.assertEqual(calls, [
+                ('validate', metadata, {'query_rows': 6, 'topk_width': 2176}),
+                ('write', {'kv_cache': a[2], 'slot_mapping': a[3], 'rows': 6}),
+                ('fp8', tuple(a)),
+            ])
+            calls.clear()
+            impl.do_kv_cache_update(*a, 'auto', object())
+            self.assertEqual([call[0] for call in calls], ['validate', 'write', 'core'])
+
+    def test_resident_hisparse_scope_only_wraps_batches_with_prefill_rows(self):
+        backend = SOURCE.with_name('sparse_backend.py')
+        cls = next(n for n in ast.parse(backend.read_text(encoding='utf-8')).body
+                   if isinstance(n, ast.ClassDef) and n.name == 'FlashSparseImpl')
+        cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name == '_forward_fp8_kv_separate_prefill_decode']
+        calls = []
+
+        class Core:
+            def _forward_fp8_kv_separate_prefill_decode(self, *args):
+                calls.append('core')
+
+        @contextmanager
+        def scope(group):
+            calls.append(('enter', group))
+            yield
+            calls.append('exit')
+
+        namespace = {'CoreSinkImpl': Core, '__package__': '_hisparse_codec_test',
+                     'hisparse_fp8_prefill_scope': scope}
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(backend), 'exec'), namespace)
+        impl = namespace['FlashSparseImpl']()
+        impl._hcu_use_resident_hisparse = True
+        impl.index_group = object()
+        q = N(shape=(6,))
+        metadata = N(fp8_extra_metadata=N(num_decode_tokens=6))
+        impl._forward_fp8_kv_separate_prefill_decode(q, object(), object(), metadata)
+        self.assertEqual(calls, ['core'])
+        calls.clear()
+        metadata.fp8_extra_metadata.num_decode_tokens = 4
+        impl._forward_fp8_kv_separate_prefill_decode(q, object(), object(), metadata)
+        self.assertEqual(calls, [('enter', impl.index_group), 'core', 'exit'])
 
 
 if __name__ == '__main__':

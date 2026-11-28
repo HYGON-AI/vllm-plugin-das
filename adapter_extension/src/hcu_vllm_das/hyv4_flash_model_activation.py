@@ -297,6 +297,11 @@ def _activate(context, expected_selection=None, *, model_selected=False):
                 # The DFly owner supplies the real missing Core033 startup seams.
                 _invoke_sync(install)
                 _raise_if_failed()
+                if os.environ.get("HCU_VLLM_HY4_HISPARSE") == "1":
+                    for leaf in ("hisparse_config_compat", "hisparse_planner_compat"):
+                        provider = import_module("hcu_vllm_das.models.hy_v4_flash." + leaf)
+                        _require_sync(provider.install_compat)
+                        _invoke_sync(provider.install_compat)
                 _invoke_sync(runner_install)
                 _raise_if_failed()
                 current_registry = import_module(

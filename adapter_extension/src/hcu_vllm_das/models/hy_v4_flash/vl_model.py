@@ -129,16 +129,34 @@ class HYV4FlashVLForConditionalGeneration(
                 )
         # The text child must see checkpoint DFly options during construction,
         # not only after its model state and target-reuse policy are created.
+        from .fullgraph_runner import _uses_hisparse_graph
+
+        hisparse = _uses_hisparse_graph(vllm_config)
+        text_config = self.config.text_config
+        if hisparse:
+            from copy import deepcopy
+
+            text_config = deepcopy(text_config)
         for name, value in vars(self.config).items():
             if name.startswith("dfly_"):
-                setattr(self.config.text_config, name, value)
+                setattr(text_config, name, value)
         with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=self.config.text_config,
-                architectures=[self.language_model_architecture],
-                prefix=maybe_prefix(prefix, "language_model"),
-            )
+            submodel_args = dict(hf_config=text_config, architectures=[self.language_model_architecture])
+            scope = nullcontext()
+            if hisparse:
+                from .hisparse_config_compat import derive_hisparse_text_config
+                from .hisparse_planner_compat import hisparse_residency_scope
+
+                child_config = derive_hisparse_text_config(
+                    vllm_config, text_config, self.language_model_architecture
+                )
+                scope = hisparse_residency_scope(vllm_config, construction_config=child_config)
+                vllm_config = child_config
+                submodel_args.clear()
+            with scope:
+                self.language_model = init_vllm_registered_model(
+                    vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model"), **submodel_args
+                )
         self.token_lookback_depth = self.language_model.token_lookback_depth
         engram_hash = self.language_model.model.engram_hash
         if engram_hash is not None:

@@ -9,20 +9,10 @@ EngineArgs copy captures the latter's result to admit only actual Flash models,
 including the VL outer config. Non-Flash delegates the original input exactly once. Callable HF overrides and
 remote-code configs remain native-only; the selector never executes them twice.
 
-Only explicit eager V2, BF16, configuration/planner metadata,
-DP/PP/PCP/DCP=1, no DBO/LoRA/offloading is admitted. The separately installed
-planner owner may admit its explicit external connector and genuine DFly5
-configuration to METADATA planning, never joint execution. This is deliberately NOT
-HiSparse+DFly admission or kernel/checkpoint/engine qualification. Activation
-belongs to the caller. Direct VllmConfig construction keeps Core's CUDA guard.
-
-IMPORTANT: this pin's host-pool planner requires HiSparseConnector.host_pool_gib.
-The requested no-connector boundary cannot start a HiSparse engine. The config
-validator is separate from validate_hisparse_runtime, which fails closed with
-that concrete downstream blocker. A successful factory/health check is NOT
-runtime admission. The separately installed hisparse_planner_compat owns an
-explicit external connector/builder for planner metadata. Its execution remains
-blocked; post-init compatibility and worker/device paths must not be skipped.
+The existing eager V2 BF16 scope supports configuration and planner metadata.
+The opt-in FP8 graph candidate requires the explicit connector, W4A8 TP4 and
+DFly5. The graph runner qualifies the actual worker device. Direct VllmConfig
+construction keeps Core's CUDA guard.
 
 The reviewed Core has three HiSparse-dependent sites: runner selection, the
 inline constraints, and late HMA validation. Explicit V2 makes runner selection
@@ -38,13 +28,15 @@ import os
 import sys
 import textwrap
 import weakref
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import replace
 from functools import wraps
 from importlib import import_module
 from threading import RLock
 
 _ARCHES = frozenset(("HYV4FlashForCausalLM", "HYV4FlashVLForConditionalGeneration"))
+_GRAPH_ATTESTATION = "_hcu_hyv4_hisparse_graph_construction"
+_PLANNER_MODULE = "hcu_vllm_das.models.hy_v4_flash.hisparse_planner_compat"
 # Core 4ba787ec9959e566d3b587a796dff07673324da5. Entire class ASTs pin
 # transitive runner/HMA helpers as well as the public entry point.
 _CORE_ABI = {
@@ -87,6 +79,18 @@ _CORE_ABI = {
     "VllmConfig": (
         "vllm.config.vllm",
         "aa5dd9c152e478bb4fffbd416b8d9a78e7116536174bdc1520ecc8dadf415daa",
+    ),
+    "EngineCoreProc.__init__": (
+        "vllm.v1.engine.core",
+        "2d9517c16c25249f765077315d3dbf2ac89cebf8d7163f78a82ab6683713e123",
+    ),
+    "EngineCoreProc._perform_handshakes": (
+        "vllm.v1.engine.core",
+        "fcb2d165efa9b9963bc859439abc33b5d57c7a768c50958d7ea31fa01803450b",
+    ),
+    "EngineCoreProc._perform_handshake": (
+        "vllm.v1.engine.core",
+        "bc39733589cbe472ae5e66b531d66e8805e3a1668532e5d8e1f76fd8b54c4e0c",
     ),
 }
 _lock = RLock()
@@ -138,6 +142,7 @@ def _load_bindings():
         platforms.current_platform,
         import_module("torch"),
         import_module("vllm.transformers_utils.config"),
+        import_module("vllm.v1.engine.core"),
     )
 
 
@@ -170,7 +175,7 @@ def _owned_health():
         "installed": True,
         "pid": _state["pid"],
         "wrapped_points": ("create_engine_config",),
-        "scope": "HCU Flash eager V2 BF16; explicit planner owner required for connector/DFly5 metadata",
+        "scope": "HCU Flash eager V2 BF16 metadata and explicit FP8 DFly5 graph candidate",
         "runtime_admitted": False,
         "core_pin": "4ba787ec9959e566d3b587a796dff07673324da5",
     }
@@ -258,7 +263,7 @@ def _is_flash(model):
     )
 
 
-def _require_model(model, bindings):
+def _require_model(model, bindings, *, graph=False):
     if not _is_flash(model):
         raise ValueError(
             "HiSparse extension requires an actual HYV4 Flash text/VL model"
@@ -271,9 +276,9 @@ def _require_model(model, bindings):
         )
     if bindings[5].VLLM_USE_V2_MODEL_RUNNER is not True:
         raise ValueError("HCU HiSparse requires explicit VLLM_USE_V2_MODEL_RUNNER=1")
-    if not model.enforce_eager or model.dtype != bindings[7].bfloat16:
+    if (model.enforce_eager is not (not graph) or model.dtype != bindings[7].bfloat16):
         raise ValueError(
-            "HCU HiSparse requires explicit eager execution and BF16 model dtype"
+            "HCU HiSparse requires BF16 model dtype and matching eager or graph execution"
         )
     # VL outer configs need not have index_topk. Core's text view is the DSA owner.
     topk = getattr(model.hf_text_config, "index_topk", None)
@@ -281,6 +286,15 @@ def _require_model(model, bindings):
         raise ValueError(
             "HiSparse requires a DSA hf_text_config with positive index_topk"
         )
+
+
+def _graph_requested(value, *, final):
+    kv = value.kv_transfer_config
+    dtype = (value.cache_config.cache_dtype if final else getattr(value, "kv_cache_dtype", "auto"))
+    return (os.environ.get("HCU_VLLM_HY4_HISPARSE") == "1"
+            and getattr(kv, "kv_connector", None) == "HCUHiSparseConnector"
+            and getattr(kv, "kv_connector_module_path", None) == _PLANNER_MODULE
+            and dtype == "fp8_ds_mla")
 
 
 def _planner_scope(value, *, final):
@@ -294,7 +308,7 @@ def _planner_scope(value, *, final):
     return True
 
 
-def _planner_snapshot(config):
+def _planner_snapshot(config, *, portable=False):
     kv = config.kv_transfer_config
     spec = config.speculative_config
     if not _planner_scope(config, final=True):
@@ -314,11 +328,53 @@ def _planner_snapshot(config):
                       if k not in ("target_model_config", "target_parallel_config",
                                    "draft_model_config", "draft_parallel_config")}),
             spec.draft_model_config.hf_config.to_dict(),
-            (id(spec.draft_model_config), spec.draft_model_config),
-            (id(spec.draft_parallel_config), spec.draft_parallel_config),
+            None if portable else (id(spec.draft_model_config), spec.draft_model_config),
+            None if portable else (id(spec.draft_parallel_config), spec.draft_parallel_config),
             spec.draft_model_config.dtype, spec.draft_model_config.enforce_eager,
         ),
     )
+
+
+def _graph_snapshot(config):
+    model = config.model_config
+    parallel = config.parallel_config
+    compilation = config.compilation_config
+    cache = config.cache_config
+    scheduler = config.scheduler_config
+    draft = config.speculative_config.draft_model_config
+    return (
+        _planner_snapshot(config, portable=True),
+        replace(config.attention_config.hisparse_config),
+        (model.model, model.model_weights, model.dtype, model.enforce_eager,
+         tuple(model.architectures), model.quantization,
+         deepcopy(model.model_arch_config.quantization_config)),
+        (parallel.tensor_parallel_size, parallel.pipeline_parallel_size,
+         parallel.data_parallel_size, parallel.prefill_context_parallel_size,
+         parallel.decode_context_parallel_size, parallel.enable_dbo,
+         parallel.enable_eplb, parallel.disable_custom_all_reduce),
+        (compilation.mode, compilation.cudagraph_mode, cache.cache_dtype, cache.user_specified_block_size,
+         cache.enable_prefix_caching, cache.kv_cache_memory_bytes,
+         cache.num_gpu_blocks_override, scheduler.scheduler_reserve_full_isl,
+         scheduler.disable_hybrid_kv_cache_manager),
+        (draft.model, draft.model_weights, draft.max_model_len, draft.dtype, draft.enforce_eager),
+    )
+
+
+def _restore_graph_record(config, bindings):
+    if type(config) is not bindings[1].VllmConfig or not _graph_requested(config, final=True):
+        return False
+    stamp = getattr(config.attention_config.hisparse_config, _GRAPH_ATTESTATION, None)
+    if (type(stamp) is not tuple or len(stamp) != 2 or type(stamp[0]) is not int
+            or stamp[0] <= 0 or stamp[0] == os.getpid()):
+        return False
+    # Spawn restores the Core config object graph through pickle. Re-check the
+    # current process's publication and structural contracts before recording
+    # its new object identities. Same-process clones still lack provenance.
+    _validate_result(config, bindings)
+    if stamp[1] != _graph_snapshot(config):
+        raise ValueError("HiSparse config lacks intact graph construction provenance")
+    _record(config)
+    return True
 
 
 def _request_bounds(args, bindings):
@@ -332,7 +388,8 @@ def _request_bounds(args, bindings):
         raise ValueError("HiSparse requires the hybrid KV cache manager (HMA)")
     if getattr(args, "scheduler_reserve_full_isl", None) is False:
         raise ValueError("HiSparse requires --scheduler-reserve-full-isl")
-    if getattr(args, "kv_cache_dtype", "auto") not in ("auto", "bfloat16"):
+    graph = _graph_requested(args, final=False)
+    if not graph and getattr(args, "kv_cache_dtype", "auto") not in ("auto", "bfloat16"):
         raise ValueError("HCU HiSparse requires BF16 KV cache")
     planner_scope = _planner_scope(args, final=False)
     if (args.kv_transfer_config is not None and not planner_scope) or getattr(args, "kv_offloading_size", None) is not None:
@@ -351,13 +408,24 @@ def _request_bounds(args, bindings):
         raise NotImplementedError("HCU HiSparse + speculation/DFly remains unqualified")
     if getattr(args, "enable_lora", False) or getattr(args, "enable_dbo", False):
         raise ValueError("HCU HiSparse does not admit LoRA or DBO")
+    compilation = args.compilation_config
+    if graph:
+        if args.block_size not in (None, 64):
+            raise ValueError("HiSparse FP8 graph requires a 64-token MLA block size")
+        if (args.tensor_parallel_size != 4 or args.enable_eplb
+                or args.enforce_eager is not False or args.enable_prefix_caching is not False
+                or type(args.max_model_len) is not int or args.max_model_len < 65792
+                or compilation.mode is not bindings[3].CompilationMode.VLLM_COMPILE
+                or compilation.cudagraph_mode is not bindings[3].CUDAGraphMode.FULL_AND_PIECEWISE):
+            raise ValueError("HiSparse FP8 graph requires TP4, at least 65792 tokens and FULL_AND_PIECEWISE")
+        return True
     if getattr(args, "enforce_eager", None) is not True:
         raise ValueError("HCU HiSparse requires explicit enforce_eager=True")
-    compilation = args.compilation_config
     if compilation.cudagraph_mode not in (None, bindings[3].CUDAGraphMode.NONE):
         raise ValueError("HCU HiSparse is eager-only; cudagraph_mode must be NONE")
     if compilation.mode not in (None, bindings[3].CompilationMode.NONE):
         raise ValueError("HCU HiSparse requires compilation mode NONE")
+    return False
 
 
 def _require_hisparse(hisparse, bindings):
@@ -373,7 +441,8 @@ def _require_hisparse(hisparse, bindings):
 def _validate_result(config, bindings):
     if not _is_hcu(bindings):
         raise ValueError("HiSparse extension is HCU-only")
-    _require_model(config.model_config, bindings)
+    graph = _graph_requested(config, final=True)
+    _require_model(config.model_config, bindings, graph=graph)
     if not config.use_v2_model_runner:
         raise ValueError("HiSparse requires Model Runner V2")
     p = config.parallel_config
@@ -390,7 +459,7 @@ def _validate_result(config, bindings):
     if getattr(p, "enable_dbo", False):
         raise ValueError("HCU HiSparse does not admit DBO")
     c = config.compilation_config
-    if (
+    if not graph and (
         c.cudagraph_mode != bindings[3].CUDAGraphMode.NONE
         or c.mode != bindings[3].CompilationMode.NONE
     ):
@@ -413,7 +482,7 @@ def _validate_result(config, bindings):
         raise NotImplementedError("HCU HiSparse + speculation/DFly remains unqualified")
     if config.lora_config is not None:
         raise ValueError("HCU HiSparse does not admit LoRA")
-    if config.cache_config.cache_dtype not in ("auto", "bfloat16"):
+    if not graph and config.cache_config.cache_dtype not in ("auto", "bfloat16"):
         raise ValueError("HCU HiSparse requires BF16 KV cache")
     attention = config.attention_config
     if (
@@ -424,6 +493,19 @@ def _validate_result(config, bindings):
             "HCU HiSparse requires explicit FLASHMLA_SPARSE without per-kind overrides"
         )
     _require_hisparse(attention.hisparse_config, bindings)
+    if graph:
+        if config.cache_config.block_size != 64 or not config.cache_config.user_specified_block_size:
+            raise ValueError("HiSparse FP8 graph requires a fixed 64-token MLA block size")
+        from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+        from .fullgraph_runner import is_qualified_config
+        from .quantization import validate_flash_quant_config
+        if (not is_qualified_config(config, breakable=is_breakable_cudagraph_enabled())
+                or config.model_config.max_model_len < 65792
+                or not attention.hisparse_config.eager_host_mirror
+                or attention.hisparse_config.device_buffer_size is not None
+                or getattr(config.quant_config, "config", None) is None
+                or validate_flash_quant_config(config.quant_config.config) != "channel_w4a8"):
+            raise ValueError("HiSparse FP8 graph requires the qualified W4A8 graph configuration")
 
 
 def _record(config):
@@ -472,6 +554,8 @@ def validate_hisparse_config(vllm_config) -> None:
             return
         if entry is None and not _is_flash(vllm_config.model_config):
             return
+        if entry is None and _restore_graph_record(vllm_config, _state["sources"]):
+            entry = _constructed[id(vllm_config)]
         attention = vllm_config.attention_config
         if (
             entry is None
@@ -494,23 +578,18 @@ def _validate_planner_config(vllm_config):
     # Strict handshake: the ordinary public validator is intentionally inert on
     # non-targets, so it alone cannot certify a resolver's target config owner.
     with _lock:
+        if id(vllm_config) not in _constructed and not _graph_requested(vllm_config, final=True):
+            raise ValueError("HiSparse planner requires owned EngineArgs construction provenance")
+        validate_hisparse_config(vllm_config)
         entry = _constructed.get(id(vllm_config))
         if entry is None or entry[0]() is not vllm_config:
             raise ValueError("HiSparse planner requires owned EngineArgs construction provenance")
-        validate_hisparse_config(vllm_config)
         if not _planner_scope(vllm_config, final=True):
             raise ValueError("HiSparse planner requires its explicit connector scope")
 
 
 def validate_hisparse_runtime(vllm_config) -> None:
-    """Fail closed at the unqualified host-pool boundary after config validation.
-
-    Non-HCU/non-Flash/non-HiSparse is inert. This Core pin unconditionally asks
-    HiSparseConnector for host_pool_gib during KV planning. We do not synthesize
-    it, change Core, or claim that a no-connector config can start an engine.
-    Main must independently qualify a connector/planner extension before this
-    gate can admit runtime use, and separately qualify HiSparse + DFly.
-    """
+    """Allow the explicit FP8 graph candidate at the native connector boundary."""
     validate_hisparse_config(vllm_config)
     if (
         getattr(vllm_config.attention_config, "hisparse_config", None) is not None
@@ -518,6 +597,8 @@ def validate_hisparse_runtime(vllm_config) -> None:
         and _is_flash(vllm_config.model_config)
     ):
         if _planner_scope(vllm_config, final=True):
+            if _graph_requested(vllm_config, final=True):
+                return
             raise NotImplementedError(
                 "HCU HiSparse planner metadata only: native connector scheduler/worker, "
                 "HIP host mapping/transfer and HiSparse + DFly joint runtime remain unqualified"
@@ -527,6 +608,74 @@ def validate_hisparse_runtime(vllm_config) -> None:
             "requires HiSparseConnector with host_pool_gib; the requested "
             "no-connector engine path and HiSparse + DFly remain unqualified"
         )
+
+
+def derive_hisparse_text_config(config, text_config, architecture):
+    """Use Core's submodel factory with HiSparse hidden during its CUDA check."""
+    validate_hisparse_config(config)
+    outer = copy(config)
+    outer.attention_config = replace(config.attention_config, hisparse_config=None)
+    text = outer.with_hf_config(text_config, architectures=[architecture])
+    text.attention_config = replace(
+        text.attention_config, hisparse_config=config.attention_config.hisparse_config
+    )
+    return text
+
+
+def _starting_engine(config, engine_type, engine_init):
+    # Plugins load from within EngineCore.__init__, after EngineCoreProc has
+    # already entered its native startup handshake context.
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code is engine_init:
+            engine = frame.f_locals.get("self")
+            if type(engine) is engine_type and frame.f_locals.get("vllm_config") is config:
+                return engine
+        frame = frame.f_back
+    return None
+
+
+def arm_hisparse_engine_handshake(config):
+    """Finish the pinned native startup handshake on one owned config instance."""
+    if not _graph_requested(config, final=True):
+        return False
+    check_health()
+    engine_type, engine_init, handshake_resume = _state["engine_handshake"]
+    engine = _starting_engine(config, engine_type, engine_init)
+    if engine is None:
+        return False
+    validate_hisparse_config(config)
+    if "__post_init__" in vars(config):
+        raise RuntimeError("HiSparse EngineCore handshake config already has a post-init owner")
+    native_post_init = config.__post_init__
+
+    def remove_hook():
+        if vars(config).get("__post_init__") is finish_handshake:
+            del config.__post_init__
+
+    def finish_handshake():
+        if sys._getframe(1).f_code is not handshake_resume:
+            return native_post_init()
+        cleanup()
+        validate_hisparse_config(config)
+        attention = config.attention_config
+        hisparse = attention.hisparse_config
+        attention.hisparse_config = None
+        try:
+            native_post_init()
+            if config.attention_config is not attention or attention.hisparse_config is not None:
+                raise RuntimeError("HiSparse Core handshake changed attention config ownership")
+        finally:
+            config.attention_config = attention
+            attention.hisparse_config = hisparse
+        validate_hisparse_config(config)
+
+    # If startup fails before Core resumes the handshake, destruction of the
+    # startup-only engine removes the unused instance callback.
+    cleanup = weakref.finalize(engine, remove_hook)
+    cleanup.atexit = False
+    config.__post_init__ = finish_handshake
+    return True
 
 
 def _copy_args(args):
@@ -573,8 +722,12 @@ def _construct(original, args, usage_context, headless, bindings):
         if not admitted:
             raise ValueError("HiSparse metadata candidate disagrees with actual Core model")
         if admitted:
-            _require_model(model, bindings)
-            _request_bounds(clone, bindings)
+            graph = _request_bounds(clone, bindings)
+            _require_model(model, bindings, graph=graph)
+            if graph and clone.block_size is None:
+                # Core otherwise chooses one common backend size at worker load.
+                # IndexPool already declares its own 256-token per-group block.
+                clone.block_size = 64
             clone.attention_config = replace(
                 clone.attention_config, hisparse_config=None
             )
@@ -599,14 +752,17 @@ def _construct(original, args, usage_context, headless, bindings):
         )
     if args.attention_config.hisparse_config is not requested_hisparse or requested_hisparse != snapshot:
         raise ValueError("HiSparse caller input mutated during Core construction")
-    config.attention_config = replace(
-        config.attention_config, hisparse_config=requested_hisparse
-    )
-    if config.attention_config.hisparse_config is not requested_hisparse:
+    graph = _graph_requested(config, final=True)
+    resolved_hisparse = validated if graph else requested_hisparse
+    config.attention_config = replace(config.attention_config, hisparse_config=resolved_hisparse)
+    if config.attention_config.hisparse_config is not resolved_hisparse:
         raise RuntimeError("Core AttentionConfig changed the real HiSparseConfig identity")
     _validate_result(config, bindings)
     with _lock:
         check_health()
+        if graph:
+            # Core's with_hf_config enumerates VllmConfig fields and rejects extra attributes.
+            setattr(resolved_hisparse, _GRAPH_ATTESTATION, (os.getpid(), _graph_snapshot(config)))
         _record(config)
     validate_hisparse_config(config)
     return config
@@ -639,6 +795,16 @@ def install_compat() -> bool:
             args_module, config_module = bindings[:2]
             args_cls = args_module.EngineArgs
             config_cls = config_module.VllmConfig
+            engine_cls = bindings[9].EngineCoreProc
+            engine_init = engine_cls.__init__
+            engine_body = inspect.unwrap(engine_init)
+            handshakes = engine_cls._perform_handshakes
+            handshake = engine_cls._perform_handshake
+            for method in (engine_init, handshakes, handshake):
+                _source_abi(method)
+            if (not inspect.isgeneratorfunction(getattr(handshakes, "__wrapped__", None))
+                    or not inspect.isgeneratorfunction(getattr(handshake, "__wrapped__", None))):
+                raise RuntimeError("HiSparse Core startup handshake owner changed")
             _source_abi(args_cls)
             _source_abi(config_cls)
             _source_abi(bindings[2].AttentionConfig)
@@ -721,6 +887,10 @@ def install_compat() -> bool:
                 (config_cls, "__post_init__", config_cls.__post_init__),
                 (config_cls, "use_v2_model_runner", config_cls.use_v2_model_runner),
                 (bindings[4], "current_platform", bindings[6]),
+                (bindings[9], "EngineCoreProc", engine_cls),
+                (engine_cls, "__init__", engine_init),
+                (engine_cls, "_perform_handshakes", handshakes),
+                (engine_cls, "_perform_handshake", handshake),
             )
             args_cls.create_engine_config = wrapper
             changed = True
@@ -729,11 +899,13 @@ def install_compat() -> bool:
                 "sources": bindings,
                 "owners": owners,
                 "hcu": _is_hcu(bindings),
+                "engine_handshake": (engine_cls, engine_body.__code__, handshakes.__wrapped__.__code__),
                 "callables": tuple(
                     (fn, _callable_state(fn)) for fn in (
                         original, wrapper, args_cls.create_model_config,
                         args_cls.__post_init__, config_cls.__post_init__,
-                        config_cls.use_v2_model_runner.fget, metadata,
+                        config_cls.use_v2_model_runner.fget, metadata, engine_init, engine_body,
+                        handshakes, handshakes.__wrapped__, handshake, handshake.__wrapped__,
                     )
                 ),
             }

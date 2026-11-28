@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import copy
 from typing import Any, NamedTuple
 
@@ -39,6 +40,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from .dfly import HYV4DFlyForCausalLM
 from .dfly_inputs import prepare_dfly_inputs, write_dfly_query_slots
 from .dfly_target_reuse import HYV4DFlyTargetReuse
+from .fullgraph_runner import _admits_hisparse_graph
 
 logger = init_logger(__name__)
 
@@ -148,7 +150,8 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
     can_reuse_target_attn_metadata = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        if vllm_config.attention_config.hisparse_config is not None:
+        hisparse = _admits_hisparse_graph(vllm_config)
+        if vllm_config.attention_config.hisparse_config is not None and not hisparse:
             raise NotImplementedError("HiSparse + DFly joint runtime remains unqualified")
         cache_dtype = vllm_config.cache_config.cache_dtype
         if cache_dtype not in ("auto", "bfloat16", "fp8_ds_mla"):
@@ -163,7 +166,7 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
                 "DFly draft and target must use the same MLA KV cache dtype; "
                 "omit speculative_config.kv_cache_dtype to inherit the target"
             )
-        if vllm_config.kv_transfer_config is not None:
+        if vllm_config.kv_transfer_config is not None and not hisparse:
             raise ValueError("DFly does not support PD disaggregation")
         if (
             vllm_config.lora_config is not None
@@ -184,6 +187,7 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
             * (spec.num_speculative_tokens + 1),
         )
         super().__init__(draft_vllm_config, device)
+        self._hisparse_config_owner = vllm_config if hisparse else None
         config = copy(super().attn_vllm_config)
         config.model_config = copy(self.draft_model_config)
         config.parallel_config = copy(vllm_config.parallel_config)
@@ -243,12 +247,20 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         config.quant_config = VllmConfig.get_quantization_config(
             self.draft_model_config, get_draft_load_config(config)
         )
-        draft = get_model(
-            vllm_config=config,
-            model_config=self.draft_model_config,
-            load_config=get_draft_load_config(config),
-            prefix="dfly",
-        )
+        scope = nullcontext()
+        if self._hisparse_config_owner is not None:
+            from .hisparse_planner_compat import hisparse_residency_scope
+
+            scope = hisparse_residency_scope(
+                self._hisparse_config_owner, construction_config=config, draft=True,
+            )
+        with scope:
+            draft = get_model(
+                vllm_config=config,
+                model_config=self.draft_model_config,
+                load_config=get_draft_load_config(config),
+                prefix="dfly",
+            )
         if not isinstance(draft, HYV4DFlyForCausalLM):
             raise TypeError("DFly speculator requires HYV4DFlyForCausalLM")
         language_model = (
@@ -316,12 +328,26 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         assert self.reuse is not None
         self.reuse.validate_groups(kv_cache_config)
         self._storage_validated = False
-        self._slot_mappings = torch.full(
-            (len(kv_cache_config.kv_cache_groups), self.max_num_tokens),
-            PAD_SLOT_ID,
-            dtype=torch.int64,
-            device=self.device,
-        )
+        cache_groups = kv_cache_config.kv_cache_groups
+        if self.vllm_config.attention_config.hisparse_config is not None:
+            # The HiSparse writer retains Core's mapping when it binds the cache.
+            # Resident groups need draft slots even without a draft attention layer.
+            slots = block_tables.slot_mappings
+            if (slots.ndim != 2 or slots.dtype != torch.int64
+                    or slots.shape[0] != len(cache_groups)
+                    or slots.shape[1] < self.max_num_tokens):
+                raise ValueError("HiSparse DFly slot mapping capacity or layout mismatch")
+            self._slot_mappings = slots
+            self._query_slot_groups = tuple(gid for gid, group in enumerate(cache_groups)
+                                            if group.kv_cache_spec.uses_slot_mapping)
+        else:
+            self._slot_mappings = torch.full(
+                (len(cache_groups), self.max_num_tokens),
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._query_slot_groups = tuple(gid for gid, groups in enumerate(self.attn_groups) if groups)
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Called AFTER set_attn: the draft has its own backend support/capacity.
@@ -480,22 +506,24 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
             padded_batch=padded_batch,
         )
         if write_slots:
-            assert self._slot_mappings is not None
-            for gid, groups in enumerate(self.attn_groups):
-                if groups:
-                    write_dfly_query_slots(
-                        self._slot_mappings[gid],
-                        self.input_buffers.positions,
-                        self.active_requests,
-                        self.block_tables.input_block_tables[gid],
-                        self.block_tables.block_sizes[gid],
-                        self.max_model_len_gpu,
-                        self.num_query_per_req,
-                        padded_batch,
-                    )
+            self._write_query_slots(padded_batch)
         self.reuse.update_indices(
             self.active_requests, self.source_rows, self.anchors, padded_batch
         )
+
+    def _write_query_slots(self, padded_batch: int) -> None:
+        assert self._slot_mappings is not None
+        for gid in self._query_slot_groups:
+            write_dfly_query_slots(
+                self._slot_mappings[gid],
+                self.input_buffers.positions,
+                self.active_requests,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.block_sizes[gid],
+                self.max_model_len_gpu,
+                self.num_query_per_req,
+                padded_batch,
+            )
 
     def _sample_step(self, step: int, hidden: torch.Tensor) -> torch.Tensor:
         """The draft tokens at query offset `step + 1` of every row."""

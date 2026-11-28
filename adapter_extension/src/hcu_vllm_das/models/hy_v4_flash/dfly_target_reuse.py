@@ -192,6 +192,23 @@ class HYV4DFlyTargetReuse:
                     "DFly query and target KV must alias the same local layout"
                 )
 
+    def bind_hisparse_resident_readers(self, *, profiling: bool) -> None:
+        from .hisparse_runtime import HiSparseBindingError, bind_hisparse_resident_reader
+
+        self.validate_storage()
+        for source, dest in self.layer_pairs:
+            target = getattr(source.mla_attn, "hisparse_cache", None)
+            draft = getattr(dest.mla_attn, "hisparse_cache", None)
+            if target is None or draft is None:
+                raise HiSparseBindingError("DFly layer has no HiSparse resident cache binding")
+            bind_hisparse_resident_reader(target, draft, dest.mla_attn.kv_cache, profiling=profiling)
+
+    def release_hisparse_profile_readers(self) -> None:
+        from .hisparse_runtime import release_hisparse_resident_reader
+
+        for _, dest in self.layer_pairs:
+            release_hisparse_resident_reader(getattr(dest.mla_attn, "hisparse_cache", None))
+
     def update_indices(
         self,
         active: torch.Tensor,

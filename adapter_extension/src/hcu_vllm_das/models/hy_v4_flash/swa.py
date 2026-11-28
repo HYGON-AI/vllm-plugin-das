@@ -30,12 +30,27 @@ class FlashWindowIndexGroupBuilder(SparseMLAIndexGroupBuilder):
 
 class FlashSparseMetadataBuilder(CompactPrefillMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    _window_owned_kv = False
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # The direct paged kernel never gathers evicted SWA history.
-        self.fp8_use_mixed_batch = True
+        # SWA owns device pages. DSA with host backing must keep Core's
+        # separate prefill/decode metadata so it resolves the hot view first.
+        if self._window_owned_kv or not self.use_hisparse:
+            self.fp8_use_mixed_batch = True
         self._hcu_ops = get_flashmla_ops() if is_hcu_platform() else None
+        self._hcu_hisparse_fp8_metadata = None
+        if not self.fp8_use_mixed_batch and self._hcu_ops is not None:
+            from .hisparse_fp8_prefill import bind_hisparse_fp8_metadata_builder
+
+            self._hcu_hisparse_fp8_metadata = bind_hisparse_fp8_metadata_builder(
+                self._hcu_ops.get_metadata
+            )
+
+    def _build_fp8_separate_prefill_decode(self, common_attn_metadata, metadata):
+        if self._hcu_hisparse_fp8_metadata is not None:
+            return self._hcu_hisparse_fp8_metadata(self, common_attn_metadata, metadata)
+        return super()._build_fp8_separate_prefill_decode(common_attn_metadata, metadata)
 
     def _build_fp8_mixed_decode_prefill(self):
         if not is_hcu_platform():
@@ -48,6 +63,10 @@ class FlashSparseMetadataBuilder(CompactPrefillMetadataBuilder):
             cache_lens=self.max_model_len_tensor[:1],
             dummy_block_table=self.dummy_block_table[:1],
         )
+
+
+class FlashSWAMetadataBuilder(FlashSparseMetadataBuilder):
+    _window_owned_kv = True
 
 
 class FlashSparseBackend(FlashSparseKernelBackend):
@@ -65,6 +84,10 @@ class FlashSparseBackend(FlashSparseKernelBackend):
 
 
 class FlashSWABackend(FlashSparseBackend):
+    @staticmethod
+    def get_builder_cls():
+        return FlashSWAMetadataBuilder
+
     @classmethod
     def supports_sliding_window(cls):
         return True

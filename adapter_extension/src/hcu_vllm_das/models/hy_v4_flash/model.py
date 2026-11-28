@@ -3,7 +3,7 @@
 """HYV4 Flash backbone using the public HYV4 checkpoint contract."""
 
 from collections.abc import Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import regex as re
@@ -26,6 +26,7 @@ from .core_model import (
     HYV4ModelWithFactories,
 )
 from .core_moe import HYV4FlashFeedForward, HYV4FlashMoE, _check_quantization
+from .fullgraph_runner import _admits_hisparse_graph
 from .runtime import is_hcu_platform
 
 _EXPERT_WEIGHT = re.compile(
@@ -57,12 +58,11 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
         raise ValueError("HYV4 Flash requires bfloat16 compute")
     if not vllm_config.use_v2_model_runner:
         raise ValueError("HYV4 Flash requires the V2 model runner")
-    if (
-        vllm_config.kv_transfer_config is not None
-        or vllm_config.lora_config is not None
-    ):
+    hisparse = _admits_hisparse_graph(vllm_config)
+    if ((vllm_config.kv_transfer_config is not None and not hisparse)
+            or vllm_config.lora_config is not None):
         raise ValueError("HYV4 Flash does not support KV transfer or LoRA")
-    if vllm_config.attention_config.hisparse_config is not None:
+    if vllm_config.attention_config.hisparse_config is not None and not hisparse:
         raise NotImplementedError(
             "Active Flash HiSparse runtime, including Graph and DFly, remains unqualified"
         )
@@ -104,6 +104,11 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
     # Admission shares the actual model-local CT/W4A8 composition used by the
     # FFN/MoE constructors. Parsing a recipe is not kernel/model qualification.
     _check_quantization(config, vllm_config.quant_config)
+    if hisparse and is_hcu_platform():
+        # Core creates HiSparse runtime handles while constructing the attention layers.
+        from hcu_adapter.kernels.hisparse import ensure_hisparse_ops
+
+        ensure_hisparse_ops()
 
 
 def _promote_fp8_scale(name, parameter, value, quant_config, *, parameters=None):
@@ -473,7 +478,14 @@ class HYV4FlashForCausalLM(HYV4ForCausalLMWithFactories):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         validate_runtime(vllm_config)
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        scope = nullcontext()
+        if (_admits_hisparse_graph(vllm_config)
+                and not vllm_config.model_config.is_submodel_config):
+            from .hisparse_planner_compat import hisparse_residency_scope
+
+            scope = hisparse_residency_scope(vllm_config)
+        with scope:
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.token_lookback_depth = self.model.token_lookback_depth
         self._weight_loading_depth = 0
         self._seen_weights: set[str] = set()
