@@ -41,12 +41,18 @@ def _prefill_chunk(vendor: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
     gathered_v = torch.zeros_like(gathered_k)
     cumulative = torch.zeros_like(kwargs["cu_seqlens_q"])
     torch.cumsum(kwargs["seqused_k"], dim=0, out=cumulative[1:])
+    table = kwargs["block_table"].contiguous()
     for head in range(key.shape[2]):
         cp_gather_cache(key[:, :, head, :], gathered_k[:, head, :],
-                        kwargs["block_table"], cumulative, batch)
+                        table, cumulative, batch)
         cp_gather_cache(value[:, :, head, :], gathered_v[:, head, :],
-                        kwargs["block_table"], cumulative, batch)
-    arguments = dict(kwargs, k=gathered_k.to(query.dtype),
+                        table, cumulative, batch)
+    output = kwargs["out"]
+    native_output = (output if output.is_contiguous() else torch.empty_like(
+        output, memory_format=torch.contiguous_format))
+    arguments = dict(kwargs, q=query.contiguous(), out=native_output,
+                     cu_seqlens_q=kwargs["cu_seqlens_q"].contiguous(),
+                     k=gathered_k.to(query.dtype),
                      v=gathered_v.to(query.dtype), cu_seqlens_k=cumulative)
     for name in ("block_table", "seqused_k", "layout"):
         arguments.pop(name, None)
@@ -55,7 +61,6 @@ def _prefill_chunk(vendor: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
         arguments["return_attn_probs"] = True
     result = vendor(**arguments)
     produced = result[0] if isinstance(result, tuple) else result
-    output = kwargs["out"]
     if produced.data_ptr() != output.data_ptr():
         output.copy_(produced)
     if isinstance(result, tuple):
@@ -72,6 +77,9 @@ def _prefill(vendor: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
     or special empty-KV vendor contract is needed.
     """
     query, key = kwargs["q"], kwargs["k"]
+    if kwargs.get("out") is None:
+        kwargs = dict(kwargs, out=torch.empty_like(
+            query, memory_format=torch.contiguous_format))
     cuq = kwargs["cu_seqlens_q"]
     batch = cuq.shape[0] - 1
     kv_heads = key.shape[1] if kwargs["layout"] == "bhsd" else key.shape[2]
@@ -125,12 +133,20 @@ def run_e4m3_attention(vendor: Callable[..., Any], kwargs: dict[str, Any]) -> An
     from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
 
     def execute(**arguments: Any) -> Any:
+        key = arguments["k"]
+        kv_heads = key.shape[1] if arguments.get("layout") == "bhsd" else key.shape[2]
         # Paged single-token decode's fast path drops requested LSE. The
         # byte-gather/ordinary-varlen path retains BF16/FP16 Q and exposes LSE
         # via return_attn_probs, including for one query per sequence.
         if arguments.get("block_table") is not None and (
             arguments["max_seqlen_q"] > 1
             or arguments.get("return_softmax_lse", False)
+            # The tested native D256/KV4 E4M3 PA exceeds the existing
+            # independent FP32 tolerance with non-unit scales. Its contiguous
+            # control is byte-identical to remapped PA, so layout conversion
+            # cannot fix this. Retain FP8 storage with the bounded BF16/FP16
+            # varlen composition for this geometry until native PA qualifies.
+            or (key.shape[-1] == 256 and kv_heads == 4)
         ):
             return _prefill(vendor, arguments)
         return vendor(**arguments)

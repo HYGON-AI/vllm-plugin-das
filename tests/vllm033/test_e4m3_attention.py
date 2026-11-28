@@ -9,6 +9,77 @@ import torch
 from test_flash_attention import load_flash_attention, make_impl
 
 
+@pytest.mark.parametrize("layout", ("bhsd", "bshd"))
+@pytest.mark.parametrize("dim", (64, 256))
+@pytest.mark.parametrize("kvheads", (1, 4))
+def test_decode_keeps_native_pa_except_unqualified_d256_kv4(monkeypatch, layout, dim, kvheads):
+    from hcu_vllm_das.attention import e4m3_attention, e5m2_scales
+
+    monkeypatch.setattr(e5m2_scales, "run_e5m2_attention", lambda execute, kw: execute(**kw))
+    monkeypatch.setattr(e4m3_attention, "_prefill", lambda vendor, kw: "bounded-varlen")
+    shape = (2, kvheads, 64, dim) if layout == "bhsd" else (2, 64, kvheads, dim)
+    kw = dict(k=torch.empty(shape, dtype=torch.uint8), layout=layout,
+              block_table=object(), max_seqlen_q=1)
+    result = e4m3_attention.run_e4m3_attention(lambda **kw: "native-pa", kw)
+    assert result == ("bounded-varlen" if dim == 256 and kvheads == 4 else "native-pa")
+
+
+@pytest.mark.parametrize("layout", ("bhsd", "bshd"))
+@pytest.mark.parametrize("chunked", (False, True))
+@pytest.mark.parametrize("entry", ("helper", "flash"))
+@pytest.mark.parametrize("out_argument", ({}, {"out": None}))
+def test_d256_kv4_decode_allocates_omitted_output(
+    monkeypatch, layout, chunked, entry, out_argument
+):
+    from hcu_vllm_das.attention import e4m3_attention as attention
+    # Import the real scale adapter before installing Core's portable seams.
+    from hcu_vllm_das.attention import e5m2_scales  # noqa: F401
+
+    native = ModuleType("vllm._custom_ops")
+    def gather(source, target, table, cumulative, batch):
+        for b in range(batch):
+            start, end = cumulative[b:b + 2].tolist()
+            target[start:end].copy_(source[table[b, 0], :end - start])
+    native.cp_gather_cache = gather
+    key = torch.full((3, 64, 4, 256), 1., dtype=torch.float8_e4m3fn)
+    value = torch.full_like(key, 2.)
+    if layout == "bhsd":
+        key, value = key.transpose(1, 2), value.transpose(1, 2)
+    query = torch.ones(3, 16, 256, dtype=torch.bfloat16)[:, ::2]
+    calls = []
+    def vendor(**kw):
+        assert "block_table" not in kw and "layout" not in kw
+        assert kw["out"].is_contiguous()
+        assert kw["out"].shape == kw["q"].shape
+        assert kw["out"].dtype == query.dtype
+        assert kw["out"].device == query.device
+        assert kw["k"].dtype == kw["v"].dtype == query.dtype
+        calls.append(kw["cu_seqlens_q"].tolist())
+        kw["out"].copy_(kw["q"] + 2)
+        return kw["out"]
+    monkeypatch.setattr(attention, "_PREFILL_SCRATCH_TARGET_BYTES",
+                        (1 if chunked else 3) * 256 * 4 * 256 * 6)
+    arguments = dict(q=query, k=key, v=value, cu_seqlens_q=torch.arange(4, dtype=torch.int32),
+        seqused_k=torch.tensor([1, 2, 3], dtype=torch.int32),
+        max_seqlen_q=1, max_seqlen_k=3,
+        block_table=torch.arange(3, dtype=torch.int32)[:, None], **out_argument)
+    if entry == "flash":
+        flash = load_flash_attention(monkeypatch,
+            kv_cache_layout="LBHNC" if layout == "bhsd" else "LBNHC")
+        impl = make_impl(flash, kv_cache_dtype="fp8_e4m3")
+        monkeypatch.setattr(flash, "_vendor_varlen_func", lambda: vendor)
+        run = impl._run_flash_attention
+    else:
+        run = lambda **kw: attention.run_e4m3_attention(vendor, dict(kw, layout=layout))
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    result = run(**arguments)
+    assert len(calls) == (3 if chunked else 1)
+    assert result.is_contiguous()
+    torch.testing.assert_close(result, query + 2, atol=0, rtol=0)
+    assert arguments.get("out") is None
+    assert ("out" in arguments) == ("out" in out_argument)
+
+
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 def test_e4m3_reader_preserves_bytes_query_and_layout(monkeypatch, layout):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)

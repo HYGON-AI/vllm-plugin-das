@@ -127,3 +127,69 @@ acceptance. No production performance claim is made for the extra prefill
 byte gather/conversion. The original paired requests, raw responses, scores,
 runtime source hashes, profiles and shutdown observations are retained in
 `flash-e4m3-v033-20261118-r1` evidence.
+
+
+## Strict PA provider follow-up (2026-11-28)
+
+The user-specified `2.8.4+dtk2610.torch2130.2611272153.gece162` provider
+reproduced `PA tensors must be contiguous` during default-Graph warmup of
+Qwen3.6-27B BF16 weights, TP4, E4M3 KV, 64-token kernel pages and prefix on.
+The Plugin preserves Core allocation and native writer views. At the PA call,
+dense read-only views include intervening half-pages and device block indices
+are multiplied by the integral page-stride ratio. Each real page keeps its
+original address. Query, output and metadata are normalized only as needed;
+caller output aliases and input tables are preserved. A subpage padding gap
+uses the existing bounded gather/ordinary-varlen composition. Its page table
+also needs contiguous columns for the native Core gather.
+
+A separate D256/KV4 E4M3 non-unit-scale test exceeded the existing 0.03
+absolute/relative FP32-reference tolerance in both layouts (one of 12288
+values, absolute error 0.033935546875). Native writer bytes matched the
+independent cast, and contiguous native PA was bitwise identical to remapped
+PA. Keep this original failure: zero-copy page remapping does not repair that
+native numerical limitation. D256/KV4 E4M3 therefore uses the bounded
+unquantized varlen composition; D256/KV1, including the requested TP4 model,
+retains native PA. This geometry guard can be removed after native PA passes
+the same non-unit-scale, changed-input Graph and model gates. Gather/conversion
+scratch and extra calls are a performance tradeoff, not native FP8 compute.
+
+An artificial FP8 cache offset of 13 bytes faulted native PA after a successful
+native-writer synchronization. The regression fixture uses a nonzero 64-element
+aligned offset, matching the allocator's alignment requirement; those earlier
+failed runs are retained separately from the original model failure. No
+FlashAttention source or binary is modified by this follow-up.
+
+
+The corrected installed artifact passes 107 portable cases, 88 native
+writer/reader/Graph cases (48 new and 40 existing), and 25 CI selection/environment
+cases with 298 subtests on gfx938, Core c440c08 and Adapter/kernel 51bd28. Native
+cases retain the existing 0.03 tolerance; no skips or xfails qualify as passes.
+The PA regression is selected by both v0.33 device tiers.
+
+The final Qwen3.6-27B BF16-weight TP4 replay retains FLASH_ATTN, E4M3 KV,
+MRV2, default FULL_AND_PIECEWISE Graph, prefix, context 4096 and 1 GiB KV per rank.
+Startup and output 13/13 / prefix 3/3 pass, with 3200 prefix hits. HumanEval 0–31 is
+raw 2/32 and format-normalized 32/32, with 4961 generated tokens and no length
+truncation. Raw and normalized pass sets match the saved old-provider BF16
+control (4974 tokens); raw 2/32 is not relabeled as32/32. The service exceeds
+the original 15-second exit gate and needs owned-only SIGTERM; EngineDeadError
+and native binding leak diagnostics remain. These are retained lifecycle gaps,
+not clean-exit, performance or whole-upgrade acceptance. Test-owned processes
+are gone. The final checkpoint/provider seals and installed RECORDs are recorded
+separately from those original failures.
+
+### Optional-output review correction
+
+The D256/KV4 decode fallback initially required `out` even though the previous
+native helper path allowed the vendor to allocate it. Allocate a contiguous
+query-shaped output at the shared gather entry when it is omitted or `None`,
+before selecting chunked or unchunked work. Explicit output aliases are retained.
+Sixteen portable regressions cover both layouts, both grouping paths and both
+`run_e4m3_attention` / `_run_flash_attention` entry points. All sixteen fail on
+reviewed head `2999642` and pass after the fix; the affected portable suite passes
+123 cases. These CPU tests substitute gather/vendor leaves and do not qualify
+native numerics, Graph replay or models for the new head. Prior installed-tree
+results above retain their original provenance. Full remote CI remains required;
+run `46130974985` failed collection with missing Adapter interfaces, with no
+native PA acceptance. The runtime image, not a skipped test or import fallback,
+must supply those dependencies before a meaningful full device rerun.
