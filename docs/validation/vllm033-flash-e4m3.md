@@ -177,3 +177,19 @@ and native binding leak diagnostics remain. These are retained lifecycle gaps,
 not clean-exit, performance or whole-upgrade acceptance. Test-owned processes
 are gone. The final checkpoint/provider seals and installed RECORDs are recorded
 separately from those original failures.
+
+### Optional-output review correction
+
+The D256/KV4 decode fallback initially required `out` even though the previous
+native helper path allowed the vendor to allocate it. Allocate a contiguous
+query-shaped output at the shared gather entry when it is omitted or `None`,
+before selecting chunked or unchunked work. Explicit output aliases are retained.
+Sixteen portable regressions cover both layouts, both grouping paths and both
+`run_e4m3_attention` / `_run_flash_attention` entry points. All sixteen fail on
+reviewed head `2999642` and pass after the fix; the affected portable suite passes
+123 cases. These CPU tests substitute gather/vendor leaves and do not qualify
+native numerics, Graph replay or models for the new head. Prior installed-tree
+results above retain their original provenance. Full remote CI remains required;
+run `46130974985` failed collection with missing Adapter interfaces, with no
+native PA acceptance. The runtime image, not a skipped test or import fallback,
+must supply those dependencies before a meaningful full device rerun.

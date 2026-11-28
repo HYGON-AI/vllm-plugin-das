@@ -93,3 +93,10 @@ equality establishes layout equivalence; it does not qualify native precision.
 Keep the original failure and tolerance. A bounded gather/unquantized varlen
 composition can retain quantized storage for the affected geometry, with its
 scratch/copy costs stated and Graph/model gates rerun separately.
+
+Preserve the optional-output contract when a new geometry changes decode to
+gather/varlen: allocate a contiguous query-shaped output at the shared fallback
+entry if `out` is omitted or `None`, before choosing chunked or unchunked work.
+Test both public helper entry points and layouts without `out`, as well as
+explicit strided-output aliasing. Core serving's required output buffer does
+not cover the helpers' optional-output API.

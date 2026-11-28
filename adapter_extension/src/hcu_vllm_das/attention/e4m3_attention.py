@@ -77,6 +77,9 @@ def _prefill(vendor: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
     or special empty-KV vendor contract is needed.
     """
     query, key = kwargs["q"], kwargs["k"]
+    if kwargs.get("out") is None:
+        kwargs = dict(kwargs, out=torch.empty_like(
+            query, memory_format=torch.contiguous_format))
     cuq = kwargs["cu_seqlens_q"]
     batch = cuq.shape[0] - 1
     kv_heads = key.shape[1] if kwargs["layout"] == "bhsd" else key.shape[2]
