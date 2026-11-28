@@ -45,14 +45,12 @@ def validate_vl_runtime(vllm_config):
     """Admit only the owned eager TP path before constructing either tower."""
     from vllm.model_executor.models import ModelRegistry
 
-    from ..hy_v4_flash.dfly_topology import validate_standard_hy4_parallel
     from .model import require_eager
+    from .pd_runtime import runtime_role
 
     require_eager(vllm_config)
     parallel = vllm_config.parallel_config
-    validate_standard_hy4_parallel(
-        parallel, enforce_eager=vllm_config.model_config.enforce_eager
-    )
+    role = runtime_role(vllm_config)
     if (
         parallel.enable_eplb
         or parallel.enable_elastic_ep
@@ -62,11 +60,8 @@ def validate_vl_runtime(vllm_config):
         raise ValueError(
             "Standard HY4 VL does not admit EPLB, elastic EP or microbatching"
         )
-    if (
-        vllm_config.kv_transfer_config is not None
-        or vllm_config.lora_config is not None
-    ):
-        raise ValueError("Standard HY4 VL does not admit KV transfer or LoRA")
+    if vllm_config.lora_config is not None:
+        raise ValueError("Standard HY4 VL does not admit LoRA")
     if getattr(vllm_config.attention_config, "hisparse_config", None) is not None:
         raise ValueError("Standard HY4 VL does not admit HiSparse")
     entry = ModelRegistry.models.get("HYV4ForCausalLM")
@@ -75,6 +70,7 @@ def validate_vl_runtime(vllm_config):
         "HcuHY4CTForCausalLM",
     ):
         raise ValueError("Standard HY4 VL requires the owned HY4 CT model factory")
+    return role
 
 
 class HYV4VLImagePixelInputs(TensorSchema):
@@ -139,8 +135,9 @@ class HYV4VLForConditionalGeneration(
         raise ValueError(f"Unsupported HYV4 VL modality: {modality}")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        validate_vl_runtime(vllm_config)
+        role = validate_vl_runtime(vllm_config)
         super().__init__()
+        self._hy4_role = role
         self.model_config = vllm_config.model_config
         self.config = vllm_config.model_config.hf_config
         self.multimodal_config = vllm_config.model_config.get_multimodal_config()
@@ -267,6 +264,13 @@ class HYV4VLForConditionalGeneration(
 
     def compute_logits(self, hidden_states):
         return self.language_model.compute_logits(hidden_states)
+
+    def get_model_state_cls(self):
+        if self._hy4_role == "producer":
+            from .pcp_model_state import HYV4PCPProducerModelState
+            return HYV4PCPProducerModelState
+        from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+        return DefaultModelState
 
     def get_expert_mapping(self):
         return self.language_model.get_expert_mapping()

@@ -6,14 +6,25 @@ Core PCP gathers complete MLA/indexer cache replicas. Only PCP rank zero may
 publish a sender for the TP coordinate. All workers still report completion,
 so Core's world-size aggregator retains KV until the real sender acknowledges.
 """
-from vllm.distributed.parallel_state import get_pcp_group
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector as native
-
-from hcu_adapter.infra.native_namespace import bind_native
 from hcu_adapter.infra.kill_switch import op_disabled
+from hcu_adapter.infra.native_namespace import bind_native
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+    mooncake_connector as native,
+)
+from vllm.distributed.parallel_state import get_pcp_group
+
+from .models.hy4_standard.pd_policy import (
+    classify_standard_hy4_role,
+    committed_remote_prompt_tokens,
+    is_standard_vl_target,
+    requires_last_prompt_replay,
+)
 
 
 def _validate(config):
+    if is_standard_vl_target(config.model_config.hf_config):
+        classify_standard_hy4_role(config)
+        return
     if getattr(config.model_config.hf_config, 'model_type', None) != 'hy_v4':
         raise ValueError('HY4 PCP Mooncake requires the HY4 text model')
     parallel = config.parallel_config
@@ -24,6 +35,29 @@ def _validate(config):
             raise ValueError('HY4 PCP Mooncake producer requires TP1/PP1/DP1/DCP1')
         if config.kv_transfer_config.kv_role != 'kv_producer':
             raise ValueError('HY4 PCP Mooncake supports a PCP producer and non-PCP consumer')
+
+
+class HY4PCPMooncakeScheduler(native.MooncakeConnectorScheduler):
+    """Keep native leases/ACKs, replay the last real prompt token for DFly.
+
+    The proxy discards P's sampled token and D receives the original prompt.
+    KV alone does not reconstruct the target hidden state used to start DFly:
+    commit only N-1 prompt tokens and let D execute token N itself. P still
+    computes the complete original prompt; no Mamba-style request truncation
+    or synthetic hidden state is involved.
+    """
+
+    def __init__(self, vllm_config, engine_id, kv_cache_config):
+        _validate(vllm_config)
+        self._standard_dfly_replay = requires_last_prompt_replay(vllm_config)
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        if self._standard_dfly_replay and (self._has_mamba or self._bounded_replay):
+            raise ValueError('Standard VL DFly PD requires full attention KV without bounded replay')
+
+    def _get_remote_prefill_token_count(self, num_prompt_tokens):
+        if self._standard_dfly_replay:
+            return committed_remote_prompt_tokens(num_prompt_tokens)
+        return super()._get_remote_prefill_token_count(num_prompt_tokens)
 
 
 def _should_launch_bootstrap_server(config):
@@ -146,7 +180,8 @@ class MooncakeConnector(native.MooncakeConnector):
     # Reuse the complete native constructor and transport, substituting this
     # worker class in a private namespace.
     __init__ = bind_native(native.MooncakeConnector.__init__,
-                          {'MooncakeConnectorWorker': HY4PCPMooncakeWorker})
+                          {'MooncakeConnectorWorker': HY4PCPMooncakeWorker,
+                           'MooncakeConnectorScheduler': HY4PCPMooncakeScheduler})
 
     def bind_connector_metadata(self, connector_metadata):
         self._early_send_metadata = None

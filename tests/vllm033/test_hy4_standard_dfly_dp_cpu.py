@@ -125,6 +125,7 @@ def test_real_proposer_empty_rank_requires_sync_then_returns_without_query(rank)
         scope,
     )
     owner = NS(
+        _hy4_pd_role=None,
         max_num_reqs=8,
         num_query_per_req=6,
         max_num_tokens=48,

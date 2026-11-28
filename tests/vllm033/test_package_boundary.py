@@ -36,6 +36,7 @@ EXPECTED_ENTRY_POINTS = {
         "das_hcu_hy4_ct_w4a8": "hcu_vllm_das.hy4_quant_activation:extension_spec",
         "das_hcu_hy4_dfly": "hcu_vllm_das.hy4_dfly_activation:extension_spec",
         "das_hcu_hy4_vl": "hcu_vllm_das.hy4_vl_activation:extension_spec",
+        "das_hcu_hy4_pcp_dfly": "hcu_vllm_das.hy4_pcp_dfly_activation:extension_spec",
         "das_hcu_hy4_static": "hcu_vllm_das.hy4_static_activation:extension_spec",
         "das_hcu_wo_a_token_major": "hcu_vllm_das.wo_a_token_major:extension_spec",
     }

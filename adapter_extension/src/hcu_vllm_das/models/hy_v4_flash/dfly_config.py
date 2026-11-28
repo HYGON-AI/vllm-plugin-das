@@ -175,8 +175,12 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         if family == "hy_v4":
             if not target.enforce_eager:
                 raise ValueError("Standard HY4 DFly on stock Core requires explicit eager execution")
+            from ..hy4_standard.pd_policy import is_standard_vl_target
             from .dfly_topology import validate_standard_dfly_parallel
-            validate_standard_dfly_parallel(parallel, enforce_eager=target.enforce_eager)
+            producer = (is_standard_vl_target(target.hf_config)
+                        and parallel.prefill_context_parallel_size == 16)
+            validate_standard_dfly_parallel(parallel, enforce_eager=target.enforce_eager,
+                allow_pcp_producer=producer)
         else:
             for name in ("data_parallel_size", "pipeline_parallel_size",
                          "prefill_context_parallel_size", "decode_context_parallel_size"):
@@ -273,6 +277,9 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         if family == "hy_v4" and parallel.data_parallel_size > 1:
             from .dfly_topology import make_rank_local_draft_parallel
             self.draft_parallel_config = make_rank_local_draft_parallel(parallel)
+        elif family == "hy_v4" and parallel.prefill_context_parallel_size == 16:
+            from ..hy4_standard.pcp_draft import make_producer_draft_parallel
+            self.draft_parallel_config = make_producer_draft_parallel(parallel)
 
     def use_eagle(self) -> bool:
         # In v0.33 this public predicate means "consumes target hidden states".
