@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -105,6 +106,20 @@ def choose_deepep_auto_low_latency(
     if fixed_use_low_latency is not None:
         return fixed_use_low_latency
 
+    # DeepEP LL allocates its dispatch buffer from max_num_seqs (plus
+    # speculative tokens), while a prefill can contain max_num_batched_tokens.
+    # Never send a forward larger than that buffer through LL, even if the
+    # phase metadata is incomplete or the runner reports a graph mode.
+    ll_capacity = _deepep_auto_ll_capacity(vllm_config)
+    requested_tokens = getattr(batch_descriptor, "num_tokens", None)
+    if requested_tokens is None:
+        requested_tokens = num_tokens
+    exceeds_ll_capacity = bool(
+        ll_capacity is not None
+        and requested_tokens is not None
+        and int(requested_tokens) > ll_capacity
+    )
+
     if cudagraph_runtime_mode is not None:
         from vllm.config.compilation import CUDAGraphMode
 
@@ -115,8 +130,31 @@ def choose_deepep_auto_low_latency(
         ):
             cudagraph_runtime_mode = capture_mode
         if cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            return True
+            return not exceeds_ll_capacity
         if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            if os.environ.get("VLLM_HCU_DEEPEP_AUTO_GRAPH_USE_LL", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                # HT's asynchronous DeepEP dispatch cannot be captured on HCU;
+                # keep the mixed graph mode enabled while using the graph-safe
+                # DeepGEMM LL delegate for its piecewise regions.
+                compilation_config = getattr(vllm_config, "compilation_config", None)
+                graph_limit = int(
+                    getattr(compilation_config, "max_cudagraph_capture_size", 0)
+                    or 0
+                )
+                # The runner also uses PIECEWISE while profiling a large
+                # prefill. Keep those forwards on HT: the LL buffer is sized
+                # for graph buckets and DeepEP rejects larger dispatches.
+                return bool(
+                    graph_limit > 0
+                    and not exceeds_ll_capacity
+                    and requested_tokens is not None
+                    and int(requested_tokens) <= graph_limit
+                )
             return False
         if cudagraph_runtime_mode != CUDAGraphMode.NONE:
             raise ValueError(
@@ -130,6 +168,8 @@ def choose_deepep_auto_low_latency(
     if is_prefilling is None:
         is_prefilling = get_deepep_auto_request_phase()
     explicit_decode = _is_explicitly_non_prefilling(is_prefilling)
+    if exceeds_ll_capacity:
+        explicit_decode = False
     local_decode = explicit_decode and (
         bool(
             batch_descriptor is not None
@@ -228,6 +268,20 @@ def _attention_metadata_is_pure_spec_decode(
         ):
             return False
     return found_attention_metadata
+
+
+def _deepep_auto_ll_capacity(vllm_config: object) -> int | None:
+    """Return the LL dispatch capacity reserved by the auto manager."""
+
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
+    if max_num_seqs <= 0:
+        return None
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_speculative_tokens = int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    )
+    return max_num_seqs * (1 + num_speculative_tokens)
 
 
 def _is_explicitly_non_prefilling(value: object | None) -> bool:

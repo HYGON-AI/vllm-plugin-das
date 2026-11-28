@@ -1587,14 +1587,24 @@ def test_dspark_deepep_auto_uses_ht_for_prefill_and_ll_for_uniform_decode():
             is_prefilling=torch.tensor([False]),
         )
     }
+    # LL capacity is max_num_seqs * (1 + num_speculative_tokens) = 64.
     assert choose_deepep_auto_low_latency(
         config,
-        256,
+        64,
         None,
         SimpleNamespace(uniform=False),
         decode_metadata,
         torch.tensor([False]),
     )
+    for oversized in (65, 256):
+        assert not choose_deepep_auto_low_latency(
+            config,
+            oversized,
+            None,
+            SimpleNamespace(uniform=False),
+            decode_metadata,
+            torch.tensor([False]),
+        )
     prefill_metadata = SimpleNamespace(
         max_query_len=8,
         max_seq_len=8,

@@ -131,6 +131,14 @@ class HcuUnquantizedFusedMoEMethod(_Original):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (
             getattr(getattr(self, "unquantized_backend", None), "name", None)
+            == "HCU_DEEPEP_BF16"
+        ):
+            super().process_weights_after_loading(layer)
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+            return
+
+        if (
+            getattr(getattr(self, "unquantized_backend", None), "name", None)
             == "HCU_LIGHTOP_W16A16"
         ):
             # Do not run vLLM's ROCm padding first: that creates a strided
