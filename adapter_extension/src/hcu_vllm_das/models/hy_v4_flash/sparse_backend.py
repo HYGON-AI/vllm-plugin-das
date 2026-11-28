@@ -106,6 +106,7 @@ class CompactPrefillMetadataBuilder(FlashMLASparseMetadataBuilder):
         offsets = compact_prefill_offsets(
             seq_lens[first:last].tolist(),
             metadata.num_actual_tokens - metadata.num_decode_tokens,
+            max_batched_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
         )
         if offsets is None:
             return metadata
@@ -161,10 +162,11 @@ class FlashSparseImpl(CoreSinkImpl):
                     getattr(properties, "multi_processor_count", None))
             if qualified_worker:
                 self._hcu_small_head_counts = (
-                    (4, 8) if arch == "gfx936" else (8, 16))
+                    (4, 8) if arch == "gfx936" and parallel.tensor_parallel_size == 8
+                    else (8, 16))
                 self._hcu_window_device = torch.device("cuda", device)
                 if (arch == "gfx936" and self.kv_cache_dtype == "fp8_ds_mla"
-                        and self.num_heads in (4, 8)):
+                        and self.num_heads in self._hcu_small_head_counts):
                     self._hcu_query_concat_device = self._hcu_window_device
                 if fp8_fusions_enabled():
                     self._hcu_small_head_device = self._hcu_window_device
@@ -340,7 +342,7 @@ class FlashSparseImpl(CoreSinkImpl):
         if not (
             nope.ndim == 3 and rope.ndim == 3
             and nope.shape[:2] == rope.shape[:2]
-            and nope.shape[1] == self.num_heads and self.num_heads in (4, 8)
+            and nope.shape[1] == self.num_heads and self.num_heads in self._hcu_small_head_counts
             and nope.shape[2] == 512 and rope.shape[2] == 64
             and nope.dtype == rope.dtype == torch.bfloat16
             and nope.device == rope.device == device

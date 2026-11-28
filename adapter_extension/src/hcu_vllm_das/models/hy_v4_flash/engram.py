@@ -374,6 +374,13 @@ class FlashEmbedding(nn.Module):
             )
         self._uva_weight = None
         self._uva_scale = None
+        if self.cpu_offload:
+            weight = self.embedding.weight
+            scale = self.embedding.weight_scale_inv
+            if weight.numel():
+                self._uva_weight = get_accelerator_view_from_cpu_tensor(weight)
+            if scale is not None and scale.numel():
+                self._uva_scale = get_accelerator_view_from_cpu_tensor(scale)
 
     def _lookup(self, parameter, indices, out, *, scale=False):
         view_name = "_uva_scale" if scale else "_uva_weight"
@@ -414,7 +421,10 @@ class FlashEngram(nn.Module):
         config = vllm_config.model_config.hf_text_config
         index = layout.layer_ids.index(layer_id)
         sizes = [p for order in layout.primes[index] for p in order]
-        cpu_offload = get_engram_cpu_offload(getattr(vllm_config, "engram_config", None))
+        cpu_offload = get_engram_cpu_offload(
+            getattr(vllm_config, "engram_config", None),
+            additional_config=getattr(vllm_config, "additional_config", None),
+        )
         dtype = None
         if vllm_config.load_config.load_format == "dummy":
             dtype = (
