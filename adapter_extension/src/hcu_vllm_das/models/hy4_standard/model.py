@@ -6,7 +6,6 @@ from vllm.models.hy_v4.amd import model as native
 
 from ...hy4_constructor import bind_constructor
 from ...hy4_indexer_loader import load_indexer_wk
-from ..hy_v4_flash.dfly_topology import validate_standard_hy4_parallel
 from .attention import (
     HYV4StandardAttention,
     bind_stock_constructor,
@@ -70,15 +69,10 @@ class HYV4StandardModel(native.HYV4Model):
     def __init__(self, *, vllm_config, prefix=""):
         check_stock_model_anchors()
         require_eager(vllm_config)
-        validate_standard_hy4_parallel(
-            vllm_config.parallel_config,
-            enforce_eager=vllm_config.model_config.enforce_eager,
-        )
-        if (
-            vllm_config.kv_transfer_config is not None
-            or vllm_config.lora_config is not None
-        ):
-            raise ValueError("Standard HY4 VL/DFly does not admit KV transfer or LoRA")
+        from .pd_runtime import runtime_role
+        runtime_role(vllm_config)
+        if vllm_config.lora_config is not None:
+            raise ValueError("Standard HY4 VL/DFly does not admit LoRA")
         if vllm_config.attention_config.hisparse_config is not None:
             raise ValueError("Standard HY4 VL/DFly does not admit HiSparse")
         _BOUND_MODEL_INIT(self, vllm_config=vllm_config, prefix=prefix)

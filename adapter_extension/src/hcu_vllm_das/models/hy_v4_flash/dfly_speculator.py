@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 import torch
 from torch import nn
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
@@ -166,8 +166,10 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
                 "DFly draft and target must use the same MLA KV cache dtype; "
                 "omit speculative_config.kv_cache_dtype to inherit the target"
             )
+        self._hy4_pd_role = None
         if vllm_config.kv_transfer_config is not None and not hisparse:
-            raise ValueError("DFly does not support PD disaggregation")
+            from ..hy4_standard.pd_policy import classify_standard_hy4_role
+            self._hy4_pd_role = classify_standard_hy4_role(vllm_config)
         if (
             vllm_config.lora_config is not None
             or vllm_config.parallel_config.use_ubatching
@@ -181,10 +183,13 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         self._requested_cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
         draft_vllm_config = copy(vllm_config)
         draft_vllm_config.scheduler_config = copy(vllm_config.scheduler_config)
-        draft_vllm_config.scheduler_config.max_num_batched_tokens = max(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.scheduler_config.max_num_seqs
-            * (spec.num_speculative_tokens + 1),
+        query_capacity = (
+            vllm_config.scheduler_config.max_num_seqs * (spec.num_speculative_tokens + 1)
+        )
+        draft_vllm_config.scheduler_config.max_num_batched_tokens = (
+            query_capacity if self._hy4_pd_role == "producer" else max(
+                vllm_config.scheduler_config.max_num_batched_tokens, query_capacity,
+            )
         )
         super().__init__(draft_vllm_config, device)
         self._hisparse_config_owner = vllm_config if hisparse else None
@@ -193,6 +198,13 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         config.parallel_config = copy(vllm_config.parallel_config)
         config.parallel_config.enable_expert_parallel = False
         config.parallel_config.is_moe_model = False
+        if self._hy4_pd_role == "producer":
+            from ..hy4_standard.pcp_draft import make_producer_draft_parallel
+            config.parallel_config = make_producer_draft_parallel(vllm_config.parallel_config)
+        if self._hy4_pd_role is not None:
+            # The connector belongs to the actual target runner. Dense draft
+            # construction and metadata must never acquire a second PD owner.
+            config.kv_transfer_config = None
         config.attention_config = copy(config.attention_config)
         config.attention_config.sparse_mla_force_mqa = True
         config.attention_config.use_non_causal = False
@@ -254,7 +266,11 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
             scope = hisparse_residency_scope(
                 self._hisparse_config_owner, construction_config=config, draft=True,
             )
-        with scope:
+        context = (
+            set_current_vllm_config(config)
+            if self._hy4_pd_role is not None else nullcontext()
+        )
+        with scope, context:
             draft = get_model(
                 vllm_config=config,
                 model_config=self.draft_model_config,
@@ -282,7 +298,10 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         ):
             raise ValueError("DFly requires BF16 shared embedding and LM head weights")
         draft.logits_processor.head_dtype = self.vllm_config.model_config.head_dtype
-        self.reuse = HYV4DFlyTargetReuse(target_model, draft, self.vllm_config)
+        self.reuse = HYV4DFlyTargetReuse(
+            target_model, draft, self.vllm_config,
+            capture_target_indices=self._hy4_pd_role != "producer",
+        )
         self.query_model = HYV4DFlyQueryModel(
             draft, self.draft_tokens, self._sample_step
         )
@@ -318,13 +337,18 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
-        super().set_attn(
-            model_state,
-            kv_cache_config,
-            block_tables,
-            target_input_buffers,
-            target_attn_groups,
+        context = (
+            set_current_vllm_config(self._draft_vllm_config)
+            if self._hy4_pd_role is not None else nullcontext()
         )
+        with context:
+            super().set_attn(
+                model_state,
+                kv_cache_config,
+                block_tables,
+                target_input_buffers,
+                target_attn_groups,
+            )
         assert self.reuse is not None
         self.reuse.validate_groups(kv_cache_config)
         self._storage_validated = False
@@ -689,6 +713,15 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         # Core's dummy target step is capped by the target token budget.
         # Profile the independent worst-case draft shape, including temporary
         # activations/workspaces, rather than only those target dummy requests.
+        if self._hy4_pd_role == "producer":
+            from ..hy4_standard.pcp_draft import require_producer_zero_drafts
+            require_producer_zero_drafts(dummy_run=dummy_run, is_profile=is_profile,
+                num_speculative_tokens=num_speculative_tokens)
+            # The owned scheduler admits only K=0 producer requests. Dummy
+            # profiling must represent that same path, not allocate/execute
+            # a multi-step draft which no live producer request can reach.
+            if dummy_run:
+                num_speculative_tokens = 0
         batch = self.max_num_reqs if dummy_run and is_profile else input_batch.num_reqs
         from .dfly_topology import validate_rank_local_dfly_step
         validate_rank_local_dfly_step(

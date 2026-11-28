@@ -196,21 +196,36 @@ def validate_dfly_runtime(vllm_config) -> None:
     p = vllm_config.parallel_config
     target = vllm_config.speculative_config.target_model_config
     if target.hf_text_config.model_type == "hy_v4":
+        from ..hy4_standard.pd_policy import is_standard_vl_target
         from .dfly_topology import validate_standard_dfly_runtime_parallel
+        producer = (is_standard_vl_target(target.hf_config)
+                    and vllm_config.speculative_config.target_parallel_config.prefill_context_parallel_size == 16)
+        if producer:
+            from ...hy4_pcp_dfly_activation import require_active
+            require_active()
+            if vllm_config.model_config.hf_config.model_type == "hy_v4_dfly":
+                if vllm_config.kv_transfer_config is not None:
+                    raise ValueError("Private producer DFly must not own the KV connector")
+            else:
+                from ..hy4_standard.pd_runtime import runtime_role
+                if runtime_role(vllm_config) != "producer":
+                    raise ValueError("PCP DFly target requires the actual producer role")
         # Draft configs deliberately disable EP; validate the immutable target
         # owner rather than treating the dense draft as an expert participant.
         validate_standard_dfly_runtime_parallel(
             p, vllm_config.speculative_config.target_parallel_config,
-            enforce_eager=target.enforce_eager)
+            enforce_eager=target.enforce_eager, allow_pcp_producer=producer)
     elif any(getattr(p, field, 1) != 1 for field in (
         "data_parallel_size", "pipeline_parallel_size",
         "prefill_context_parallel_size", "decode_context_parallel_size")):
         raise ValueError("DFly requires DP/PP/PCP/DCP=1")
     if not vllm_config.use_v2_model_runner:
         raise ValueError("DFly requires V2 model runner")
-    if (getattr(vllm_config, "lora_config", None) is not None
-            or (getattr(vllm_config, "kv_transfer_config", None) is not None and not hisparse)):
-        raise ValueError("DFly does not admit LoRA or KV transfer")
+    if getattr(vllm_config, "lora_config", None) is not None:
+        raise ValueError("DFly does not admit LoRA")
+    if getattr(vllm_config, "kv_transfer_config", None) is not None and not hisparse:
+        from ..hy4_standard.pd_runtime import runtime_role
+        runtime_role(vllm_config)
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_ds_mla"):
         raise ValueError("DFly requires BF16 or fp8_ds_mla KV cache")
     return None

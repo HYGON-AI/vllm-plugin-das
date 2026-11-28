@@ -6,14 +6,35 @@ Core PCP gathers complete MLA/indexer cache replicas. Only PCP rank zero may
 publish a sender for the TP coordinate. All workers still report completion,
 so Core's world-size aggregator retains KV until the real sender acknowledges.
 """
-from vllm.distributed.parallel_state import get_pcp_group
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector as native
+import asyncio
 
-from hcu_adapter.infra.native_namespace import bind_native
 from hcu_adapter.infra.kill_switch import op_disabled
+from hcu_adapter.infra.native_namespace import bind_native
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+    mooncake_connector as native,
+)
+from vllm.distributed.parallel_state import get_pcp_group
+
+from .models.hy4_standard.pd_policy import (
+    classify_standard_hy4_role,
+    committed_remote_prompt_tokens,
+    is_standard_vl_target,
+    requires_last_prompt_replay,
+)
+
+
+class _ReadySendAsyncio:
+    def __init__(self, wait):
+        self.wait = wait
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
 
 
 def _validate(config):
+    if is_standard_vl_target(config.model_config.hf_config):
+        classify_standard_hy4_role(config)
+        return
     if getattr(config.model_config.hf_config, 'model_type', None) != 'hy_v4':
         raise ValueError('HY4 PCP Mooncake requires the HY4 text model')
     parallel = config.parallel_config
@@ -24,6 +45,29 @@ def _validate(config):
             raise ValueError('HY4 PCP Mooncake producer requires TP1/PP1/DP1/DCP1')
         if config.kv_transfer_config.kv_role != 'kv_producer':
             raise ValueError('HY4 PCP Mooncake supports a PCP producer and non-PCP consumer')
+
+
+class HY4PCPMooncakeScheduler(native.MooncakeConnectorScheduler):
+    """Keep native leases/ACKs, replay the last real prompt token for DFly.
+
+    The proxy discards P's sampled token and D receives the original prompt.
+    KV alone does not reconstruct the target hidden state used to start DFly:
+    commit only N-1 prompt tokens and let D execute token N itself. P still
+    computes the complete original prompt; no Mamba-style request truncation
+    or synthetic hidden state is involved.
+    """
+
+    def __init__(self, vllm_config, engine_id, kv_cache_config):
+        _validate(vllm_config)
+        self._standard_dfly_replay = requires_last_prompt_replay(vllm_config)
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        if self._standard_dfly_replay and (self._has_mamba or self._bounded_replay):
+            raise ValueError('Standard VL DFly PD requires full attention KV without bounded replay')
+
+    def _get_remote_prefill_token_count(self, num_prompt_tokens):
+        if self._standard_dfly_replay:
+            return committed_remote_prompt_tokens(num_prompt_tokens)
+        return super()._get_remote_prefill_token_count(num_prompt_tokens)
 
 
 def _should_launch_bootstrap_server(config):
@@ -69,6 +113,12 @@ class HY4PCPMooncakeWorker(native.MooncakeConnectorWorker):
     def __init__(self, vllm_config, engine_id, kv_cache_config):
         self._native_entered = False
         _validate(vllm_config)
+        self._ready_sends_enabled = (
+            is_standard_vl_target(vllm_config.model_config.hf_config)
+            and classify_standard_hy4_role(vllm_config) == 'producer'
+        )
+        self._native_send_tasks = set()
+        self._ready_send_slots = None
         parallel = vllm_config.parallel_config
         self._canonical_pcp_sender = True
         self._replica_pending = {}
@@ -122,7 +172,67 @@ class HY4PCPMooncakeWorker(native.MooncakeConnectorWorker):
         if not self._canonical_pcp_sender:
             ready_event.set()
             return
-        return await super()._mooncake_sender_listener(ready_event)
+        if not getattr(self, '_ready_sends_enabled', False):
+            return await super()._mooncake_sender_listener(ready_event)
+        self._ready_send_slots = asyncio.Semaphore(self.num_sender_tasks)
+        try:
+            return await super()._mooncake_sender_listener(ready_event)
+        finally:
+            # Core has stopped its queue dispatchers before returning here.
+            tasks = tuple(self._native_send_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_kv_to_decode(self, identity, sock, meta):
+        if not getattr(self, '_ready_sends_enabled', False):
+            return await super().send_kv_to_decode(identity, sock, meta)
+        if self._ready_send_slots is None:
+            raise RuntimeError('HY4 producer ready-send listener is not initialized')
+        # A pending prompt must not occupy a finite sender dispatcher: it can
+        # otherwise hide a later ready prompt whose KV blocks P needs to free.
+        task = asyncio.create_task(self._send_when_ready(identity, sock, meta))
+        self._native_send_tasks.add(task)
+        task.add_done_callback(self._native_send_tasks.discard)
+
+    async def _send_when_ready(self, identity, sock, meta):
+        held = False
+        waiters = set()
+
+        async def wait_ready(tasks, *args, **kwargs):
+            nonlocal held
+            if held:
+                self._ready_send_slots.release()
+                held = False
+            waiters.update(tasks)
+            done, pending = await asyncio.wait(tasks, *args, **kwargs)
+            waiters.difference_update(done)
+            if done:
+                await self._ready_send_slots.acquire()
+                held = True
+            return done, pending
+
+        send = bind_native(native.MooncakeConnectorWorker.send_kv_to_decode,
+                           {'asyncio': _ReadySendAsyncio(wait_ready)})
+        try:
+            # Keep Core's validation, partial responses, timeout and ACK logic.
+            # Bound ready work by the original task count; the native thread
+            # pool still bounds actual transfers by num_sender_workers.
+            await send(self, identity, sock, meta)
+        except Exception as error:  # noqa: BLE001 - match Core's wire-error boundary
+            native.logger.error('Error processing HY4 Mooncake xfer request: %s', error)
+            response = native.MooncakeXferResponse(
+                status=native.MooncakeXferResponseStatus.ERROR, err_msg=str(error))
+            try:
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+            except Exception:  # noqa: BLE001 - the reply channel may be closing
+                native.logger.exception('Could not return HY4 Mooncake xfer error')
+        finally:
+            if held:
+                self._ready_send_slots.release()
+            for task in waiters:
+                task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     async def record_send_reqs(self, metadata):
         if self._canonical_pcp_sender:
@@ -146,7 +256,8 @@ class MooncakeConnector(native.MooncakeConnector):
     # Reuse the complete native constructor and transport, substituting this
     # worker class in a private namespace.
     __init__ = bind_native(native.MooncakeConnector.__init__,
-                          {'MooncakeConnectorWorker': HY4PCPMooncakeWorker})
+                          {'MooncakeConnectorWorker': HY4PCPMooncakeWorker,
+                           'MooncakeConnectorScheduler': HY4PCPMooncakeScheduler})
 
     def bind_connector_metadata(self, connector_metadata):
         self._early_send_metadata = None

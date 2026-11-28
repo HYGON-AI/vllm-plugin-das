@@ -8,7 +8,11 @@ The dense TP1 draft has no EP/DP collective and uses only its local target KV.
 from copy import copy
 
 
-def validate_standard_hy4_parallel(parallel, *, enforce_eager):
+def validate_standard_hy4_parallel(parallel, *, enforce_eager, allow_pcp_producer=False):
+    if allow_pcp_producer:
+        from ..hy4_standard.pd_policy import validate_standard_pd_parallel
+        return validate_standard_pd_parallel(
+            parallel, kv_role="kv_producer", enforce_eager=enforce_eager)
     for field in (
         "pipeline_parallel_size",
         "prefill_context_parallel_size",
@@ -36,8 +40,9 @@ def validate_standard_hy4_parallel(parallel, *, enforce_eager):
         )
 
 
-def validate_standard_dfly_parallel(parallel, *, enforce_eager):
-    return validate_standard_hy4_parallel(parallel, enforce_eager=enforce_eager)
+def validate_standard_dfly_parallel(parallel, *, enforce_eager, allow_pcp_producer=False):
+    return validate_standard_hy4_parallel(parallel, enforce_eager=enforce_eager,
+        allow_pcp_producer=allow_pcp_producer)
 
 
 def make_rank_local_draft_parallel(target):
@@ -63,8 +68,16 @@ def validate_rank_local_dfly_step(dp_size, dp_rank, state, *, local_reqs, dummy_
         )
 
 
-def validate_standard_dfly_runtime_parallel(actual, target, *, enforce_eager):
-    validate_standard_dfly_parallel(target, enforce_eager=enforce_eager)
+def validate_standard_dfly_runtime_parallel(actual, target, *, enforce_eager, allow_pcp_producer=False):
+    validate_standard_dfly_parallel(target, enforce_eager=enforce_eager,
+        allow_pcp_producer=allow_pcp_producer)
+    if allow_pcp_producer and actual.prefill_context_parallel_size == 1:
+        if (any(getattr(actual, name) != 1 for name in (
+                "tensor_parallel_size", "pipeline_parallel_size", "decode_context_parallel_size",
+                "data_parallel_size", "world_size", "world_size_across_dp"))
+                or actual.enable_expert_parallel or actual.is_moe_model):
+            raise ValueError("PCP producer dense draft requires its private single-rank world")
+        return
     for field in (
         "data_parallel_size",
         "tensor_parallel_size",
@@ -78,4 +91,5 @@ def validate_standard_dfly_runtime_parallel(actual, target, *, enforce_eager):
         if actual.enable_expert_parallel:
             raise ValueError("DFly dense draft cannot participate in target EP")
     else:
-        validate_standard_dfly_parallel(actual, enforce_eager=enforce_eager)
+        validate_standard_dfly_parallel(actual, enforce_eager=enforce_eager,
+            allow_pcp_producer=allow_pcp_producer)
