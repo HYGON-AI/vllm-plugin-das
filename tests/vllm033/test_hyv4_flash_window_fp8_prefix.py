@@ -120,7 +120,7 @@ def setup(monkeypatch):
             self._topk_indices_buffer = kwargs.get('topk_indices_buffer')
             self.kv_cache_dtype = 'fp8_ds_mla'
             self.num_heads = kwargs.get('num_heads', 16)
-            self.fp8_decode_padded_heads = 64 if kwargs.get('num_heads',16) <= 64 else 128
+            self.fp8_decode_padded_heads = 64 if self.num_heads <= 64 else 128
             self.softmax_scale = .25
 
         @property
@@ -225,7 +225,10 @@ def test_constructor_qualifies_current_device_not_zero(setup):
     assert values[0]._hcu_window_device == Device('cuda',2)
     assert setup.cuda.property_reads == [2]
     setup.cuda.current = 0
-    invoke(setup.make())
+    values = setup.make()
+    assert values[0]._hcu_window_device == Device('cuda',0)
+    assert setup.cuda.property_reads == [2,0]
+    invoke(values)
     assert setup.provider.calls[-1]['indices'].shape[-1] == 2048
 
 
