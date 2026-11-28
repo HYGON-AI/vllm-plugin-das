@@ -17,7 +17,8 @@ def module():
 def config(**changes):
     result = NS(model_config=NS(dtype=torch.bfloat16,
         hf_config=NS(enable_ihc=True, hidden_size=6144, hc_mult=4)),
-        compilation_config=NS(mode=0), use_v2_model_runner=True)
+        compilation_config=NS(mode=0), use_v2_model_runner=True,
+        speculative_config=None)
     for name, value in changes.items():
         setattr(result, name, value)
     return result
@@ -149,6 +150,7 @@ def test_actual_native_backbone_constructor_keeps_decoder_type_check(monkeypatch
             n_routed_experts=4, moe_intermediate_size=8, n_shared_experts=1,
             norm_topk_prob=True)
     cfg = NS(model_config=NS(hf_config=hf), cache_config=None, quant_config=None,
+             speculative_config=None,
              parallel_config=NS(eplb_config=NS(num_redundant_experts=0)))
     instance = cls.__new__(cls)
     body(instance, vllm_config=cfg)
