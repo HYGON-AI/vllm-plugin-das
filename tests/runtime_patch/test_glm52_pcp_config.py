@@ -265,6 +265,43 @@ def test_hy4_tp1_pcp8_ep8_mtp3_fp8_is_allowed(
     assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
 
 
+@pytest.mark.parametrize("cache_dtype", ["fp8_e4m3", "fp8_ds_mla"])
+def test_hy4_tp1_pcp8_ep8_mtp3_aiter_agrs_is_allowed(
+    make_pcp_config, cache_dtype, monkeypatch,
+):
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM", tp=1, pcp=8, pp=1, dp=1, dcp=1,
+        enable_expert_parallel=True, enforce_eager=True, speculative=True,
+        speculative_method="mtp", num_speculative_tokens=3,
+        cache_dtype=cache_dtype, all2all_backend="allgather_reducescatter",
+        moe_backend="aiter", attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+    assert patch_vllm_config._validate_hcu_pcp_scope(config) is True
+
+
+@pytest.mark.parametrize("moe_backend,all2all_backend", [
+    ("deep_gemm", "allgather_reducescatter"),
+    ("aiter", "deepep_high_throughput"),
+    ("aiter", "deepep_low_latency"),
+])
+def test_hy4_pcp8_rejects_mixed_expert_backend_pairs(
+    make_pcp_config, monkeypatch, moe_backend, all2all_backend,
+):
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.delenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", raising=False)
+    config = make_pcp_config(
+        architecture="HYV4ForCausalLM", tp=1, pcp=8, pp=1, dp=1, dcp=1,
+        enable_expert_parallel=True, enforce_eager=True, speculative=True,
+        speculative_method="mtp", num_speculative_tokens=3,
+        cache_dtype="fp8_e4m3", all2all_backend=all2all_backend,
+        moe_backend=moe_backend, attention_backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+    )
+    with pytest.raises(ValueError, match="DeepGEMM"):
+        patch_vllm_config._validate_hcu_pcp_scope(config)
+
+
 def test_hy4_tp1_pcp8_defaults_to_linear_gate_pcp_sharding(
     make_pcp_config, monkeypatch
 ) -> None:

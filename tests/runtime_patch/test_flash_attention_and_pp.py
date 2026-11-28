@@ -2454,3 +2454,283 @@ def test_hcu_fa_nonpaged_descales_keep_original_shape(monkeypatch):
     scale = torch.tensor(0.5).expand(4, 2)
     fa_utils.flash_attn_varlen_func(k=torch.zeros(8, 2, 8), k_descale=scale)
     assert calls["flash_attn_varlen_func"][0]["k_descale"] is scale
+
+
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("query_len", [1, 3])
+@pytest.mark.parametrize("with_lse", [False, True])
+@pytest.mark.parametrize("scale", [0.0, 0.125])
+def test_strided_b16_decode_uses_native_paged_varlen(
+    monkeypatch, layout, query_len, with_lse, scale,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    physical = torch.zeros(
+        (3, 2, 64, 2, 128) if layout == "NHD" else (3, 2, 2, 64, 128),
+        dtype=torch.bfloat16,
+    )
+    cache = physical if layout == "NHD" else physical.transpose(2, 3)
+    key, value = cache.unbind(1)
+    query = torch.zeros(2 * query_len, 4, 256, dtype=torch.bfloat16)[..., ::2]
+    backing = torch.full_like(query, -7).repeat_interleave(2, dim=-1)
+    output = backing[..., ::2]
+    cu = torch.tensor([0, query_len, 2 * query_len], dtype=torch.int32)
+    seq = torch.tensor([11, 13], dtype=torch.int32)
+    table = torch.tensor([[0], [2]], dtype=torch.int32)
+    sink = torch.ones(4, dtype=torch.bfloat16)
+    slopes = torch.ones(4)
+    native_calls = []
+    lse = torch.tensor([19.0])
+    probabilities = torch.tensor([23.0])
+
+    def native(*args):
+        native_calls.append(args)
+        assert args[0].is_contiguous()
+        assert args[1] is key
+        assert args[2] is value
+        assert args[3].is_contiguous()
+        assert args[3] is not output
+        assert args[4] is cu
+        assert args[6] is seq
+        assert args[8] is table
+        assert args[9] is slopes
+        assert args[10:20] == (
+            query_len, 13, 0.0, scale, False, True, 7, 0, 0.0, False,
+        )
+        assert args[24] is sink
+        args[3].fill_(5)
+        return args[3], None, None, None, None, lse, probabilities, None
+
+    monkeypatch.setattr(fa_utils.flash_attn_2_cuda, "varlen_fwd", native)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("strided K/V must not reach the direct PA ABI")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=query, k=key, v=value, out=output, cu_seqlens_q=cu,
+        max_seqlen_q=query_len, max_seqlen_k=13, seqused_k=seq,
+        block_table=table, softmax_scale=scale, causal=True,
+        window_size=[7, 0], softcap=0.0, alibi_slopes=slopes,
+        s_aux=sink, return_softmax_lse=with_lse,
+    )
+    assert len(native_calls) == 1
+    assert (result[0] if with_lse else result) is output
+    if with_lse:
+        assert result[1] is lse
+        assert result[2] is probabilities
+    torch.testing.assert_close(output, torch.full_like(output, 5))
+    torch.testing.assert_close(backing[..., 1::2], torch.full_like(output, -7))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("query_len", [1, 3])
+@pytest.mark.parametrize("softcap", [0.0, 2.0])
+def test_strided_b16_paged_softcap_respects_native_abi(
+    monkeypatch, dtype, layout, query_len, softcap,
+):
+    from vllm.v1.attention.ops import triton_unified_attention
+
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    physical = torch.zeros(
+        (3, 2, 64, 2, 128) if layout == "NHD" else (3, 2, 2, 64, 128),
+        dtype=dtype,
+    )
+    key, value = (physical if layout == "NHD" else physical.transpose(2, 3)).unbind(1)
+    query = torch.zeros(2 * query_len, 4, 128, dtype=dtype)
+    backing = torch.full((2 * query_len, 4, 256), -7, dtype=dtype)
+    output = backing[..., ::2]
+    cu = torch.tensor([0, query_len, 2 * query_len], dtype=torch.int32)
+    seq = torch.tensor([11, 13], dtype=torch.int32)
+    table = torch.tensor([[0], [2]], dtype=torch.int32)
+    calls = []
+
+    def native(*args):
+        # Preserve flash_api.cpp's real paged softcap admission constraint.
+        if args[8] is not None and args[18] > 0:
+            raise RuntimeError("mha_varlen_fwd: page attention (block_table) does not support softcap")
+        calls.append("native")
+        args[3].fill_(5)
+        return args[3], None, None, None, None, None, None, None
+
+    def triton(**kwargs):
+        calls.append("triton")
+        assert kwargs["softcap"] == 2.0
+        assert kwargs["softmax_scale"] == 0.125
+        assert kwargs["causal"] is True
+        assert kwargs["window_size"] == (-1, -1)
+        assert kwargs["k"] is key and kwargs["v"] is value
+        assert kwargs["block_table"] is table
+        assert kwargs["seqused_k"] is seq
+        kwargs["out"].fill_(7)
+
+    monkeypatch.setattr(fa_utils.flash_attn_2_cuda, "varlen_fwd", native)
+    monkeypatch.setattr(triton_unified_attention, "unified_attention", triton)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("direct PA ignores softcap and rejects strided caches")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=query, k=key, v=value, out=output, cu_seqlens_q=cu,
+        max_seqlen_q=query_len, max_seqlen_k=13, seqused_k=seq,
+        block_table=table, softmax_scale=0.125, causal=True,
+        window_size=(-1, -1), softcap=softcap,
+    )
+    assert result is output
+    assert calls == (["triton"] if softcap > 0 else ["native"])
+    torch.testing.assert_close(output, torch.full_like(output, 7 if softcap > 0 else 5))
+    torch.testing.assert_close(backing[..., 1::2], torch.full_like(output, -7))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("query_len", [1, 3])
+def test_positive_softcap_does_not_reach_direct_pa_with_contiguous_inputs(
+    monkeypatch, dtype, query_len,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    q = torch.zeros(query_len, 4, 128, dtype=dtype)
+    k = torch.zeros(1, 64, 2, 128, dtype=dtype)
+    out = torch.empty_like(q)
+    calls = []
+    monkeypatch.setattr(
+        fa_utils, "_softcap_b16_paged_fwd",
+        lambda params: calls.append(params["softcap"]) or params["out"],
+    )
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("direct PA silently ignores positive softcap")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=q, k=k, v=k, out=out, cu_seqlens_q=torch.tensor([0, query_len]),
+        max_seqlen_q=query_len, max_seqlen_k=13, seqused_k=torch.tensor([13]),
+        block_table=torch.tensor([[0]]), causal=True, softcap=2.0,
+    )
+    assert result is out and calls == [2.0]
+
+
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("query_len", [1, 3])
+def test_strided_d256_decode_uses_stride_aware_triton(monkeypatch, layout, query_len):
+    from vllm.v1.attention.ops import triton_unified_attention
+
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout=layout)
+    physical = torch.zeros(
+        (3, 2, 64, 2, 256) if layout == "NHD" else (3, 2, 2, 64, 256),
+        dtype=torch.bfloat16,
+    )
+    key, value = (physical if layout == "NHD" else physical.transpose(2, 3)).unbind(1)
+    query = torch.zeros(2 * query_len, 4, 256, dtype=torch.bfloat16)
+    backing = torch.zeros(2 * query_len, 4, 512, dtype=torch.bfloat16)
+    output = backing[..., ::2]
+    calls = []
+
+    def triton(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["k"] is key and kwargs["v"] is value
+        assert kwargs["softcap"] == 0.0
+        kwargs["out"].fill_(7)
+
+    monkeypatch.setattr(triton_unified_attention, "unified_attention", triton)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("D256 strided cache must not reach the contiguous PA ABI")
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=query, k=key, v=value, out=output,
+        cu_seqlens_q=torch.tensor([0, query_len, 2 * query_len]),
+        max_seqlen_q=query_len, max_seqlen_k=13, seqused_k=torch.tensor([11, 13]),
+        block_table=torch.tensor([[0], [2]]), causal=True,
+    )
+    assert result is output and len(calls) == 1
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+    assert torch.count_nonzero(backing[..., 1::2]) == 0
+
+
+@pytest.mark.parametrize("options,message", [
+    ({"dropout_p": 0.1}, "dropout"),
+    ({"return_softmax_lse": True}, "LSE"),
+    ({"causal": False, "window_size": (7, 2)}, "right window"),
+])
+def test_paged_softcap_fallback_rejects_unsupported_semantics(
+    monkeypatch, options, message,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    with pytest.raises(NotImplementedError, match=message):
+        fa_utils._softcap_b16_paged_fwd({"softcap": 2.0, **options})
+
+
+@pytest.mark.parametrize("options,message", [
+    ({"return_attn_probs": True}, "probabilities"),
+    ({"cp_world_size": 2}, "context parallel"),
+    ({"q_v": object()}, "q_v"),
+])
+def test_positive_softcap_rejects_unsupported_options_before_vendor_dispatch(
+    monkeypatch, options, message,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    q = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    k = torch.zeros(1, 64, 2, 128, dtype=torch.bfloat16)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("positive softcap must not bypass explicit admission")
+
+    with pytest.raises(NotImplementedError, match=message):
+        fa_utils._with_kv_cache_layout(vendor, "probe")(
+            q=q, k=k, v=k, out=torch.empty_like(q),
+            cu_seqlens_q=torch.tensor([0, 1]), max_seqlen_q=1,
+            max_seqlen_k=13, seqused_k=torch.tensor([13]),
+            block_table=torch.tensor([[0]]), causal=True, softcap=2.0, **options,
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("query_len", [1, 3])
+@pytest.mark.parametrize("causal,window,allowed", [
+    (False, (0, -1), False),
+    (False, (3, -1), False),
+    (False, (-1, 0), False),
+    (False, (-1, 3), False),
+    (False, (0, 0), False),
+    (False, (3, 3), False),
+    (False, (2, 5), False),
+    (False, (-1, -1), True),
+    (True, (0, -1), True),
+    (True, (3, 0), True),
+])
+def test_paged_softcap_window_admission_preserves_mask_semantics(
+    monkeypatch, dtype, query_len, causal, window, allowed,
+):
+    from vllm.v1.attention.ops import triton_unified_attention
+
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="NHD")
+    q = torch.zeros(query_len, 4, 128, dtype=dtype)
+    k = torch.zeros(1, 64, 2, 128, dtype=dtype)
+    out = torch.empty_like(q)
+    calls = []
+
+    def triton(**kwargs):
+        assert allowed, "unsupported window reached a kernel with different mask semantics"
+        assert kwargs["window_size"] == window
+        assert kwargs["causal"] == causal
+        calls.append(True)
+        kwargs["out"].fill_(7)
+
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        pytest.fail("positive softcap must not reach the vendor direct PA path")
+
+    monkeypatch.setattr(triton_unified_attention, "unified_attention", triton)
+    wrapped = fa_utils._with_kv_cache_layout(vendor, "probe")
+    kwargs = dict(
+        q=q, k=k, v=k, out=out,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seqlen_q=query_len, max_seqlen_k=13,
+        seqused_k=torch.tensor([13], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        causal=causal, window_size=window, softcap=2.0,
+    )
+    if allowed:
+        assert wrapped(**kwargs) is out
+        assert calls == [True]
+    else:
+        with pytest.raises(NotImplementedError, match="noncausal.*window"):
+            wrapped(**kwargs)
+        assert not calls

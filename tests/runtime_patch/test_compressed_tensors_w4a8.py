@@ -230,6 +230,73 @@ def test_ct_w4a8_does_not_inherit_storage_eplb_capability(native_wna16):
     assert storage.supports_eplb
 
 
+def test_hyv4_checkpoint_accounting_excludes_ct_w4a8_runtime_auxiliaries(native_wna16, monkeypatch):
+    from vllm_hcu.models.hy_v4.model import _HYV4CheckpointAccounting
+
+    _, method, layer = _native_layer(-1, "aiter")
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(num_experts=2)
+    model.mlp = torch.nn.Module()
+    model.mlp.experts = torch.nn.Module()
+    model.mlp.experts.routed_experts = layer
+    auxiliaries = {"w13_weight_g_idx", "w2_weight_g_idx",
+                   "w13_g_idx_sort_indices", "w2_g_idx_sort_indices",
+                   "w13_qzeros", "w2_qzeros"}
+    ledger = _HYV4CheckpointAccounting(model)
+    assert not any(name.rsplit(".", 1)[-1] in auxiliaries for name in ledger.expected)
+    for name in ledger.expected:
+        ledger.record(name)
+    ledger.validate()
+    from vllm_hcu.models.hy_v4 import model as hy_model
+    outer = object.__new__(hy_model.HYV4ForCausalLM)
+    torch.nn.Module.__init__(outer)
+    outer.config = SimpleNamespace(tie_word_embeddings=False)
+    outer.quant_config = None
+    outer.model = model
+    checkpoint_names = set(ledger.expected)
+
+    def load_checkpoint(_loader, _weights):
+        for name in checkpoint_names:
+            model._checkpoint_accounting.record(name)
+        return {"model." + name for name in checkpoint_names}
+
+    monkeypatch.setattr(hy_model._HYV4AutoWeightsLoader, "load_weights", load_checkpoint)
+    assert outer.load_weights(iter([])) == {"model." + name for name in checkpoint_names}
+    # Actual checkpoint weights and scales remain mandatory.
+    ledger.received.pop("mlp.experts.routed_experts.w13_weight_scale")
+    with pytest.raises(RuntimeError, match="Missing HY V4 checkpoint"):
+        ledger.validate()
+    # The exception belongs to this execution adapter, not all WNA16 storage.
+    del method._hcu_ct_w4a8_delegate
+    native_ledger = _HYV4CheckpointAccounting(model)
+    assert auxiliaries <= {name.rsplit(".", 1)[-1] for name in native_ledger.expected}
+
+
+@pytest.mark.parametrize("architecture,backend,extra,error", [
+    ("Qwen4ExpForCausalLM", "deepep_high_throughput", {}, NotImplementedError),
+    ("UnknownModel", "deepep_low_latency", {}, NotImplementedError),
+    ("HYV4ForCausalLM", "deepep_auto", {}, NotImplementedError),
+    ("HYV4ForCausalLM", "deepep_high_throughput", {"use_ep": False}, ValueError),
+    ("HYV4MTPModel", "deepep_low_latency", {"dp_size": 1}, ValueError),
+    ("HYV4ForCausalLM", "deepep_high_throughput", {"tp_size": 8}, ValueError),
+    ("HYV4MTPModel", "deepep_low_latency", {"pcp_size": 8}, ValueError),
+])
+def test_ct_deepep_rejects_unqualified_contract_before_storage(
+    monkeypatch, native_wna16, architecture, backend, extra, error,
+):
+    weight, activation, moe = _scheme()
+    parallel = dict(dp_size=8, pcp_size=1, tp_size=1, use_ep=True,
+                    all2all_backend=backend, enable_eplb=False,
+                    use_deepep_auto_kernels=False)
+    parallel.update(extra)
+    moe.moe_parallel_config = SimpleNamespace(**parallel)
+    moe._hcu_model_architectures = (architecture,)
+    monkeypatch.setattr(native_wna16.CompressedTensorsWNA16MoEMethod, "__init__",
+                        lambda *_args, **_kwargs: pytest.fail("storage must not be constructed"))
+    with pytest.raises(error):
+        runtime.make_hcu_w4a8_method(weight, activation, moe)
+
+
 @pytest.fixture
 def native_wna16(monkeypatch):
     """Use the real CT loader; replace only accelerator backend selection."""
@@ -256,7 +323,7 @@ def native_wna16(monkeypatch):
                 setattr(cls, name, value)
 
 
-def _native_layer(group_size, backend):
+def _native_layer(group_size, backend, **moe_overrides):
     from compressed_tensors.quantization import QuantizationArgs
 
     weight = QuantizationArgs(num_bits=4, type="int", symmetric=True,
@@ -265,6 +332,7 @@ def _native_layer(group_size, backend):
                                   dynamic=True, strategy="token")
     moe = SimpleNamespace(has_bias=False, activation="silu",
                           is_act_and_mul=True, moe_backend=backend)
+    vars(moe).update(moe_overrides)
     method = runtime.make_hcu_w4a8_method(weight, activation, moe, "experts")
     layer = torch.nn.Module()
     layer.moe_config = moe
@@ -272,6 +340,120 @@ def _native_layer(group_size, backend):
     method.create_weights(layer, 2, 32, 16, torch.bfloat16,
                           intermediate_size_full=16)
     return weight, method, layer
+
+
+@pytest.mark.parametrize("architecture", ["HYV4ForCausalLM", "HYV4MTPModel"])
+@pytest.mark.parametrize("architecture_source", ["pretagged", "factory_context"])
+@pytest.mark.parametrize("backend,dp_size,pcp_size,low_latency", [
+    ("deepep_low_latency", 8, 1, True),
+    ("deepep_high_throughput", 8, 1, False),
+    ("deepep_high_throughput", 1, 8, False),
+])
+def test_hyv4_ct_deepep_keeps_native_loader_and_modular_kernel(
+    monkeypatch, native_wna16, architecture, architecture_source,
+    backend, dp_size, pcp_size, low_latency,
+):
+    from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
+    from vllm import config as vllm_config
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading, initialize_layerwise_reload,
+        finalize_layerwise_reload,
+    )
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+    from vllm_hcu.model_executor.layers.fused_moe.experts import dpsk_v4_deep_gemm_moe
+    from vllm_hcu.patch.worker.op_opt import patch_compressed_tensors_moe_wna16
+
+    # Retain the real backend boundary: explicit DeepGEMM does not request
+    # the AITER WNA16 constructor wrapper. Storage must select its own oracle.
+    monkeypatch.setattr(patch_compressed_tensors_moe_wna16, "_aiter_requested",
+        lambda owner: getattr(getattr(owner, "moe_config", owner), "moe_backend", None) == "aiter")
+    def select_storage(**kwargs):
+        assert kwargs["config"].moe_backend == "triton"
+        assert kwargs["config"].moe_parallel_config.all2all_backend == "allgather_reducescatter"
+        assert str(getattr(kwargs["quant_config"].strategy, "value",
+                           kwargs["quant_config"].strategy)) == "group"
+        return native_wna16.WNA16MoEBackend.TRITON, None
+    monkeypatch.setattr(native_wna16, "select_wna16_moe_backend", select_storage)
+    monkeypatch.setattr(deepep_runtime, "current_platform",
+                        SimpleNamespace(is_rocm=lambda: True))
+    monkeypatch.setattr(deepep_runtime, "_require_slimquant_w4a8_hipc_runtime", lambda: None)
+    calls = []
+    class Experts:
+        def process_weights_after_loading(self, layer):
+            for prefix in ("w13", "w2"):
+                assert getattr(layer, prefix + "_weight").dtype == torch.int8
+                torch.testing.assert_close(getattr(layer, prefix + "_weight_scale"),
+                                           torch.full((2, 32, 1), .125))
+    class Kernel:
+        fused_experts = SimpleNamespace(experts=Experts())
+        def apply(self, **kwargs):
+            return kwargs["hidden_states"] + 3
+    kernel = Kernel()
+    def factory(**kwargs):
+        calls.append(kwargs)
+        return kernel
+    monkeypatch.setattr(dpsk_v4_deep_gemm_moe,
+                        "make_fixed_deepep_deepgemm_w4a8_moe_kernel", factory)
+    parallel = SimpleNamespace(dp_size=dp_size, pcp_size=pcp_size, tp_size=1, use_ep=True,
+        all2all_backend=backend, use_deepep_auto_kernels=False,
+        use_deepep_ll_kernels=low_latency, use_deepep_ht_kernels=not low_latency,
+        enable_eplb=False)
+    current = (
+        SimpleNamespace(model_config=SimpleNamespace(architectures=[architecture]))
+        if architecture_source == "factory_context" else None
+    )
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config_or_none", lambda: current)
+    descriptors = {"moe_parallel_config": parallel}
+    if architecture_source == "pretagged":
+        descriptors["_hcu_model_architectures"] = (architecture,)
+    _, method, layer = _native_layer(-1, "deep_gemm", **descriptors)
+    if architecture_source == "factory_context":
+        # The factory tags the original config only after the quant method
+        # has cloned it. Initial post-load still has the current-config scope.
+        assert not hasattr(layer.moe_config, "_hcu_model_architectures")
+        layer.moe_config._hcu_model_architectures = (architecture,)
+        record_metadata_for_reloading(layer)
+    # The delegate's admission marker must not mutate the shared MoE descriptor.
+    assert not hasattr(layer.moe_config, "_hcu_ct_w4a8")
+    assert type(method) is native_wna16.CompressedTensorsWNA16MoEMethod
+    layer.swiglu_limit = 10.0
+    tables = (object(), object(), object())
+    layer._expert_routing_tables = lambda: tables
+    for prefix, shape in (("w13", (2, 32, 32)), ("w2", (2, 32, 16))):
+        q = torch.arange(-8, 8, dtype=torch.int8).repeat(torch.tensor(shape).prod().item() // 16).reshape(shape)
+        getattr(layer, prefix + "_weight_packed").data.copy_(
+            pack_to_int32(q, 4).transpose(1, 2).contiguous())
+        getattr(layer, prefix + "_weight_scale").data.fill_(2.)
+    checkpoint = {
+        name: value.detach().clone() for name, value in layer.named_parameters()
+    }
+    method.process_weights_after_loading(layer)
+    assert len(calls) == 1 and calls[0]["use_low_latency"] is low_latency
+    assert calls[0]["routing_tables"] is tables
+    assert calls[0]["moe_quant_config"].gemm1_clamp_limit == 10.0
+    assert method.supports_internal_mk and method.moe_kernel is kernel
+    assert not method.supports_int8_allgatherv_input and not method.supports_eplb
+    x = torch.ones(3, 32, dtype=torch.bfloat16)
+    torch.testing.assert_close(method.apply(layer, x, torch.ones(3, 1),
+        torch.zeros(3, 1, dtype=torch.int32)), x + 3)
+    if architecture_source == "factory_context":
+        # Reload runs after that scope has ended. Exercise the retained real
+        # CT method, delegate routing, and native restore lifecycle again.
+        current = None
+        initialize_layerwise_reload(layer)
+        for name, value in checkpoint.items():
+            param = getattr(layer, name)
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                param.data.copy_(value)
+            else:
+                loader(param, value)
+        finalize_layerwise_reload(layer, None)
+        assert len(calls) == 2
+        assert method._hcu_ct_w4a8_delegate.moe._hcu_model_architectures == (architecture,)
+        assert layer.quant_method is method and method.supports_internal_mk
+        torch.testing.assert_close(method.apply(layer, x, torch.ones(3, 1),
+            torch.zeros(3, 1, dtype=torch.int32)), x + 3)
 
 
 @pytest.mark.parametrize("group_size", [None, -1])
