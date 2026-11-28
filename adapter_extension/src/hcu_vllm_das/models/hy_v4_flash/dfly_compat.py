@@ -194,7 +194,15 @@ def validate_dfly_runtime(vllm_config) -> None:
     if getattr(vllm_config.attention_config, "hisparse_config", None) is not None and not hisparse:
         raise NotImplementedError("HiSparse + DFly joint runtime remains unqualified")
     p = vllm_config.parallel_config
-    if any(getattr(p, field, 1) != 1 for field in (
+    target = vllm_config.speculative_config.target_model_config
+    if target.hf_text_config.model_type == "hy_v4":
+        from .dfly_topology import validate_standard_dfly_runtime_parallel
+        # Draft configs deliberately disable EP; validate the immutable target
+        # owner rather than treating the dense draft as an expert participant.
+        validate_standard_dfly_runtime_parallel(
+            p, vllm_config.speculative_config.target_parallel_config,
+            enforce_eager=target.enforce_eager)
+    elif any(getattr(p, field, 1) != 1 for field in (
         "data_parallel_size", "pipeline_parallel_size",
         "prefill_context_parallel_size", "decode_context_parallel_size")):
         raise ValueError("DFly requires DP/PP/PCP/DCP=1")

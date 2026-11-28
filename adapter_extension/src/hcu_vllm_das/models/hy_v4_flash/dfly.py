@@ -3,7 +3,7 @@
 from collections.abc import Iterable, Iterator
 from copy import copy, deepcopy
 from itertools import chain
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs
@@ -363,6 +363,8 @@ class HYV4DFlyDecoderLayer(HYV4DecoderLayer):
 
     Core033 has no attention_cls/feed_forward_cls constructor hooks.
     """
+    attention_cls = HYV4DFlyAttention
+
     def __init__(self, config, vllm_config, cache_config=None, quant_config=None,
                  prefix="", topk_indices_buffer=None):
         nn.Module.__init__(self)
@@ -374,7 +376,7 @@ class HYV4DFlyDecoderLayer(HYV4DecoderLayer):
         self.enable_ihc = False
         local_config = copy(vllm_config)
         local_config.quant_config = quant_config
-        self.self_attn = HYV4DFlyAttention(local_config, config, self.layer_idx,
+        self.self_attn = self.attention_cls(local_config, config, self.layer_idx,
                                           topk_indices_buffer, f"{prefix}.self_attn")
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -416,7 +418,11 @@ class HYV4DFlyModel(nn.Module):
         )
         quant_config = vllm_config.quant_config
         if isinstance(quant_config, CompressedTensorsConfig):
-            quant_config = HYV4DFlyQuantizationConfig.for_model(quant_config, prefix)
+            quant_cls = HYV4DFlyQuantizationConfig
+            if getattr(config, "dfly_target_model_type", None) == "hy_v4":
+                from ..hy4_dfly import HYV4StandardDFlyQuantizationConfig
+                quant_cls = HYV4StandardDFlyQuantizationConfig
+            quant_config = quant_cls.for_model(quant_config, prefix)
         elif isinstance(quant_config, Fp8Config):
             quant_config = deepcopy(quant_config)
             quant_config.apply_vllm_mapper(
@@ -452,9 +458,13 @@ class HYV4DFlyModel(nn.Module):
             ),
             persistent=False,
         )
+        decoder_cls = HYV4DFlyDecoderLayer
+        if getattr(config, "dfly_target_model_type", None) == "hy_v4":
+            from ..hy4_dfly import HYV4StandardDFlyDecoderLayer
+            decoder_cls = HYV4StandardDFlyDecoderLayer
         self.layers = nn.ModuleList(
             [
-                HYV4DFlyDecoderLayer(
+                decoder_cls(
                     config,
                     vllm_config,
                     cache_config=vllm_config.cache_config,
@@ -472,7 +482,8 @@ class HYV4DFlyModel(nn.Module):
                 and not attn.mla_attn.get_attn_backend().supports_sink()
             ):
                 raise ValueError("DFly requires a backend that applies learnable sinks")
-            attn.rotary_emb = HYV4DFlyRotaryEmbedding(attn.rotary_emb)
+            if getattr(config, "dfly_target_model_type", None) != "hy_v4":
+                attn.rotary_emb = HYV4DFlyRotaryEmbedding(attn.rotary_emb)
             attn.use_hpc_gated_mla = False
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mtp_fusion = HYV4DFlyFusion(
@@ -525,8 +536,6 @@ class HYV4DFlyModel(nn.Module):
             assert self.embed_tokens is not None, "DFly embedding is not bound"
             inputs_embeds = self.embed_tokens(input_ids)
         hidden = inputs_embeds
-        # HCU's existing MLA rotary module consumes 1-D and 3-D M-RoPE
-        # positions directly; the newer NVIDIA token-row cache is not used.
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)
@@ -539,11 +548,12 @@ class HYV4DFlyForCausalLM(nn.Module):
     allow_patterns_overrides = ["*.safetensors"]
     has_own_lm_head = False
     draft_id_to_target_id = None
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
-    # Core v0.33 HCU attention owns separate q_a/kv_a modules. Only the
-    # FFN gate/up projections are packed; never use the newer fused QKV map.
+    # Flash owns separate q_a/kv_a projections; standard Core MLA fuses them.
+    # The instance mapper adds QKVA stacking only for the standard draft.
     _weight_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".gate_proj.": (".gate_up_proj.", 0),
@@ -562,6 +572,11 @@ class HYV4DFlyForCausalLM(nn.Module):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.config = self.model.config
+        if getattr(self.config, "dfly_target_model_type", None) == "hy_v4":
+            self._weight_mapper = self._weight_mapper | WeightsMapper(orig_to_new_stacked={
+                ".q_a_proj.": (".fused_qkv_a_proj.", 0),
+                ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
+            })
         self.has_own_embed_tokens = False
         self.lm_head: ParallelLMHead | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)

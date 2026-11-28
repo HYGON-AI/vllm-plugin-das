@@ -36,6 +36,37 @@ def test_other_model_families_are_not_claimed(model_type):
     assert not accepts_checkpoint(checkpoint(), None, SimpleNamespace(model_type=model_type))
 
 
+@pytest.mark.parametrize('choice', [None, 'compressed-tensors', 'hcu_hy4_ct_w4a8'])
+def test_standard_vl_outer_config_selects_its_hy4_text_quantizer(choice):
+    hf = SimpleNamespace(model_type='hy_v4_vl',
+                         text_config=SimpleNamespace(model_type='hy_v4'))
+    quant = checkpoint()
+    before = deepcopy(quant)
+    assert accepts_checkpoint(quant, choice, hf)
+    assert quant == before
+    assert hf.model_type == 'hy_v4_vl'
+    assert hf.text_config.model_type == 'hy_v4'
+
+
+@pytest.mark.parametrize('text', [None, {}, SimpleNamespace(),
+    SimpleNamespace(model_type='hy_v4_flash'), SimpleNamespace(model_type='hy_v3')])
+def test_vl_with_missing_or_foreign_text_family_is_not_claimed(text):
+    hf = SimpleNamespace(model_type='hy_v4_vl', text_config=text)
+    assert not accepts_checkpoint(checkpoint(), None, hf)
+
+
+@pytest.mark.parametrize('choice', [None, 'compressed-tensors', 'hcu_hy4_ct_w4a8'])
+def test_standard_dfly_derived_config_keeps_target_quantizer(choice):
+    hf = SimpleNamespace(model_type='hy_v4_dfly', dfly_target_model_type='hy_v4')
+    assert accepts_checkpoint(checkpoint(), choice, hf)
+
+
+@pytest.mark.parametrize('target', [None, 'hy_v4_flash', 'hy_v3', 'qwen3'])
+def test_dfly_without_standard_target_marker_is_not_claimed(target):
+    hf = SimpleNamespace(model_type='hy_v4_dfly', dfly_target_model_type=target)
+    assert not accepts_checkpoint(checkpoint(), None, hf)
+
+
 @pytest.mark.parametrize('side,key,value', [
     ('weights', 'num_bits', 8), ('weights', 'type', 'float'),
     ('weights', 'strategy', 'group'), ('weights', 'symmetric', False),
@@ -107,6 +138,11 @@ def test_real_hy4_config_delegates_without_claiming_other_models(monkeypatch):
         assert cls.override_quantization_method(checkpoint(), cls.get_name(),
             current.model_config.hf_config) == cls.get_name()
         assert cls().get_quant_method('draft', 'model.layers.80') == 'delegated'
+        current.model_config.hf_config = SimpleNamespace(model_type='hy_v4_vl',
+            text_config=SimpleNamespace(model_type='hy_v4'))
+        assert cls.override_quantization_method(checkpoint(), None,
+            current.model_config.hf_config) == cls.get_name()
+        assert cls().get_quant_method('vision_or_text', 'visual.blocks.0') == 'delegated'
         current.model_config.hf_config.model_type = 'deepseek_v41'
         assert cls.override_quantization_method(checkpoint(), None, current.model_config.hf_config) is None
         with pytest.raises(ValueError, match='HY4'):

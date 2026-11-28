@@ -1,0 +1,246 @@
+{
+  "config_groups": {
+    "group_int4_routed_experts": {
+      "format": "pack-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:^(?!.*dfly_layers).*layers\\.(?:1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38|39|40|41|42|43|44|45|46|47|48|49|50|51|52|53|54|55|56|57|58|59|60|61|62|63|64|65|66|67|68|69|70|71|72|73|74|75|76|77)\\.mlp\\.experts\\.\\d+\\.(?:gate_proj|up_proj|down_proj)$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 4,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    },
+    "group_int8_dfly": {
+      "format": "int-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:.*dfly_layers\\.\\d+\\.self_attn\\.(?:fused_qkv_a_proj(?:_with_mqa)?|q_a_proj|kv_a_proj_with_mqa|q_b_proj|kv_b_proj|o_proj)$",
+        "re:.*dfly_layers\\.\\d+\\.self_attn\\.linear_gate$",
+        "re:.*dfly_layers\\.\\d+\\.mlp\\.(?:gate_up_proj|gate_proj|up_proj|down_proj)$",
+        "re:.*dfly_layers\\.hidden_correction\\.(?:gate_up_proj|gate_proj|up_proj|down_proj)$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 8,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    },
+    "group_int8_indexer_wk_EXPERIMENTAL": {
+      "format": "int-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:.*self_attn\\.indexer\\.(?:wk_weights_proj|wk)$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 8,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    },
+    "group_int8_indexer_wq_b": {
+      "format": "int-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:.*self_attn\\.indexer\\.wq_b$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 8,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    },
+    "group_int8_linear_gate": {
+      "format": "int-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:^(?!.*dfly_layers).*layers\\.(?!0\\.)\\d+\\.self_attn\\.linear_gate$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 8,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    },
+    "group_int8_mla": {
+      "format": "int-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:^(?!.*dfly_layers).*self_attn\\.(?:fused_qkv_a_proj(?:_with_mqa)?|q_a_proj|kv_a_proj_with_mqa|q_b_proj|kv_b_proj|o_proj)$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 8,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    },
+    "group_int8_mlp": {
+      "format": "int-quantized",
+      "input_activations": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": true,
+        "group_size": null,
+        "num_bits": 8,
+        "observer": null,
+        "observer_kwargs": {},
+        "strategy": "token",
+        "symmetric": true,
+        "type": "int"
+      },
+      "output_activations": null,
+      "targets": [
+        "re:^(?!.*dfly_layers).*shared_experts\\.(?:gate_up_proj|gate_proj|up_proj|down_proj)$",
+        "re:^(?!.*dfly_layers).*layers\\.0\\.mlp\\.(?:gate_up_proj|gate_proj|up_proj|down_proj)$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": -1,
+        "num_bits": 8,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "channel",
+        "symmetric": true,
+        "type": "int"
+      }
+    }
+  },
+  "format": "pack-quantized",
+  "ignore": [
+    "re:.*(?<!linear_)(?:router\\.)?gate$",
+    "re:.*(?:router\\.)?gate\\..*",
+    "re:.*hc_.*",
+    "re:.*(?:input_layernorm|post_attention_layernorm)$",
+    "re:.*(?:q_a_layernorm|kv_a_layernorm|norm)$",
+    "re:.*learnable_sink_param$",
+    "re:.*indexer\\.k_norm(?:\\..*)?$",
+    "re:.*indexer\\.weights_proj$",
+    "lm_head",
+    "re:.*embed_tokens.*",
+    "re:.*vit\\..*",
+    "re:.*visual\\..*",
+    "re:.*(?:eh_proj|enorm|hnorm|final_layernorm)$",
+    "re:.*dfly_layers\\.(?:mtp_fusion|confidence_head|final_norm)(?:\\..*)?$",
+    "re:^(?!.*dfly_layers).*layers\\.0\\.self_attn\\.linear_gate$"
+  ],
+  "kv_cache_scheme": null,
+  "quant_method": "compressed-tensors",
+  "quantization_status": "compressed"
+}

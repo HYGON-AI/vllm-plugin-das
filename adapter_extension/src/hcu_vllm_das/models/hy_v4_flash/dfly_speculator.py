@@ -690,6 +690,10 @@ class HYV4DFlySpeculator(DraftModelSpeculator):
         # Profile the independent worst-case draft shape, including temporary
         # activations/workspaces, rather than only those target dummy requests.
         batch = self.max_num_reqs if dummy_run and is_profile else input_batch.num_reqs
+        from .dfly_topology import validate_rank_local_dfly_step
+        validate_rank_local_dfly_step(
+            self.dp_size, self.dp_rank, dp_sync_state,
+            local_reqs=input_batch.num_reqs, dummy_run=dummy_run)
         query_width = self.num_query_per_req
         count = batch * query_width
         if batch > self.max_num_reqs or count > self.max_num_tokens:

@@ -14,6 +14,7 @@ def config():
     return NS(model_config=NS(hf_config=NS(model_type='hy_v4',hidden_size=6144,
         n_routed_experts=256,num_experts_per_tok=8),dtype=torch.bfloat16,is_multimodal_model=False),
         lora_config=None,use_v2_model_runner=True,compilation_config=NS(mode=0),
+        speculative_config=None,
         parallel_config=NS(tensor_parallel_size=1,pipeline_parallel_size=1,
             prefill_context_parallel_size=1,decode_context_parallel_size=1,
             data_parallel_size=16,enable_expert_parallel=True,enable_eplb=False,enable_elastic_ep=False))
