@@ -9,6 +9,21 @@ import torch
 from test_flash_attention import load_flash_attention, make_impl
 
 
+@pytest.mark.parametrize("layout", ("bhsd", "bshd"))
+@pytest.mark.parametrize("dim", (64, 256))
+@pytest.mark.parametrize("kvheads", (1, 4))
+def test_decode_keeps_native_pa_except_unqualified_d256_kv4(monkeypatch, layout, dim, kvheads):
+    from hcu_vllm_das.attention import e4m3_attention, e5m2_scales
+
+    monkeypatch.setattr(e5m2_scales, "run_e5m2_attention", lambda execute, kw: execute(**kw))
+    monkeypatch.setattr(e4m3_attention, "_prefill", lambda vendor, kw: "bounded-varlen")
+    shape = (2, kvheads, 64, dim) if layout == "bhsd" else (2, 64, kvheads, dim)
+    kw = dict(k=torch.empty(shape, dtype=torch.uint8), layout=layout,
+              block_table=object(), max_seqlen_q=1)
+    result = e4m3_attention.run_e4m3_attention(lambda **kw: "native-pa", kw)
+    assert result == ("bounded-varlen" if dim == 256 and kvheads == 4 else "native-pa")
+
+
 @pytest.mark.parametrize("layout", ("LBHNC", "LBNHC"))
 def test_e4m3_reader_preserves_bytes_query_and_layout(monkeypatch, layout):
     flash = load_flash_attention(monkeypatch, kv_cache_layout=layout)

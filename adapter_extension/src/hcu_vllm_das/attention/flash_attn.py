@@ -35,6 +35,12 @@ def _vendor_varlen_func() -> Callable[..., Any]:
     return function
 
 
+def _run_vendor_varlen(**kwargs: Any) -> Any:
+    from hcu_vllm_das.attention.paged_attention import run_paged_attention
+
+    return run_paged_attention(_vendor_varlen_func(), kwargs)
+
+
 def _layout_name(layout: KVCacheLayout) -> str:
     return getattr(layout, "name", str(layout))
 
@@ -341,7 +347,7 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
                 if kwargs[name].element_size() != 1:
                     raise ValueError("HCU E4M3 requires one-byte K/V storage")
                 kwargs[name] = kwargs[name].view(torch.float8_e4m3fn)
-            return run_e4m3_attention(_vendor_varlen_func(), kwargs)
+            return run_e4m3_attention(_run_vendor_varlen, kwargs)
         if (
             self.kv_cache_dtype == _E5M2_KV_CACHE_DTYPE
             and kwargs.get("block_table") is not None
@@ -350,8 +356,8 @@ class HcuFlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         ):
             from hcu_vllm_das.attention.e5m2_scales import run_e5m2_attention
 
-            return run_e5m2_attention(_vendor_varlen_func(), kwargs)
-        return _vendor_varlen_func()(**kwargs)
+            return run_e5m2_attention(_run_vendor_varlen, kwargs)
+        return _run_vendor_varlen(**kwargs)
 
 
 class HcuFlashAttentionBackend(FlashAttentionBackend):

@@ -27,6 +27,7 @@ PUBLIC_SELECTOR_CASES = ('normal', 'optional', 'required', 'commit',
 DEVICE_TIERS = ('device', 'device-gfx938')
 INT8_DEVICE_TESTS = ('tests/vllm033/test_aiter_int8_public_hcu.py',
                     'tests/vllm033/test_aiter_int8_ct_graph_hcu.py')
+ATTENTION_DEVICE_TESTS = ('tests/vllm033/test_paged_attention_hcu.py',)
 
 
 def _has_hcu_contracts(path):
@@ -56,9 +57,9 @@ def test_files(tier):
         directory = directory / 'gfx938'
     candidates = sorted(directory.glob('test_*.py'))
     if tier == 'device-gfx938':
-        # These installed public/CT/Graph contracts admit both HCU targets.
-        # Keep gfx938's own DeepGEMM suite and add the same INT8 acceptance gate.
-        candidates.extend(ROOT / name for name in INT8_DEVICE_TESTS
+        # These installed INT8 and paged-attention contracts admit both HCU
+        # targets. Retain gfx938's own DeepGEMM suite as well.
+        candidates.extend(ROOT / name for name in (*INT8_DEVICE_TESTS, *ATTENTION_DEVICE_TESTS)
                           if (ROOT / name).is_file())
     return [p.relative_to(ROOT).as_posix()
             for p in candidates

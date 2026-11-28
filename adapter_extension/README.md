@@ -608,6 +608,19 @@ internally; rectangular short prefill uses that path by passing a conservative
 `max_seqlen_q` upper bound, avoiding the vendor wrapper's incompatible MTP tile
 selection.
 
+Single-token decode also accommodates vendor PA implementations that require
+all tensors to be contiguous. For interleaved dense K/V pages, read-only views
+include the intervening half-pages and the Plugin multiplies the device block
+indices by the page-stride ratio. K/V addresses, native writer views and Core
+page ownership stay intact; the allocated cache is never copied. Query, output
+and small metadata buffers are made contiguous as needed, preserving the
+caller's output alias. Subpage padding that cannot be expressed by integer
+page indices uses the bounded native gather/ordinary-varlen composition over
+active contexts instead. That exceptional path has context-sized scratch and
+copy costs; it is not a native paged-decode performance claim. D256/KV4 E4M3
+also uses this bounded composition because the tested native PA exceeds the
+existing non-unit-scale numerical gate; D256/KV1 retains native PA.
+
 An additional prefill composition is available as an explicit candidate:
 `VLLM_HCU_FLASH_PREFILL_GATHER=1`. It reuses vLLM's existing C++
 `cp_gather_cache` per head, then the public contiguous vendor varlen call.

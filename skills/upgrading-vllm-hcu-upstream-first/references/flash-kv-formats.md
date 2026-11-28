@@ -64,3 +64,25 @@ its run remains diagnostic, including if observation changes whether it fails.
 Do not infer healthy serving, HumanEval or normal shutdown from completed model
 loading or capture progress. Record controller cleanup signals separately from
 framework-internal signals and the final surviving-process check.
+
+## Strict native PA contiguity
+
+A newer provider may require contiguous Q, output, page tables, lengths and
+K/V even though each Plugin cache page is dense. Reproduce the original model
+with the requested backend, dtype, Graph and prefix before changing ownership.
+Keep the official allocator and native writer. For whole-page block gaps,
+read-only dense views can span intervening storage and multiply page IDs by
+`block_stride / dense_page_elements`; bound each view to
+`(real_blocks - 1) * ratio + 1` pages and retain its storage offset. Never
+compact the full cache each decode or split the entire allocation into K/V
+halves. A subpage padding gap needs a separate bounded active-context gather
+path, with its scratch/copy cost disclosed.
+
+Test actual native writer/readback, Q/output/metadata strides, both declared
+layouts, multi-page indices and changed-input Graph replay against independent
+numerics. Preserve output aliases and page-table inputs. Use the allocator's
+real alignment: an artificial unaligned FP8 offset can fault native PA after a
+successful writer sync. Retain such a failed fixture separately from the
+original model failure; CPU address arithmetic does not qualify device loads.
+Remove the adapter only after a replacement passes the same capability tests,
+not because its full wheel version matches an allowlist.

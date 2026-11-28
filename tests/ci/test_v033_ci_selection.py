@@ -108,6 +108,17 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(tier=tier):
                 self.assertTrue(expected.issubset(test_files(tier)))
 
+    def test_paged_attention_runs_on_both_devices_and_units_stay_portable(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import test_files
+        device = 'tests/vllm033/test_paged_attention_hcu.py'
+        unit = 'tests/vllm033/test_paged_attention.py'
+        for tier in ('device', 'device-gfx938'):
+            self.assertIn(device, test_files(tier))
+            self.assertNotIn(unit, test_files(tier))
+        self.assertIn(unit, test_files('portable'))
+        self.assertNotIn(device, test_files('portable'))
+
     def test_result_gate_rejects_skip_xfail_empty_failure_and_error(self):
         sys.path.insert(0, str(ROOT / 'tools'))
         from run_v033_ci import validate_result, test_files

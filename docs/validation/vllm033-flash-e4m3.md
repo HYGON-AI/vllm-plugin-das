@@ -127,3 +127,34 @@ acceptance. No production performance claim is made for the extra prefill
 byte gather/conversion. The original paired requests, raw responses, scores,
 runtime source hashes, profiles and shutdown observations are retained in
 `flash-e4m3-v033-20261118-r1` evidence.
+
+
+## Strict PA provider follow-up (2026-11-28)
+
+The user-specified `2.8.4+dtk2610.torch2130.2611272153.gece162` provider
+reproduced `PA tensors must be contiguous` during default-Graph warmup of
+Qwen3.6-27B BF16 weights, TP4, E4M3 KV, 64-token kernel pages and prefix on.
+The Plugin preserves Core allocation and native writer views. At the PA call,
+dense read-only views include intervening half-pages and device block indices
+are multiplied by the integral page-stride ratio. Each real page keeps its
+original address. Query, output and metadata are normalized only as needed;
+caller output aliases and input tables are preserved. A subpage padding gap
+uses the existing bounded gather/ordinary-varlen composition. Its page table
+also needs contiguous columns for the native Core gather.
+
+A separate D256/KV4 E4M3 non-unit-scale test exceeded the existing 0.03
+absolute/relative FP32-reference tolerance in both layouts (one of 12288
+values, absolute error 0.033935546875). Native writer bytes matched the
+independent cast, and contiguous native PA was bitwise identical to remapped
+PA. Keep this original failure: zero-copy page remapping does not repair that
+native numerical limitation. D256/KV4 E4M3 therefore uses the bounded
+unquantized varlen composition; D256/KV1, including the requested TP4 model,
+retains native PA. This geometry guard can be removed after native PA passes
+the same non-unit-scale, changed-input Graph and model gates. Gather/conversion
+scratch and extra calls are a performance tradeoff, not native FP8 compute.
+
+An artificial FP8 cache offset of 13 bytes faulted native PA after a successful
+native-writer synchronization. The regression fixture uses a nonzero 64-element
+aligned offset, matching the allocator's alignment requirement; those earlier
+failed runs are retained separately from the original model failure. No
+FlashAttention source or binary is modified by this follow-up.
