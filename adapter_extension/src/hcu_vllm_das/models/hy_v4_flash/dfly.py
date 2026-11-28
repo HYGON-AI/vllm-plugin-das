@@ -536,9 +536,6 @@ class HYV4DFlyModel(nn.Module):
             assert self.embed_tokens is not None, "DFly embedding is not bound"
             inputs_embeds = self.embed_tokens(input_ids)
         hidden = inputs_embeds
-        if getattr(self.config, "dfly_target_model_type", None) == "hy_v4":
-            from vllm.models.hy_v4.nvidia.mrope import set_token_rope
-            set_token_rope(self.layers[0].self_attn.rotary_emb, positions, hidden)
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)

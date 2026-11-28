@@ -27,7 +27,15 @@ def make_ct_backbone(*, vllm_config, prefix=''):
         from .hy_v4_flash.dfly_compat import validate_dfly_runtime
         validate_dfly_runtime(vllm_config)
     hy4_dp_metadata.prepare(vllm_config)
-    cls = HcuHY4CTLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4CTBackbone
+    from .hy4_standard.target_policy import uses_standard_target
+    standard = uses_standard_target(
+        vllm_config.model_config.hf_config,
+        method=getattr(vllm_config.speculative_config, "method", None))
+    if standard:
+        from .hy4_standard.model import HYV4StandardModel
+        cls = HYV4StandardModel
+    else:
+        cls = HcuHY4CTLaunchBackbone if ihc_launch.selected(vllm_config) else HcuHY4CTBackbone
     return fused_routing.attach(
         dense_fusion.attach(ihc_launch.attach_vendor(
             cls(vllm_config=vllm_config, prefix=prefix), vllm_config), vllm_config), vllm_config)
@@ -41,6 +49,10 @@ def make_ct_predictor(*, vllm_config, prefix=''):
 class HcuHY4CTForCausalLM(native.HYV4ForCausalLM):
     __init__ = bind_constructor(native.HYV4ForCausalLM.__init__,
                                {'HYV4Model': make_ct_backbone})
+
+    def load_weights(self, weights):
+        from .hy4_standard.weight_utils import filter_target_weights
+        return super().load_weights(filter_target_weights(weights))
 
 
 class HcuHY4CTMTP(mtp.HYV4MTP):

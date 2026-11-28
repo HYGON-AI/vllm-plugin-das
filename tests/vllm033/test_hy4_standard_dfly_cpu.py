@@ -16,7 +16,7 @@ def test_standard_and_flash_have_distinct_attention_factories():
         for n in tree.body
         if isinstance(n, ast.ClassDef) and n.name == "HYV4StandardDFlyAttention"
     )
-    assert [ast.unparse(b) for b in attention.bases] == ["HYV4MLAAttention"]
+    assert [ast.unparse(b) for b in attention.bases] == ["HYV4StandardAttention"]
     assert not any(
         isinstance(n, ast.FunctionDef) and n.name == "forward" for n in attention.body
     )

@@ -52,6 +52,7 @@ def test_dp16_target_and_dense_draft_have_distinct_ownership():
         {"enable_dbo": True},
         {"enable_eplb": True},
         {"enable_elastic_ep": True},
+        {"data_parallel_size": 1},
         {"data_parallel_size": 8},
         {"data_parallel_rank": 16},
     ],

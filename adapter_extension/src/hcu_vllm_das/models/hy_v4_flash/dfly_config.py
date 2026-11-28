@@ -173,6 +173,8 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
         if target.dtype != torch.bfloat16:
             raise ValueError("DFly requires bfloat16 compute")
         if family == "hy_v4":
+            if not target.enforce_eager:
+                raise ValueError("Standard HY4 DFly on stock Core requires explicit eager execution")
             from .dfly_topology import validate_standard_dfly_parallel
             validate_standard_dfly_parallel(parallel, enforce_eager=target.enforce_eager)
         else:
@@ -202,7 +204,7 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
             raise ValueError("DFly requires BF16 or fp8_ds_mla KV cache")
         n = self.num_speculative_tokens
         if family == "hy_v4":
-            from vllm.models.hy_v4.dfly_config import resolve_dfly_width
+            from ..hy4_standard.dfly_config import resolve_dfly_width
             n = resolve_dfly_width(target.hf_config, n)
         if n is None:
             block = getattr(target.hf_config, "dfly_block_size", None)
@@ -223,7 +225,7 @@ class HCUDFlySpeculativeConfig(SpeculativeConfig):
                 validate_flash_quant_config(target.model_arch_config.quantization_config)
             derived = derive_flash_dfly_config(target.hf_config)
         else:
-            from vllm.models.hy_v4.dfly_config import derive_standard_dfly_config
+            from ..hy4_standard.dfly_config import derive_standard_dfly_config
             if target.quantization is not None:
                 from ...quantization.hy4_ct_policy import accepts_checkpoint
                 if not accepts_checkpoint(target.model_arch_config.quantization_config,

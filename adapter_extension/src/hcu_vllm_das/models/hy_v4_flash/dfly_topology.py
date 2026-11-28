@@ -8,7 +8,7 @@ The dense TP1 draft has no EP/DP collective and uses only its local target KV.
 from copy import copy
 
 
-def validate_standard_dfly_parallel(parallel, *, enforce_eager):
+def validate_standard_hy4_parallel(parallel, *, enforce_eager):
     for field in (
         "pipeline_parallel_size",
         "prefill_context_parallel_size",
@@ -17,8 +17,6 @@ def validate_standard_dfly_parallel(parallel, *, enforce_eager):
         if getattr(parallel, field) != 1:
             raise ValueError(f"Standard DFly requires {field}=1")
     dp = parallel.data_parallel_size
-    if dp == 1:
-        return
     if (
         type(dp) is not int
         or dp != 16
@@ -34,8 +32,12 @@ def validate_standard_dfly_parallel(parallel, *, enforce_eager):
         )
     ):
         raise ValueError(
-            "Standard distributed DFly requires eager TP1/DP16/EP16 with fixed DeepEP HT/LL and no DBO/EPLB"
+            "Standard HY4 VL/DFly requires eager TP1/DP16/EP16 with fixed DeepEP HT/LL and no DBO/EPLB"
         )
+
+
+def validate_standard_dfly_parallel(parallel, *, enforce_eager):
+    return validate_standard_hy4_parallel(parallel, enforce_eager=enforce_eager)
 
 
 def make_rank_local_draft_parallel(target):

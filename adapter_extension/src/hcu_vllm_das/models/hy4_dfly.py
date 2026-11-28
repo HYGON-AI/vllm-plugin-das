@@ -5,7 +5,7 @@ The shared Core033 DFly loader/proposer retains checkpoint and KV guards.
 This module supplies constructor factories only, without a second forward.
 """
 
-from vllm.models.hy_v4.nvidia.attention import HYV4MLAAttention
+from .hy4_standard.attention import HYV4StandardAttention
 
 from ..quantization.hy4_ct_w4a8 import HcuHY4CTW4A8Config
 from .hy_v4_flash.dfly import HYV4DFlyDecoderLayer, HYV4DFlyQuantizationConfig
@@ -13,7 +13,7 @@ from .hy_v4_flash.runtime import validate_flash_platform
 from .hy_v4_flash.swa import FlashSparseBackend
 
 
-class HYV4StandardDFlyAttention(HYV4MLAAttention):
+class HYV4StandardDFlyAttention(HYV4StandardAttention):
     def __init__(self, vllm_config, config, layer_idx, topk_indices_buffer, prefix):
         validate_flash_platform()
         super().__init__(

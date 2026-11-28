@@ -18,7 +18,7 @@ from vllm.v1.worker.utils import customize_attention_spec
 
 from vllm.models.hy_v4.nvidia.attention import HYV4MLAAttention
 from .dfly_inputs import build_dfly_reuse_indices
-from .dfly_rotary import HYV4DFlyRotaryEmbedding
+from .dfly_rotary import validate_dfly_rotary_pair
 
 
 class HYV4DFlyTargetReuse:
@@ -89,11 +89,7 @@ class HYV4DFlyTargetReuse:
             self.index_layers[index] = attn
         for layer, index in zip(draft.model.layers, config.target_kv_layers, strict=True):
             source, dest = target_attention(index), layer.self_attn
-            source_rope, dest_rope = source.rotary_emb, dest.rotary_emb
-            if isinstance(dest_rope, HYV4DFlyRotaryEmbedding):
-                dest_rope = dest_rope.rotary
-            if type(source_rope) is not type(dest_rope):
-                raise ValueError(f"DFly target KV layer {index} uses incompatible RoPE")
+            validate_dfly_rotary_pair(source.rotary_emb, dest.rotary_emb)
             if source.num_local_heads != dest.num_local_heads:
                 raise ValueError("DFly target and draft must use matching attention TP")
             storage_specs: list[MLAAttentionSpec] = []
