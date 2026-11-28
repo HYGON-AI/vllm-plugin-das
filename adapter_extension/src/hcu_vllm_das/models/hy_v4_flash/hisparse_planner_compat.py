@@ -11,13 +11,12 @@ This is a distinct external connector, not a spoof of Core's connector-name test
 Its native SupportsHMA and required-layout interfaces run during real post-init.
 Neither KVTransferConfig nor speculative_config is hidden from post-init.
 
-The external connector retains the runtime admission guard, then delegates to
-the REAL native scheduler/worker constructor (not a metadata-only substitute).
-This patch qualifies planner metadata, not HIP mapping, transfer operations,
-DFly storage aliases or joint execution. Runtime and DFly joint guards remain
-in force. No implicit adapter/model activation occurs.
+The external connector delegates to the native scheduler/worker constructor
+after the Plugin runtime config guard succeeds. Activation is explicit.
 """
 import ast
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import replace
 from functools import wraps
@@ -47,17 +46,21 @@ _ABI = {
     'vllm.v1.worker.utils': '8577c2dc843834984a56b36c0f7c9763c1bf16504e4ac0eb0eab3ba77716fca0',
     'vllm.v1.worker.gpu.attn_utils': 'bcf208ac8151fe4790c00d7691a9a5734d1e8b4f3e8ba866fcc5550544487826',
     'hcu_vllm_das.models.hy_v4_flash.indexpool_cache': '3107cf1b034405f371b925c766629d41f7f6e7eed0ec7ed5164c6609dc6c184f',
+    'vllm.v1.hisparse.coordinator': '02253de971df732fb6219b832fc5d09d2af5587934d68c904a02eafd0c9c75ab',
+    'vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker': '60db48ec478e7fb1da067ad6da0d875a3d580646a911f375eb6d71e9ee42530a',
 }
 _INDEXPOOL_BASE_ABI = 'c3db5f4fbf1f18837eea3a85576d337aeb6682c7e3455d094d5718a6fc04c7f8'
 _lock = RLock()
 _state = None
 _failure = None
 _publishing = False
+_residency_scope = ContextVar("hyv4_hisparse_residency_scope", default=None)
 
 
 def _after_fork():
     global _lock, _failure
     _lock = RLock()
+    _residency_scope.set(None)
     if _state is not None or _publishing:
         _failure = "HiSparse planner publication inherited across fork; use spawn"
 
@@ -107,6 +110,8 @@ def _healthy():
             raise RuntimeError('HiSparse planner published entry-point ownership changed')
     if _fingerprint(s['spec_original']) != s['spec_original_fp']:
         raise RuntimeError('HiSparse worker resolver original signature/code changed')
+    if any(_fingerprint(fn) != found for fn, found in s['residency_checks']):
+        raise RuntimeError('HiSparse residency check signature/code changed')
     if s["resolver_module"].get_kv_cache_config_builder is not s["wrapper"]:
         raise RuntimeError("HiSparse planner resolver ownership changed")
     if _fingerprint(s["original"]) != s["original_fp"]:
@@ -187,22 +192,82 @@ def _host_bytes(kv):
     return budget
 
 
+@contextmanager
+def hisparse_residency_scope(config, *, construction_config=None, draft=False):
+    """Select the provider for one owned target or draft construction."""
+    from .hisparse_config_compat import _graph_requested, validate_hisparse_runtime
+
+    if not _graph_requested(config, final=True):
+        yield
+        return
+    check_health()
+    validate_hisparse_runtime(config)
+    token = _residency_scope.set((config if construction_config is None else construction_config, draft))
+    try:
+        yield
+    finally:
+        _residency_scope.reset(token)
+
+
+def _make_residency_check(original, resolved_type):
+    @wraps(original)
+    def validate(device, config):
+        active = _residency_scope.get()
+        if active is None or device.type != "cuda" or type(config) is not resolved_type:
+            return original(device, config)
+
+        from vllm.config import get_current_vllm_config_or_none
+
+        construction_config, draft = active
+        expected = (2176, 15232, 13056) if draft else (2048, 14336, 12288)
+        if (get_current_vllm_config_or_none() is not construction_config
+                or (config.top_k, config.device_buffer_size, config.max_union_rows) != expected
+                or config.eager_host_mirror is not True):
+            return original(device, config)
+
+        import torch
+
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device_index)
+        arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+        if arch != "gfx936" or getattr(properties, "multi_processor_count", None) != 80:
+            return original(device, config)
+
+        try:
+            from hcu_adapter.kernels.hisparse import validate_hisparse_residency_capacity
+        except ImportError as exc:
+            raise RuntimeError("HYV4 HiSparse requires the HCU residency capacity provider") from exc
+        validate_hisparse_residency_capacity(device_index, config.device_buffer_size, config.max_union_rows)
+        if draft:
+            # DFly initially constructs a separate runtime, then shares the
+            # target's smaller stride while keeping its wider union.
+            validate_hisparse_residency_capacity(device_index, 14336, config.max_union_rows)
+
+    return validate
+
+
 def validate_config_scope(value, *, final=False) -> None:
     """Internal config-owner handshake. Does not install or admit execution.
 
     Only explicit plugin connector enables the additional planner/DFly5 scope;
     arbitrary/native/MultiConnector KV-transfer configurations remain rejected.
     """
+    from .hisparse_config_compat import _graph_requested
+
     check_health()
     _host_bytes(value.kv_transfer_config)
+    graph = _graph_requested(value, final=final)
+    spec = value.speculative_config
+    if graph and spec is None:
+        raise ValueError("HiSparse FP8 graph requires explicit DFly5")
     if final:
         if value.model_config.original_max_model_len == -1:
             raise ValueError("HiSparse planner does not admit auto-fit model length")
-        spec = value.speculative_config
         if spec is not None:
             from . import dfly_compat
             from .dfly_config import HCUDFlySpeculativeConfig
             dfly_compat.check_health()
+            admitted_dtypes = ("fp8_ds_mla",) if graph else (None, "auto", "bfloat16")
             if (type(spec) is not HCUDFlySpeculativeConfig or spec.method != "dfly"
                     or type(spec.num_speculative_tokens) is not int
                     or spec.num_speculative_tokens != 5
@@ -211,21 +276,28 @@ def validate_config_scope(value, *, final=False) -> None:
                     or value.num_lookahead_tokens != 6
                     or spec.parallel_drafting
                     or spec.draft_model_config.dtype != value.model_config.dtype
-                    or spec.draft_model_config.enforce_eager is not True
-                    or spec.kv_cache_dtype not in (None, "auto", "bfloat16")):
-                raise ValueError("HiSparse planner admits only intact owned BF16 DFly5")
+                    or spec.draft_model_config.enforce_eager is not (not graph)
+                    or spec.kv_cache_dtype not in admitted_dtypes
+                    or (graph and (spec.enforce_eager is not False
+                        or spec.draft_parallel_config.tensor_parallel_size != 4
+                        or spec.draft_model_config.max_model_len != value.model_config.max_model_len))):
+                raise ValueError("HiSparse planner requires intact owned DFly5 matching the cache and graph mode")
     else:
         if value.max_model_len == -1:
             raise ValueError("HiSparse planner does not admit auto-fit model length")
         if any(getattr(value, key, None) is not None
                for key in ("spec_method", "spec_model", "spec_tokens")):
             raise ValueError("HiSparse planner requires canonical speculative_config, not CLI aliases")
-        spec = value.speculative_config
+        args = {"method", "num_speculative_tokens"}
+        if graph:
+            args |= {"enforce_eager", "kv_cache_dtype"}
         if spec is not None and (type(spec) is not dict
-                or set(spec) != {"method", "num_speculative_tokens"}
+                or set(spec) != args
                 or spec.get("method") != "dfly"
                 or type(spec.get("num_speculative_tokens")) is not int
-                or spec["num_speculative_tokens"] != 5):
+                or spec["num_speculative_tokens"] != 5
+                or (graph and (spec["enforce_eager"] is not False
+                               or spec["kv_cache_dtype"] != "fp8_ds_mla"))):
             raise ValueError("HiSparse planner supports explicit DFly5 only")
 
 
@@ -243,8 +315,26 @@ def _is_indexpool_spec(spec):
             and spec.tokens_per_state > 1)
 
 
+def _can_pack_graph_indexpool(config, source, indexers):
+    """Keep compressed, full-indexer and differing source layouts separate."""
+    from .hisparse_config_compat import _graph_requested
+
+    if (not _graph_requested(config, final=True) or len(source) != 12
+            or len(set(source.values())) != 1 or len(set(indexers.values())) != 1
+            or not all(name.endswith('.attn') for name in source)
+            or set(indexers) != {name.removesuffix('.attn') + '.indexer.k_cache' for name in source}):
+        return False
+    mla = next(iter(source.values()))
+    pool = next(iter(indexers.values()))
+    return (mla.is_index_group_leader and not mla.is_draft and not pool.is_draft
+            and mla.cache_dtype_str == 'fp8_ds_mla' and mla.topk_buffer_width == 2048
+            and (mla.state_content_size_bytes, mla.page_size_bytes) == (656, 41984)
+            and (pool.block_size, pool.tokens_per_state, pool.page_size_bytes) == (256, 4, 8448)
+            and pool.get_block_stride_alignment() == 8448)
+
+
 def _indexpool_groups(config, specs):
-    """Native group objects, preserving independent logical 64/1024/ring blocks.
+    """Native groups preserving sparse, compressed, and ring block sizes.
 
     The LCM is a PHYSICAL byte stride, not a fabricated common scheduler or
     kernel block. HiSparse source/hot stays 64; IndexPool remains 64 states per
@@ -257,7 +347,8 @@ def _indexpool_groups(config, specs):
     from vllm.v1.hisparse.runtime import ResolvedHiSparseConfig
     from vllm.v1.kv_cache_interface import (MLAAttentionSpec, SparseCacheRole,
         KVCacheGroupSpec, KVCacheGroupRole, UniformTypeKVCacheSpecs,
-        HiSparseHotSpec, HiSparseResidentSpec)
+        HiSparseHotSpec, HiSparseResidentSpec, SlidingWindowMLASpec,
+        CircularBufferSpec)
     source = {n: v for n, v in specs.items() if isinstance(v, MLAAttentionSpec)
               and v.cache_role is SparseCacheRole.SPARSE}
     indexers = {n: v for n, v in specs.items() if isinstance(v, MLAAttentionSpec)
@@ -276,17 +367,32 @@ def _indexpool_groups(config, specs):
             kernel_page = spec.copy_with_new_block_size(int(spec.tokens_per_state)*64).page_size_bytes
             if spec.get_block_stride_alignment() % kernel_page:
                 raise ValueError('IndexPool specs must be worker-resolved with physical kernel-page alignment')
-    # One real indexer spec per group avoids inventing a common kernel ABI.
-    groups.extend(KVCacheGroupSpec([n], v, enable_kv_transfer=True,
-        role=KVCacheGroupRole.HISPARSE_INDEXER) for n, v in indexers.items())
+    packed = _can_pack_graph_indexpool(config, source, indexers)
+    if packed:
+        indexer_spec = UniformTypeKVCacheSpecs.from_specs(indexers)
+        if indexer_spec is None:
+            raise ValueError('Packed IndexPool requires one common logical block geometry')
+        groups.append(KVCacheGroupSpec(list(indexers), indexer_spec,
+            enable_kv_transfer=True, role=KVCacheGroupRole.HISPARSE_INDEXER))
+    else:
+        # Keep indexers with different logical or physical geometry separate.
+        groups.extend(KVCacheGroupSpec([n], v, enable_kv_transfer=True,
+            role=KVCacheGroupRole.HISPARSE_INDEXER) for n, v in indexers.items())
     topk = max(v.topk_buffer_width if v.topk_buffer_width is not None else
                config.model_config.hf_text_config.index_topk for v in source.values())
     resolved = ResolvedHiSparseConfig.from_vllm_config(config, topk, 64)
-    units = []
-    for name, spec in source.items():
-        if spec.is_index_group_leader or not units:
-            units.append([])
-        units[-1].append((name, spec))
+    if packed:
+        # Four per group fits the existing physical stride and supplies four
+        # 64K contexts at the 12 GiB budget without reducing the hot union.
+        # Keep the same order in the resident/hot groups for identical offsets.
+        ordered = list(source.items())
+        units = [ordered[i:i + 4] for i in range(0, len(ordered), 4)]
+    else:
+        units = []
+        for name, spec in source.items():
+            if spec.is_index_group_leader or not units:
+                units.append([])
+            units[-1].append((name, spec))
     for unit in units:
         pages = {v.page_size_bytes for _, v in unit}
         if len(pages) != 1:
@@ -299,8 +405,18 @@ def _indexpool_groups(config, specs):
                 blocks_per_request=(resolved.device_buffer_size+63)//64), enable_kv_transfer=False))
     regular = {n: v for n, v in specs.items()
         if not isinstance(v, (MLAAttentionSpec, HiSparseResidentSpec, HiSparseHotSpec))}
-    # No MLA in this subset: native regular SWA/ring grouping, not a hidden
-    # attention_config or config view with HiSparse removed.
+    windows = {n: v for n, v in regular.items()
+               if isinstance(v, SlidingWindowMLASpec) and v.cache_dtype_str == 'fp8_ds_mla'}
+    if windows and len(set(windows.values())) == 1 and len(windows) < len(regular):
+        tails = {n: v for n, v in regular.items() if n not in windows}
+        if all(isinstance(v, CircularBufferSpec) for v in tails.values()):
+            # Mixed page sizes can split identical SWA layers into singleton
+            # groups. Each would reserve its own full-width device pool blocks.
+            window_spec = UniformTypeKVCacheSpecs.from_specs(windows)
+            if window_spec is None:
+                raise ValueError('HiSparse SWA layers must retain uniform cache geometry')
+            groups.append(KVCacheGroupSpec(list(windows), window_spec))
+            regular = tails
     if regular:
         groups.extend(planning.get_kv_cache_groups(config, regular))
     return groups
@@ -376,10 +492,12 @@ def _make_types(planning, layout, native_connector):
     class HCUHiSparseConnector(native_connector.HiSparseConnector):
         def __init__(self, vllm_config, role, kv_cache_config):
             # Native interfaces above are used for real HMA/layout validation.
-            # Never enter its scheduler/worker constructor before qualification.
-            from .hisparse_config_compat import validate_hisparse_runtime
+            # The configuration owner scopes entry to the explicit candidate.
+            from .hisparse_config_compat import arm_hisparse_engine_handshake, validate_hisparse_runtime
             validate_hisparse_runtime(vllm_config)
             super().__init__(vllm_config, role, kv_cache_config)
+            if role is native_connector.KVConnectorRole.SCHEDULER:
+                arm_hisparse_engine_handshake(vllm_config)
 
     class HCUHiSparsePlanner(planning.DefaultKVCacheConfigBuilder):
         def get_kv_cache_groups(self, vllm_config, kv_cache_spec):
@@ -447,7 +565,7 @@ def install_compat() -> bool:
                     raise RuntimeError(f"HiSparse planner reviewed Core ABI changed: {name}")
                 modules.append(mod)
                 members.extend(_members(mod))
-            module, planning, layout = modules[:3]
+            module, planning, layout, runtime = modules[:4]
             original = module.get_kv_cache_config_builder
             if (tuple(inspect.signature(original).parameters) != ("vllm_config",)
                     or hasattr(original, "__wrapped__")):
@@ -466,6 +584,12 @@ def install_compat() -> bool:
                     or tuple(inspect.signature(spec_original).parameters) != ('vllm_config', 'kv_cache_spec', 'attn_layers')
                     or hasattr(spec_original, '__wrapped__')):
                 raise RuntimeError('HiSparse worker resolver signature/alias ownership changed')
+            residency_original = runtime._check_residency_shared_memory
+            if (tuple(inspect.signature(residency_original).parameters) != ("device", "config")
+                    or hasattr(residency_original, "__wrapped__")
+                    or residency_original.__module__ != runtime.__name__):
+                raise RuntimeError('HiSparse residency check signature/owner changed')
+            residency_check = _make_residency_check(residency_original, runtime.ResolvedHiSparseConfig)
             connector_cls, builder_cls = _make_types(planning, layout, modules[8])
 
             @wraps(original)
@@ -482,7 +606,8 @@ def install_compat() -> bool:
             # Intentional owned function slots, never original __globals__ edits.
             slots = ((module, 'get_kv_cache_config_builder', original, resolve),
                      (binding, 'resolve_hisparse_specs', spec_original, resolve_hisparse_specs),
-                     (worker, 'resolve_hisparse_specs', spec_original, resolve_hisparse_specs))
+                     (worker, 'resolve_hisparse_specs', spec_original, resolve_hisparse_specs),
+                     (runtime, '_check_residency_shared_memory', residency_original, residency_check))
             members = [entry for entry in members
                        if not any(entry[0] is owner and entry[1] == key for owner, key, _, _ in slots)]
             plugin_members = [(cls, name, fn, _fingerprint(fn))
@@ -491,6 +616,8 @@ def install_compat() -> bool:
             _state = {"pid": os.getpid(), "resolver_module": module,
                       "publications": slots, "spec_original": spec_original,
                       "spec_original_fp": _fingerprint(spec_original),
+                      "residency_checks": tuple((fn, _fingerprint(fn)) for fn in
+                                                (residency_original, residency_check)),
                       "wrapper": resolve, "wrapper_fp": _fingerprint(resolve),
                       "original": original, "original_fp": _fingerprint(original),
                       "members": members,

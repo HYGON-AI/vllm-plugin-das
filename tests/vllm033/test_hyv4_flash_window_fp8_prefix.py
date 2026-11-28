@@ -178,6 +178,27 @@ def invoke(values):
     return obj._fp8_flash_mla_kernel(q,cache,indices,metadata)
 
 
+def test_only_window_metadata_forces_fp8_mixed_on_hisparse():
+    source = (Path(__file__).resolve().parents[2] /
+              'adapter_extension/src/hcu_vllm_das/models/hy_v4_flash/swa.py')
+    names = {'FlashSparseMetadataBuilder', 'FlashSWAMetadataBuilder'}
+    tree = ast.parse(source.read_text())
+    builders = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in names]
+
+    class CoreBuilder:
+        def __init__(self, _spec, _layers, config, _device):
+            self.use_hisparse = config.hisparse
+            self.fp8_use_mixed_batch = False
+
+    ns = {'CompactPrefillMetadataBuilder':CoreBuilder, 'is_hcu_platform':lambda:False,
+          'AttentionCGSupport':NS(UNIFORM_BATCH=object())}
+    exec(compile(ast.Module(body=builders,type_ignores=[]),str(source),'exec'),ns)
+    sparse, window = (ns[name] for name in ('FlashSparseMetadataBuilder','FlashSWAMetadataBuilder'))
+    assert not sparse(None,[],NS(hisparse=True),None).fp8_use_mixed_batch
+    assert sparse(None,[],NS(hisparse=False),None).fp8_use_mixed_batch
+    assert window(None,[],NS(hisparse=True),None).fp8_use_mixed_batch
+
+
 def test_window_uses_private512_clone_and_fresh_scheduler(setup):
     values = setup.make(); obj,q,cache,indices,metadata = values
     original = (indices.identity,obj.topk_indices_buffer.identity)

@@ -8,13 +8,14 @@ import pytest
 MODEL = (Path(__file__).resolve().parents[2]
          / "adapter_extension/src/hcu_vllm_das/models/hy_v4_flash")
 
-def validate(config):
+def validate(config, *, admit_hisparse=False):
     tree = ast.parse((MODEL / "model.py").read_text())
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
               and n.name == "validate_runtime")
     calls = []
     namespace = {"VllmConfig": object, "torch": NS(bfloat16="bf16"),
                  "is_hcu_platform": lambda: True,
+                 "_admits_hisparse_graph": lambda cfg: admit_hisparse,
                  "_check_quantization": lambda *a: calls.append(a)}
     exec(compile(ast.Module(body=[fn], type_ignores=[]),
                  "<active-runtime-admission>", "exec"), namespace)
@@ -46,6 +47,18 @@ def test_active_model_rejects_unqualified_orphan_hisparse(eager):
 @pytest.mark.parametrize("eager", [True,False])
 def test_ordinary_target_admission_retains_eager_and_graph(eager):
     assert len(validate(configuration(eager=eager))) == 1
+
+
+def test_hisparse_model_admission_loads_its_native_provider(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    calls = []
+    module = ModuleType("hcu_adapter.kernels.hisparse")
+    module.ensure_hisparse_ops = lambda: calls.append("native")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    validate(configuration(hisparse=True, eager=False), admit_hisparse=True)
+    assert calls == ["native"]
 
 
 def test_core_moe_collects_without_core_root_environment():

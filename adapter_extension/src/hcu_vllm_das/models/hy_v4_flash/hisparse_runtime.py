@@ -11,6 +11,7 @@ No global Core/provider/allocator patch is made. Reallocation requires teardown.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 
 
@@ -552,6 +553,101 @@ def bind_hisparse_reader(owner, reader_cache, *, reader_layer, stream, torch):
     binding.layer = reader_layer
     owner._readers[id(reader_layer)] = binding
     return binding
+
+
+_REPLACEMENT_FIELDS = ('lru_init', 'device_global_indices', 'lru_slots', 'swap_stats')
+
+
+def bind_hisparse_resident_reader(owner, reader, source_cache, *, profiling=False):
+    """Borrow a Core resident lease at KV initialization, before graph capture.
+
+    Draft rows are transient and live in allocated lookahead slots. The target
+    connector continues to own publication to the host source. Each reader
+    keeps its query indices, staging events and copy stream.
+    """
+    target, draft = owner.runtime, reader.runtime
+    source_group, draft_group = target.index_group, draft.index_group
+    if (owner is reader or target is draft or owner.draft_layer
+            or source_group is draft_group or not draft.is_group_leader
+            or draft_group.leader is not draft or draft_group.followers
+            or target._swap_staged or draft._swap_staged
+            or reader.submit_layer_mirror is not None):
+        raise HiSparseBindingError('invalid resident draft/target cache ownership')
+    for name in ('kv_dtype', 'row_width', 'max_num_reqs', 'device'):
+        if getattr(draft, name) != getattr(target, name):
+            raise HiSparseBindingError(f'resident draft/target layout mismatch: {name}')
+    if draft.max_union_rows > target.region_stride:
+        raise HiSparseBindingError('resident draft top-k union exceeds target capacity')
+
+    host = getattr(target, '_host_cache', None)
+    source = source_cache if len(source_cache.shape) == 2 else source_cache.view(-1, target.row_width)
+    if (host is None or not same_cache_layout(source, host) or owner.view is None
+            or not same_cache_layout(owner.view.cache, target.hot.cache)):
+        raise HiSparseBindingError('resident draft needs the bound target host and GPU views')
+
+    aliases = [(reader, name, getattr(owner, name)) for name in HiSparseRuntimeBinding._CACHE_FIELDS]
+    aliases.extend((draft, name, getattr(target, name)) for name in (
+        *HiSparseRuntimeBinding._RUNTIME_FIELDS, 'resident_source_index', 'region_stride'))
+    aliases.extend((draft_group, name, getattr(source_group, name)) for name in _REPLACEMENT_FIELDS)
+    if any(value is None and name != 'shared_host_region' for _, name, value in aliases):
+        raise HiSparseBindingError('incomplete target resident cache binding')
+
+    current_owner = getattr(reader, '_hcu_resident_owner', None)
+    if current_owner is not None and current_owner is not owner:
+        raise HiSparseBindingError('resident draft already has a different target')
+    if hasattr(draft, '_host_cache'):
+        if current_owner is not owner or any(getattr(obj, name, None) is not value
+                                              for obj, name, value in aliases):
+            raise HiSparseBindingError('resident draft binding changed without teardown')
+        return
+    if profiling:
+        reader._hcu_profile_resident_state = (
+            draft.region_stride,
+            tuple(getattr(draft_group, name) for name in _REPLACEMENT_FIELDS),
+        )
+    for obj, name, value in aliases:
+        setattr(obj, name, value)
+    reader.draft_layer = True
+    reader._hcu_resident_owner = owner
+
+
+def release_hisparse_resident_reader(reader):
+    """Drop Plugin aliases to Core's throwaway KV allocation after profiling."""
+    state = getattr(reader, '_hcu_profile_resident_state', None)
+    if state is None:
+        return
+    draft = reader.runtime
+    for name in HiSparseRuntimeBinding._CACHE_FIELDS:
+        setattr(reader, name, None)
+    for name in ('hot', 'hot_backing', 'hot_block_table', '_host_cache', 'registered_host_pool'):
+        if hasattr(draft, name):
+            delattr(draft, name)
+    draft.request_state_indices = None
+    draft.shared_host_region = None
+    draft.resident_source_index = -1
+    draft.region_stride, replacement = state
+    for name, value in zip(_REPLACEMENT_FIELDS, replacement, strict=True):
+        setattr(draft.index_group, name, value)
+    reader.draft_layer = False
+    del reader._hcu_resident_owner
+    del reader._hcu_profile_resident_state
+
+
+@contextmanager
+def suspend_hisparse_mirrors(layers):
+    """Synthetic graph capture has no request or connector lifecycle."""
+    callbacks = []
+    try:
+        for layer in layers:
+            cache = getattr(layer, 'hisparse_cache', None)
+            callback = getattr(cache, 'submit_layer_mirror', None)
+            if callback is not None:
+                callbacks.append((cache, callback))
+                cache.submit_layer_mirror = None
+        yield
+    finally:
+        for cache, callback in callbacks:
+            cache.submit_layer_mirror = callback
 
 
 def install_hisparse_prewrite_hook(impl, cache):

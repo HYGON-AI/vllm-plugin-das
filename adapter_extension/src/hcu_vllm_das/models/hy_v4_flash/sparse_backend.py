@@ -3,7 +3,6 @@
 """HCU kernel leaves on the actual Core033 sink-aware sparse MLA backend."""
 
 from dataclasses import dataclass
-from functools import cache as cache_result
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +25,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 from ...environment import fp8_fusions_enabled
 from .compact_prefill import compact_prefill_offsets
+from .hisparse_fp8_prefill import get_compact_prefill_gather as _get_compact_prefill_gather
+from .hisparse_fp8_prefill import hisparse_fp8_prefill_scope
 from .hisparse_runtime import (
     HiSparseBindingError,
     HiSparseRuntimeBinding,
@@ -39,18 +40,6 @@ from .runtime import is_hcu_platform
 
 logger = init_logger(__name__)
 _GATHER_GROUP_SIZE = 512
-
-
-@cache_result
-def _get_compact_prefill_gather():
-    try:
-        from lightop.op import decode_gather_and_up_convert_with_indices
-    except ImportError:
-        return None
-    from hcu_adapter._base import Missing
-
-    op = decode_gather_and_up_convert_with_indices
-    return op if callable(op) and not isinstance(op, Missing) else None
 
 
 @dataclass
@@ -144,6 +133,7 @@ class FlashSparseImpl(CoreSinkImpl):
         # Keep bank and real-head admission scoped to qualified worker pairs.
         self._hcu_window_device = None
         self._hcu_fp8_ds_mla_writer = False
+        self._hcu_use_resident_hisparse = False
         self._hcu_small_head_device = None
         self._hcu_small_head_counts = (8, 16)
         self._hcu_query_concat_device = None
@@ -191,8 +181,15 @@ class FlashSparseImpl(CoreSinkImpl):
         from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 
         if isinstance(self.index_group, HiSparseMLAIndexGroup):
-            # Keep the separately qualified HiSparse reader ABI unchanged.
             self._hcu_small_head_device = None
+            from .fullgraph_runner import _uses_hisparse_graph
+
+            if (self._hcu_fp8_ds_mla_writer and self.kv_cache_dtype == "fp8_ds_mla"
+                    and _uses_hisparse_graph(get_current_vllm_config())):
+                # This path uses the Core-resident slots wired before capture.
+                # The eager reader hook performs synchronous CPU validation.
+                self._hcu_use_resident_hisparse = True
+                return
             self._hcu_query_concat_device = None
             install_hisparse_prewrite_hook(
                 self, self.index_group.cache(self.index_group_index)
@@ -276,7 +273,7 @@ class FlashSparseImpl(CoreSinkImpl):
     def _checked_hisparse_call(self, layer=None):
         # No global patch or allocation hook. Ordinary KV and non-HCU execution
         # keep the inherited path exactly; Core allocates all HiSparse storage.
-        if self._hcu_ops is None:
+        if self._hcu_ops is None or self._hcu_use_resident_hisparse:
             return None
         from vllm.forward_context import get_forward_context
         from vllm.utils.torch_utils import current_stream
@@ -312,25 +309,28 @@ class FlashSparseImpl(CoreSinkImpl):
         self, kv_c_normed, k_pe, kv_cache, slot_mapping,
         kv_cache_dtype, k_scale, skip_scale=False,
     ):
-        writer = super().do_kv_cache_update
         call = self._checked_hisparse_call()
-        args = (kv_c_normed, k_pe, kv_cache, slot_mapping,
-                kv_cache_dtype, k_scale, skip_scale)
-        if call is None:
+        core_writer = super().do_kv_cache_update
+
+        def write():
             if (getattr(self, "_hcu_fp8_ds_mla_writer", False)
                     and kv_cache_dtype == "fp8_ds_mla"):
                 from .fp8_ds_mla_cache import write_fp8_ds_mla_cache
 
                 return write_fp8_ds_mla_cache(
                     kv_c_normed, k_pe, kv_cache, slot_mapping)
-            return writer(*args)
+            return core_writer(kv_c_normed, k_pe, kv_cache, slot_mapping,
+                               kv_cache_dtype, k_scale, skip_scale)
+
+        if call is None:
+            return write()
         binding, metadata = call
         binding.validate_batch(
             metadata, query_rows=kv_c_normed.shape[0],
             topk_width=self.topk_indices_buffer.shape[1],
         )
         return binding.write(
-            lambda: writer(*args), kv_cache=kv_cache,
+            write, kv_cache=kv_cache,
             slot_mapping=slot_mapping, rows=kv_c_normed.shape[0],
         )
 
@@ -398,6 +398,16 @@ class FlashSparseImpl(CoreSinkImpl):
         return binding.read(
             lambda: reader(q, kv_c_and_k_pe_cache, attn_metadata, layer)
         )
+
+    def _forward_fp8_kv_separate_prefill_decode(
+        self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata,
+    ):
+        forward = super()._forward_fp8_kv_separate_prefill_decode
+        if (self._hcu_use_resident_hisparse
+                and q.shape[0] > attn_metadata.fp8_extra_metadata.num_decode_tokens):
+            with hisparse_fp8_prefill_scope(self.index_group):
+                return forward(q, kv_c_and_k_pe_cache, topk_indices, attn_metadata)
+        return forward(q, kv_c_and_k_pe_cache, topk_indices, attn_metadata)
 
     def _forward_fp8_kv_mixed_batch(
         self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata,

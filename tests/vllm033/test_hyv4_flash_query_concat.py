@@ -66,7 +66,8 @@ class Core:
 
 
 @contextmanager
-def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', available=True):
+def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', available=True,
+            hisparse_graph=False):
     calls = []
     workspace = [Tensor((16, 4, 576))]
     state = {'probes': 0}
@@ -103,6 +104,7 @@ def harness(tp=8, arch='gfx936', cu=80, master=True, provider='native', availabl
     modules['hcu_adapter._base'].Missing = Missing
     modules['vllm.v1.attention.backends.mla.index_group'].HiSparseMLAIndexGroup = HiSparse
     modules['_concat_contract.fullgraph_runner']._qualified_worker_tuple = runner_ns['_qualified_worker_tuple']
+    modules['_concat_contract.fullgraph_runner']._uses_hisparse_graph = lambda cfg: hisparse_graph
     source = ast.parse((FAMILY / 'sparse_backend.py').read_text())
     original = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == 'FlashSparseImpl')
     names = {'__init__', '_install_hisparse_hook', '_concat_query_for_mqa', 'forward_mqa'}
@@ -175,6 +177,15 @@ class QueryConcatTests(unittest.TestCase):
             q = query()
             self.assertIs(obj.forward_mqa(q, None, None, None), q)
             self.assertEqual([x[0] for x in calls], ['hisparse_hook'])
+
+    def test_hisparse_fp8_graph_retains_hcu_query_concat_and_resident_slots(self):
+        with harness(tp=4, hisparse_graph=True) as (Impl, buffers, calls, state):
+            obj = Impl(num_heads=8, index_group=HiSparse())
+            self.assertTrue(obj._hcu_use_resident_hisparse)
+            buffers[0] = Tensor((64, 8, 576))
+            q = obj.forward_mqa(query(24, 8), None, None, None)
+            self.assertEqual(q.shape, (24, 8, 576))
+            self.assertEqual([name for name, _ in calls], ['native'])
 
     def test_master_off_keeps_compatibility_copy(self):
         with harness(master=False) as (Impl, buffers, calls, state):

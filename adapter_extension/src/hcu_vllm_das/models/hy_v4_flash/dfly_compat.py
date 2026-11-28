@@ -186,7 +186,12 @@ def validate_dfly_runtime(vllm_config) -> None:
     from .dfly_config import HCUDFlySpeculativeConfig
     if not isinstance(vllm_config.speculative_config, HCUDFlySpeculativeConfig):
         raise ValueError("DFly requires the owned speculative config")
-    if getattr(vllm_config.attention_config, "hisparse_config", None) is not None:
+    from .fullgraph_runner import _is_hisparse_connector
+
+    # EngineArgs temporarily holds the connector before its resolved HiSparse config.
+    hisparse = (os.environ.get("HCU_VLLM_HY4_HISPARSE") == "1"
+                and _is_hisparse_connector(vllm_config))
+    if getattr(vllm_config.attention_config, "hisparse_config", None) is not None and not hisparse:
         raise NotImplementedError("HiSparse + DFly joint runtime remains unqualified")
     p = vllm_config.parallel_config
     if any(getattr(p, field, 1) != 1 for field in (
@@ -195,8 +200,8 @@ def validate_dfly_runtime(vllm_config) -> None:
         raise ValueError("DFly requires DP/PP/PCP/DCP=1")
     if not vllm_config.use_v2_model_runner:
         raise ValueError("DFly requires V2 model runner")
-    if any(getattr(vllm_config, field, None) is not None for field in (
-        "lora_config", "kv_transfer_config")):
+    if (getattr(vllm_config, "lora_config", None) is not None
+            or (getattr(vllm_config, "kv_transfer_config", None) is not None and not hisparse)):
         raise ValueError("DFly does not admit LoRA or KV transfer")
     if vllm_config.cache_config.cache_dtype not in ("auto", "bfloat16", "fp8_ds_mla"):
         raise ValueError("DFly requires BF16 or fp8_ds_mla KV cache")
